@@ -1,0 +1,16 @@
+# Maven build output
+target/
+
+# IDE metadata
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS cruft
+.DS_Store
+Thumbs.db
