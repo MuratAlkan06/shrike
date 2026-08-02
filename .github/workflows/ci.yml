@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test on Temurin 21
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Temurin 21 and register its Maven toolchain
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and test the reactor
+        run: mvn -B verify
+
+      - name: Assert compiled classes carry Java 21 bytecode
+        run: |
+          class_file=$(find . -type f -name '*.class' -path '*/target/classes/*' | head -n 1)
+          if [ -z "$class_file" ]; then
+            class_file=$(find . -type f -name '*.class' -path '*/target/test-classes/*' | head -n 1)
+          fi
+          if [ -z "$class_file" ]; then
+            echo "No compiled class files found; the bytecode check proved nothing." >&2
+            exit 1
+          fi
+          major_version=$(od -An -tu1 -j 6 -N 2 "$class_file" | awk 'NF { print $1 * 256 + $2; exit }')
+          echo "$class_file reports class-file major version $major_version"
+          if [ "$major_version" -ne 65 ]; then
+            echo "Expected major version 65 (Java 21), got $major_version." >&2
+            exit 1
+          fi
+
+  docs-gate:
+    name: Check documentation gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository with full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Scan files and commit messages for forbidden phrases
+        run: scripts/forbidden_phrases.sh
+
+      - name: Check every README claim names existing evidence
+        run: scripts/claims_check.sh
