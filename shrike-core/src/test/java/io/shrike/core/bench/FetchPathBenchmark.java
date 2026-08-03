@@ -52,6 +52,12 @@ import org.openjdk.jmh.annotations.Warmup;
  * costs. It is not a measurement of the file read alone, and neither number is a measurement of a
  * network. Both paths pay the same socket, which is what leaves the difference between them.
  *
+ * <p><strong>A third method prices that shared socket, and it is not a fetch path.</strong>
+ * {@link #writeRangeToTheSinkAlone} writes the same bytes into the same loopback pair with no log
+ * behind it, so what both rows pay is a number this repository commits rather than one it asserts.
+ * It belongs beside the two rather than in them: it is what says whether either row is bound by the
+ * socket, and it is what has to come off both before the distance between them can be read.
+ *
  * <p><strong>The transfer path opens a file descriptor per fetch and the buffered path does not.</strong>
  * {@link SegmentedLog#openRange} opens a second descriptor on the segment file and the
  * {@link RecordRange} closes it once the range has been sent, while {@link SegmentedLog#readRange}
@@ -100,6 +106,12 @@ public class FetchPathBenchmark {
     private SegmentedLog log;
     private long highWaterMark;
 
+    /**
+     * The bytes the range covers, read once at trial setup so that {@link #writeRangeToTheSinkAlone}
+     * sends exactly what the two fetch paths send with no log in the call that sends it.
+     */
+    private byte[] recordsBlock;
+
     private ServerSocketChannel listener;
 
     /** The end a fetch is written to: the broker's side of a connection. */
@@ -135,6 +147,7 @@ public class FetchPathBenchmark {
         }
         highWaterMark = log.nextOffset();
         requireBothPathsCoverTheSameBytes();
+        recordsBlock = log.readRange(FETCH_OFFSET, highWaterMark, RANGE_MAX_BYTES);
 
         listener = ServerSocketChannel.open();
         listener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
@@ -196,6 +209,26 @@ public class FetchPathBenchmark {
         byte[] records = log.readRange(FETCH_OFFSET, highWaterMark, RANGE_MAX_BYTES);
         ByteChannels.writeFully(brokerEnd, ByteBuffer.wrap(records));
         return records.length;
+    }
+
+    /**
+     * Writes the same bytes into the same sink with nothing behind the write: no range located, no
+     * file read, no descriptor opened. It is not one of the two paths above and it is not a fetch —
+     * it is what both of those pay for the socket, measured rather than assumed, so that a reader can
+     * tell whether either row is bound by the sink and can take the sink off both before comparing
+     * them.
+     *
+     * <p>The buffer is a heap one wrapping the same array on every invocation, which is what
+     * {@link #serveRangeByBuffer} hands {@code writeFully} after its read: the array is reused here
+     * because allocating and filling it is the log's cost rather than the socket's.
+     *
+     * @return how many bytes were written, returned so the work cannot be eliminated
+     * @throws IOException if the socket fails
+     */
+    @Benchmark
+    public long writeRangeToTheSinkAlone() throws IOException {
+        ByteChannels.writeFully(brokerEnd, ByteBuffer.wrap(recordsBlock));
+        return recordsBlock.length;
     }
 
     /**
