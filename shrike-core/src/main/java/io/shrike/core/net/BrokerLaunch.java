@@ -17,7 +17,7 @@ import java.util.Optional;
  *
  * <p>{@link BrokerConfig} is what a broker is built from; this is how a process comes to hold one. It
  * is read from environment variables and nothing else — no configuration file, no working-directory
- * lookup, no path this process guesses at. Seventeen variables, of which one is required, and one rule
+ * lookup, no path this process guesses at. Eighteen variables, of which one is required, and one rule
  * names them: a setting's variable is {@code SHRIKE_} followed by the name {@link LogConfig} and
  * {@link BrokerConfig} give the field in their javadoc, upper-cased with each dot an underscore, so
  * {@code retention.ms} is read from {@code SHRIKE_RETENTION_MS}.
@@ -38,6 +38,7 @@ import java.util.Optional;
  * SHRIKE_INDEX_INTERVAL_BYTES index.interval.bytes
  * SHRIKE_MAX_FETCH_WAIT_MS    max.fetch.wait.ms
  * SHRIKE_MAX_REQUEST_BYTES    max.request.bytes
+ * SHRIKE_READ_TIMEOUT_MS      read.timeout.ms
  * SHRIKE_FETCH_ZERO_COPY      fetch.zero.copy, written true or false in whatever letters
  * SHRIKE_CONNECTION_CAP       connectionCap, which has no dotted name of its own
  * SHRIKE_MAX_TOTAL_PARTITIONS maxTotalPartitions, which has no dotted name of its own
@@ -45,7 +46,7 @@ import java.util.Optional;
  *
  * <p>A variable that is not set, or set to nothing at all, is one the default answers for — which is
  * what {@code docker run -e SHRIKE_PORT=} passes and what an operator means by it. Each of the
- * thirteen settings below the first four defaults to what {@link LogConfig#defaults()} and
+ * fourteen settings below the first four defaults to what {@link LogConfig#defaults()} and
  * {@link BrokerConfig#defaults(Path, int, Path)} give the field it sets, so a process that names none
  * of them starts the broker every deployment before them started. The data directory has no default
  * because a default would be a path this process picked rather than one somebody chose, and every
@@ -107,6 +108,9 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
     /** {@code max.request.bytes}. */
     public static final String MAX_REQUEST_BYTES_VARIABLE = "SHRIKE_MAX_REQUEST_BYTES";
 
+    /** {@code read.timeout.ms}, which bounds reading and idling and never bounds serving. */
+    public static final String READ_TIMEOUT_MS_VARIABLE = "SHRIKE_READ_TIMEOUT_MS";
+
     /** {@code fetch.zero.copy}: {@code true} or {@code false}, in whatever letters. */
     public static final String FETCH_ZERO_COPY_VARIABLE = "SHRIKE_FETCH_ZERO_COPY";
 
@@ -134,6 +138,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             Map.entry("indexIntervalBytes", INDEX_INTERVAL_BYTES_VARIABLE),
             Map.entry("maxFetchWaitMs", MAX_FETCH_WAIT_MS_VARIABLE),
             Map.entry("maxRequestBytes", MAX_REQUEST_BYTES_VARIABLE),
+            Map.entry("readTimeoutMs", READ_TIMEOUT_MS_VARIABLE),
             Map.entry("connectionCap", CONNECTION_CAP_VARIABLE),
             Map.entry("maxTotalPartitions", MAX_TOTAL_PARTITIONS_VARIABLE));
 
@@ -201,13 +206,15 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
                 .map(BrokerLaunch::zeroCopyFetch)
                 .orElse(BrokerConfig.DEFAULT_ZERO_COPY_FETCH);
         int connectionCap = wholeNumber(environment, CONNECTION_CAP_VARIABLE, BrokerConfig.DEFAULT_CONNECTION_CAP);
+        int readTimeoutMs = wholeNumber(environment, READ_TIMEOUT_MS_VARIABLE,
+                BrokerConfig.DEFAULT_READ_TIMEOUT_MILLIS);
         int maxTotalPartitions = wholeNumber(environment, MAX_TOTAL_PARTITIONS_VARIABLE,
                 BrokerConfig.DEFAULT_MAX_TOTAL_PARTITIONS);
         LogConfig logConfig = logConfig(environment);
 
         try {
             return new BrokerConfig(dataDirectory, port, maxRequestBytes, maxFetchWaitMs, zeroCopyFetch,
-                    connectionCap, maxTotalPartitions, readyFilePath, logConfig);
+                    connectionCap, readTimeoutMs, maxTotalPartitions, readyFilePath, logConfig);
         } catch (IllegalArgumentException refusal) {
             throw refusalNamingTheVariable(refusal);
         }

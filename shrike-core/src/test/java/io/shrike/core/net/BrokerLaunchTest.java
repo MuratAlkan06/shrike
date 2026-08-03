@@ -96,6 +96,7 @@ class BrokerLaunchTest {
                 Map.entry(BrokerLaunch.INDEX_INTERVAL_BYTES_VARIABLE, "8192"),
                 Map.entry(BrokerLaunch.MAX_FETCH_WAIT_MS_VARIABLE, "5000"),
                 Map.entry(BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE, "1048576"),
+                Map.entry(BrokerLaunch.READ_TIMEOUT_MS_VARIABLE, "7500"),
                 Map.entry(BrokerLaunch.FETCH_ZERO_COPY_VARIABLE, "False"),
                 Map.entry(BrokerLaunch.CONNECTION_CAP_VARIABLE, "8"),
                 Map.entry(BrokerLaunch.MAX_TOTAL_PARTITIONS_VARIABLE, "32"));
@@ -105,7 +106,7 @@ class BrokerLaunchTest {
         Path dataDirectory = Path.of(DATA_DIRECTORY);
         LogConfig namedLogConfig = new LogConfig(524_288, 67_108_864, 8192, 86_400_000L, 1_073_741_824L,
                 FlushMode.PER_RECORD, 250L, 2_097_152L);
-        assertEquals(new BrokerConfig(dataDirectory, 9750, 1_048_576, 5_000, false, 8, 32,
+        assertEquals(new BrokerConfig(dataDirectory, 9750, 1_048_576, 5_000, false, 8, 7_500, 32,
                         dataDirectory.resolve("shrike.ready"), namedLogConfig), config,
                 "every value the environment named reached the one field its variable names");
         assertFalse(config.zeroCopyFetch(), "a fetch's records are read into memory because a variable said so");
@@ -251,6 +252,20 @@ class BrokerLaunchTest {
                         BrokerLaunch.CONNECTION_CAP_VARIABLE, "0")));
         assertTrue(capRefusal.getMessage().contains(BrokerLaunch.CONNECTION_CAP_VARIABLE),
                 "one pattern, whichever record holds the bound: " + capRefusal.getMessage());
+    }
+
+    @Test
+    void refusesAReadTimeoutOfZeroNamingTheVariableThatWouldHaveClosedEveryConnection() {
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.READ_TIMEOUT_MS_VARIABLE, "0");
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.READ_TIMEOUT_MS_VARIABLE), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("readTimeoutMs must be at least 1"),
+                "the record owns the bound and the launch says which variable crossed it: " + refusal.getMessage());
     }
 
     @Test

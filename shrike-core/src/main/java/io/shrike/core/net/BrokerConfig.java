@@ -32,6 +32,15 @@ import java.util.Objects;
  *                          the log for the same range and put the same bytes on the wire
  * @param connectionCap     the most connections served at once; the one after that is accepted and
  *                          closed rather than queued
+ * @param readTimeoutMs     {@code read.timeout.ms}: how long one connection may hold its place under
+ *                          {@code connectionCap} without finishing a request. It covers exactly two
+ *                          things — the time a connection sits idle between requests, and the time it
+ *                          spends part way through a request frame — and it never covers serving one,
+ *                          so a long-poll fetch held open for {@code maxFetchWaitMs} is not reading and
+ *                          is not closed for it. A connection past the bound is closed by
+ *                          {@code shrike-conn-reaper}, which asks once per bound; there is no value
+ *                          that turns the bound off, because a broker that wants a longer one sets a
+ *                          longer one
  * @param maxTotalPartitions the most partitions this broker will hold open across every topic. Each one
  *                          costs a directory and two open file handles for as long as the broker runs,
  *                          so a create that would pass this number is refused rather than answered with
@@ -41,8 +50,8 @@ import java.util.Objects;
  * @param logConfig         the record, segment, and index sizes every partition log opens with
  */
 public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, int maxFetchWaitMs,
-                           boolean zeroCopyFetch, int connectionCap, int maxTotalPartitions, Path readyFilePath,
-                           LogConfig logConfig) {
+                           boolean zeroCopyFetch, int connectionCap, int readTimeoutMs, int maxTotalPartitions,
+                           Path readyFilePath, LogConfig logConfig) {
 
     /** Ask the operating system for a free port, and read back which one it gave. */
     public static final int EPHEMERAL_PORT = 0;
@@ -66,6 +75,16 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
      * how long this broker may be made to hold one is a number it decides rather than the caller.
      */
     public static final int DEFAULT_MAX_FETCH_WAIT_MILLIS = 30_000;
+
+    /**
+     * Thirty seconds of reading, which is the same number the longest fetch wait takes and means
+     * something else entirely: this one is time a connection spends saying nothing, or saying half of
+     * something, while it holds a slot and up to {@code max.request.bytes} of the heap. Thirty seconds
+     * is far longer than any client on a machine this broker will talk to needs to put four length
+     * bytes and a frame on a socket, and short enough that a connection nobody is driving gives its
+     * slot back while an operator is still looking at the problem rather than after it.
+     */
+    public static final int DEFAULT_READ_TIMEOUT_MILLIS = 30_000;
 
     /**
      * A thousand and twenty-four partitions across every topic — the same number one create may ask for,
@@ -103,6 +122,10 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
         if (connectionCap < 1) {
             throw new IllegalArgumentException("connectionCap must be at least 1, but was " + connectionCap);
         }
+        if (readTimeoutMs < 1) {
+            throw new IllegalArgumentException("readTimeoutMs must be at least 1, because a bound of zero would "
+                    + "close every connection the first time the reaper looked at one, but was " + readTimeoutMs);
+        }
         if (maxTotalPartitions < 1) {
             throw new IllegalArgumentException("maxTotalPartitions must be at least 1, but was " + maxTotalPartitions);
         }
@@ -111,9 +134,9 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
     /**
      * The configuration a broker gets when the caller names only where things live: the default
      * request bound, a fetch wait capped at {@value #DEFAULT_MAX_FETCH_WAIT_MILLIS}ms, fetches served
-     * out of the segment file, {@value #DEFAULT_CONNECTION_CAP} connections,
-     * {@value #DEFAULT_MAX_TOTAL_PARTITIONS} partitions across every topic, and
-     * {@link LogConfig#defaults()}.
+     * out of the segment file, {@value #DEFAULT_CONNECTION_CAP} connections, a read bound of
+     * {@value #DEFAULT_READ_TIMEOUT_MILLIS}ms, {@value #DEFAULT_MAX_TOTAL_PARTITIONS} partitions across
+     * every topic, and {@link LogConfig#defaults()}.
      *
      * @param dataDirectory the directory every path is derived from
      * @param port          the port to listen on, or {@value #EPHEMERAL_PORT}
@@ -123,6 +146,6 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
     public static BrokerConfig defaults(Path dataDirectory, int port, Path readyFilePath) {
         return new BrokerConfig(dataDirectory, port, RequestReader.DEFAULT_MAX_REQUEST_BYTES,
                 DEFAULT_MAX_FETCH_WAIT_MILLIS, DEFAULT_ZERO_COPY_FETCH, DEFAULT_CONNECTION_CAP,
-                DEFAULT_MAX_TOTAL_PARTITIONS, readyFilePath, LogConfig.defaults());
+                DEFAULT_READ_TIMEOUT_MILLIS, DEFAULT_MAX_TOTAL_PARTITIONS, readyFilePath, LogConfig.defaults());
     }
 }

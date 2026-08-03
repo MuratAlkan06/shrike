@@ -38,24 +38,25 @@ import java.util.concurrent.atomic.AtomicLong;
  * same connection an hour apart. Connections are capped: at
  * {@link BrokerConfig#connectionCap()} the next socket is accepted and immediately closed. Accepting
  * and closing is the point — the acceptor never blocks and nothing is queued, so a client that opens
- * a thousand sockets costs a thousand closes rather than a thousand threads. Two more threads:
+ * a thousand sockets costs a thousand closes rather than a thousand threads. Three more threads:
  * {@code shrike-retention} does nothing but ask each partition to delete the segments retention no
- * longer keeps — with retention off, which is the default, it asks and there is nothing to do — and
+ * longer keeps — with retention off, which is the default, it asks and there is nothing to do —
  * {@code shrike-flush} does nothing but ask each partition to force the records that have sat unforced
  * for {@code flush.interval.ms} — in {@code per-record} mode it asks and there is nothing to do,
- * because the append already forced.
+ * because the append already forced — and {@code shrike-conn-reaper} does nothing but ask each open
+ * connection whether it has spent longer than {@code read.timeout.ms} reading one request.
  *
  * <p><strong>Starting.</strong> The topic registry and every partition log are opened and recovered
  * first, then the committed offsets are loaded, then the socket binds, then the acceptor, the
- * retention thread, and the flush thread start, and only then is the {@link ReadyFile} written. A
- * reader that can see the ready file can connect.
+ * retention thread, the flush thread, and the connection reaper start, and only then is the
+ * {@link ReadyFile} written. A reader that can see the ready file can connect.
  *
- * <p><strong>Stopping.</strong> Stop accepting, stop retention and the flush interval and wait for a
- * pass of each in flight, wake every fetch that is waiting on a partition, close the open connections
- * so their threads come out of their blocking reads, join those threads under a bounded deadline, and
- * close every log — which forces the segment it was still writing. Nothing is deleted on the way out,
- * including the ready file: what retention deletes it deletes while the broker is running and says so
- * in the log.
+ * <p><strong>Stopping.</strong> Stop accepting, stop retention, the flush interval, and the reaper and
+ * wait for a pass of each in flight, wake every fetch that is waiting on a partition, close the open
+ * connections so their threads come out of their blocking reads, join those threads under a bounded
+ * deadline, and close every log — which forces the segment it was still writing. Nothing is deleted on
+ * the way out, including the ready file: what retention deletes it deletes while the broker is running
+ * and says so in the log.
  *
  * <p><strong>Durability.</strong> What a produce promises is decided by {@code flush.mode} and by
  * nothing else. Under {@link io.shrike.core.log.FlushMode#PER_RECORD} a produce is acknowledged only
@@ -71,11 +72,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * and {@link #start(BrokerConfig, TimeSource, InetAddress)} binds the address it is handed — the only
  * way this broker comes to listen anywhere else. This build has no authentication and no transport
  * security, so a port it listens on past loopback is a port anything that can reach it may write to,
- * and a caller that names a wider address is saying it has arranged that reachability itself. There is
- * no server-side read or idle timeout either — {@code SO_TIMEOUT} does not bound a
- * {@code SocketChannel} read — so a connection that opens and then says nothing holds its slot until
- * it is closed. {@link BrokerConfig#connectionCap()} is what bounds that today, and a reaper rides
- * with the slice that brings authentication.
+ * and a caller that names a wider address is saying it has arranged that reachability itself.
+ *
+ * <p><strong>Reading and idling are bounded; serving is not.</strong> A connection may spend at most
+ * {@link BrokerConfig#readTimeoutMs()} in one read phase — sitting idle between requests, or part way
+ * through a request frame — and {@code shrike-conn-reaper} closes it when it spends more, which is what
+ * brings its thread out of the blocking read and gives its place under
+ * {@link BrokerConfig#connectionCap()} back. {@code SO_TIMEOUT} is not what does it: that bounds reads
+ * on a socket's streams and not on the {@code SocketChannel} this broker reads through. The bound is
+ * deliberately not a bound on the connection: a fetch held open for {@code max.fetch.wait.ms} is this
+ * broker waiting to write rather than a client failing to speak, and it is never closed for it.
+ * Authentication is still not here, and #9 is still where the rest of that is tracked.
  */
 public final class ShrikeBroker implements AutoCloseable {
 
@@ -113,6 +120,16 @@ public final class ShrikeBroker implements AutoCloseable {
      * at one interval rather than at two.
      */
     private final FlushSweep flush;
+
+    /**
+     * The {@code shrike-conn-reaper} thread and its schedule; built here, started by {@link #start}. It
+     * asks exactly as often as {@code read.timeout.ms}, so a connection that stalls holds its slot for
+     * between one and two bounds rather than for as long as its client stays connected.
+     */
+    private final ConnectionReaper reaper;
+
+    /** Handed to each connection, so every read phase is stamped from the clock this broker was given. */
+    private final TimeSource timeSource;
 
     private final int port;
 
@@ -158,6 +175,18 @@ public final class ShrikeBroker implements AutoCloseable {
     };
 
     /**
+     * The second test seam, and the second field here production code never writes. It runs on a
+     * connection's own thread as that connection ends, after its map entry and its place under the cap
+     * have both gone back — the one instant a test can be sure a slot is free again, which nothing on
+     * the wire says. A reaped connection gives its slot back on its own thread rather than on the one
+     * that closed it, so without this a test proving the cap does not shrink would have to guess when to
+     * look. Production leaves it doing nothing.
+     */
+    // volatile because a test installs it from its own thread and every connection thread reads it.
+    private volatile Runnable connectionEnded = () -> {
+    };
+
+    /**
      * The one accepting thread. Not final because it starts after the broker is built, since a thread
      * handed a half-built broker would be the worse trade; volatile because {@link #close()} may be
      * called from a thread that never watched it being set.
@@ -173,7 +202,11 @@ public final class ShrikeBroker implements AutoCloseable {
         this.dispatcher = new RequestDispatcher(topics, groupOffsets);
         this.retention = new RetentionSweep(topics, timeSource, RetentionSweep.DEFAULT_CHECK_INTERVAL_MILLIS);
         this.flush = new FlushSweep(topics, timeSource, config.logConfig().flushIntervalMs());
+        this.timeSource = timeSource;
         this.port = port;
+        // Last, and holding a method of a broker that is one statement from being built: the reaper only
+        // stores it here, and the thread that would call it does not exist until start().
+        this.reaper = new ConnectionReaper(this::closeStalledConnections, timeSource, config.readTimeoutMs());
     }
 
     /**
@@ -235,6 +268,7 @@ public final class ShrikeBroker implements AutoCloseable {
         try {
             broker.retention.start();
             broker.flush.start();
+            broker.reaper.start();
             broker.startAccepting();
             ReadyFile.write(config.readyFilePath(), broker.port, ProcessHandle.current().pid());
         } catch (RuntimeException e) {
@@ -276,6 +310,9 @@ public final class ShrikeBroker implements AutoCloseable {
         // flush interval first.
         retention.close();
         flush.close();
+        // Beside the other two, and for the plainer reason: a pass in flight only closes sockets a
+        // shutdown is about to close anyway, so what this waits for is the thread rather than the pass.
+        reaper.close();
 
         // Woken before their sockets are closed, so a fetch that is part way through a long poll
         // returns rather than being joined against for a deadline it was told it could use.
@@ -333,6 +370,18 @@ public final class ShrikeBroker implements AutoCloseable {
     void onConnectionReserved(Runnable seam) {
         Objects.requireNonNull(seam, "seam");
         connectionReserved = seam;
+    }
+
+    /**
+     * Installs the test seam described on {@link #connectionEnded}. Package-private for the same reason
+     * as {@link #onConnectionReserved(Runnable)}.
+     *
+     * @param seam what to run on a connection's own thread once that connection has given back
+     *             everything it held
+     */
+    void onConnectionEnded(Runnable seam) {
+        Objects.requireNonNull(seam, "seam");
+        connectionEnded = seam;
     }
 
     private void startAccepting() {
@@ -436,7 +485,7 @@ public final class ShrikeBroker implements AutoCloseable {
             socket.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
 
             Connection connection = new Connection(name, socket, new RequestReader(config.maxRequestBytes()),
-                    dispatcher);
+                    dispatcher, timeSource);
             reserved = connection;
             Thread thread = new Thread(() -> {
                 try {
@@ -444,6 +493,7 @@ public final class ShrikeBroker implements AutoCloseable {
                 } finally {
                     openConnections.remove(connection);
                     openConnectionCount.decrementAndGet();
+                    connectionEnded.run();
                 }
             }, name);
 
@@ -497,6 +547,29 @@ public final class ShrikeBroker implements AutoCloseable {
             connection.close();
         }
         openConnectionCount.decrementAndGet();
+    }
+
+    /**
+     * One pass of the read bound: close every open connection that has spent at least
+     * {@code read.timeout.ms} in one read phase, and leave the rest alone. It is what
+     * {@code shrike-conn-reaper} calls on its own thread, and what a test calls directly with a clock it
+     * advanced, because when a pass happens is not what the bound means.
+     *
+     * <p>Nothing here gives a slot back. Closing the socket is what brings a connection's own thread out
+     * of its blocking read, and that thread removes its map entry and its place under the cap on the way
+     * out, exactly as it does for a client that hung up.
+     *
+     * @param nowMillis the epoch millisecond every read phase's age is measured against
+     * @return how many connections this pass closed
+     */
+    int closeStalledConnections(long nowMillis) {
+        int closed = 0;
+        for (Connection connection : openConnections.keySet()) {
+            if (connection.closeIfStalled(nowMillis, config.readTimeoutMs())) {
+                closed++;
+            }
+        }
+        return closed;
     }
 
     /**
