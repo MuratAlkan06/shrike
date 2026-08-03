@@ -21,8 +21,12 @@ import java.util.List;
  * <p>Output is redirected to a file, with the error stream merged into it. A pipe would need a thread
  * to drain it or the child would block once the pipe filled, and a file is a thing a failure message
  * can quote whole.
+ *
+ * <p>This module's test classes are attached as a test-jar, so the three members another module needs
+ * — start a process, read what it wrote, destroy it and everything it started — are public and the
+ * rest stays inside this package.
  */
-final class JavaProcess {
+public final class JavaProcess {
 
     /** Long enough that reaching it means the process is stuck rather than slow. */
     private static final long EXIT_TIMEOUT_SECONDS = 60L;
@@ -52,7 +56,7 @@ final class JavaProcess {
      * @return the started process
      * @throws IOException if the process cannot be started
      */
-    static JavaProcess start(String name, Class<?> mainClass, Path outputFile, List<String> arguments)
+    public static JavaProcess start(String name, Class<?> mainClass, Path outputFile, List<String> arguments)
             throws IOException {
         List<String> command = new ArrayList<>(List.of(JAVA_COMMAND, "-cp", System.getProperty("java.class.path"),
                 mainClass.getName()));
@@ -100,7 +104,7 @@ final class JavaProcess {
     /**
      * @return everything the process has written so far, standard error included
      */
-    String output() {
+    public String output() {
         if (!Files.exists(outputFile)) {
             return "";
         }
@@ -132,7 +136,7 @@ final class JavaProcess {
      * more. It is safe to call on a process that has already ended, which is what lets a test call it
      * on every process it started whatever happened to them.
      */
-    void destroyTree() {
+    public void destroyTree() {
         process.descendants().forEach(ProcessHandle::destroyForcibly);
         process.destroyForcibly();
         try {

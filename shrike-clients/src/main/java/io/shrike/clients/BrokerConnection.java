@@ -2,6 +2,8 @@ package io.shrike.clients;
 
 import io.shrike.core.protocol.CommitOffsetRequest;
 import io.shrike.core.protocol.CreateTopicRequest;
+import io.shrike.core.protocol.DescribeGroupRequest;
+import io.shrike.core.protocol.DescribeTopicsRequest;
 import io.shrike.core.protocol.FetchRequest;
 import io.shrike.core.protocol.ProduceRequest;
 import io.shrike.core.protocol.Request;
@@ -298,6 +300,10 @@ public final class BrokerConnection implements AutoCloseable {
                     + " partition=" + commit.partition() + " offset=" + commit.offset();
             case CreateTopicRequest create -> "a create of topic=" + create.name() + " with "
                     + create.partitionCount() + " partition(s)";
+            case DescribeTopicsRequest describeTopics -> describeTopics.describesEveryTopic()
+                    ? "a describe of every topic"
+                    : "a describe of topic(s) " + String.join(", ", describeTopics.topics());
+            case DescribeGroupRequest describeGroup -> "a describe of groupId=" + describeGroup.groupId();
         };
     }
 

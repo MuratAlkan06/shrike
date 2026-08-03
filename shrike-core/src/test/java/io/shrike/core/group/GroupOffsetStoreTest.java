@@ -208,6 +208,43 @@ class GroupOffsetStoreTest {
     }
 
     @Test
+    void enumeratesOneGroupsCommittedOffsetsInTopicThenPartitionOrder() {
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        store.commit(GROUP, TOPIC, 1, 12L);
+        store.commit(GROUP, OTHER_TOPIC, 0, 1L);
+        store.commit(GROUP, TOPIC, 0, 5L);
+        store.commit(OTHER_GROUP, TOPIC, 0, 3L);
+
+        List<CommittedOffset> committed = store.committedOffsets(GROUP);
+
+        assertEquals(List.of(new CommittedOffset(OTHER_TOPIC, 0, 1L), new CommittedOffset(TOPIC, 0, 5L),
+                new CommittedOffset(TOPIC, 1, 12L)), committed,
+                "the order is the file's: topic and then partition, whatever order the commits arrived in");
+    }
+
+    @Test
+    void enumeratesNoCommittedOffsetsForAGroupThatHasNeverCommitted() {
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        store.commit(GROUP, TOPIC, 0, 5L);
+
+        List<CommittedOffset> neverSeen = store.committedOffsets("nobody");
+
+        assertEquals(List.of(), neverSeen,
+                "a commit is what creates a group, so a group with no commits and no such group are one state");
+    }
+
+    @Test
+    void enumeratesTheOffsetsOfAGroupIdSpelledInAnotherCasing() {
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        store.commit(GROUP, TOPIC, 0, 5L);
+
+        List<CommittedOffset> committed = store.committedOffsets(SAME_GROUP_CAPITALISED);
+
+        assertEquals(List.of(new CommittedOffset(TOPIC, 0, 5L)), committed,
+                "one group has one set of offsets whichever casing asks for them");
+    }
+
+    @Test
     void refusesANegativeOffsetAndAnUnsafeName() {
         GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
 

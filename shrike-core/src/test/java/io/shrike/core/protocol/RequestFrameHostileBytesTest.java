@@ -27,9 +27,12 @@ class RequestFrameHostileBytesTest {
 
     private static final int CORRELATION_ID = 77;
 
+    /** The first number no api has taken, so a frame naming it is a frame this build cannot read. */
+    private static final short UNTAKEN_API_KEY = 6;
+
     @Test
     void refusesAnApiKeyThisBuildDoesNotImplement() {
-        for (short apiKey : new short[] {ApiKeys.DESCRIBE_TOPICS, ApiKeys.DESCRIBE_GROUP, -1, 999}) {
+        for (short apiKey : new short[] {UNTAKEN_API_KEY, 7, -1, 999}) {
             ByteBuffer frame = request(apiKey, ApiKeys.VERSION_0, CORRELATION_ID, new byte[0]);
 
             RequestDecoding decoding = RequestFrame.decode(frame);
@@ -201,6 +204,90 @@ class RequestFrameHostileBytesTest {
 
             assertRefused(decoding, ErrorCode.INVALID_REQUEST, "must not be negative");
         }
+    }
+
+    @Test
+    void refusesATopicCountOutsideTheRangeADescribeMayName() {
+        for (int topicCount : new int[] {-1, DescribeTopicsRequest.MAX_TOPIC_COUNT + 1, Integer.MAX_VALUE}) {
+            ByteBuffer frame = request(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0, CORRELATION_ID,
+                    concat(int32(topicCount), string("orders")));
+
+            RequestDecoding decoding = RequestFrame.decode(frame);
+
+            assertRefused(decoding, ErrorCode.INVALID_REQUEST, "topicCount " + topicCount);
+        }
+    }
+
+    @Test
+    void refusesATopicCountThatClaimsMoreNamesThanBytesRemain() {
+        ByteBuffer frame = request(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0, CORRELATION_ID,
+                concat(int32(DescribeTopicsRequest.MAX_TOPIC_COUNT), string("orders")));
+
+        RequestDecoding decoding = RequestFrame.decode(frame);
+
+        assertRefused(decoding, ErrorCode.INVALID_REQUEST, "needs at least");
+    }
+
+    @Test
+    void refusesADescribedTopicNameOutsideTheSafeCharacterSet() {
+        ByteBuffer frame = request(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0, CORRELATION_ID,
+                concat(int32(2), string("orders"), string("../etc")));
+
+        RequestDecoding decoding = RequestFrame.decode(frame);
+
+        assertRefused(decoding, ErrorCode.INVALID_REQUEST, "topic must be");
+    }
+
+    @Test
+    void refusesADescribedTopicNameWhoseLengthIsNegativeOrRunsPastTheEndOfTheFrame() {
+        ByteBuffer negative = request(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0, CORRELATION_ID,
+                concat(int32(1), int16(-1)));
+        ByteBuffer pastTheEnd = request(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0, CORRELATION_ID,
+                concat(int32(1), stringWithLength(Short.MAX_VALUE, "orders")));
+
+        assertRefused(RequestFrame.decode(negative), ErrorCode.INVALID_REQUEST, "negative length");
+        assertRefused(RequestFrame.decode(pastTheEnd), ErrorCode.INVALID_REQUEST, "32767 bytes");
+    }
+
+    @Test
+    void refusesADescribeWhoseBodyEndsInsideAField() {
+        ByteBuffer halfACount = request(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0, CORRELATION_ID, int16(0));
+        ByteBuffer halfALength = request(ApiKeys.DESCRIBE_GROUP, ApiKeys.VERSION_0, CORRELATION_ID,
+                new byte[] {0x00});
+
+        assertRefused(RequestFrame.decode(halfACount), ErrorCode.INVALID_REQUEST, "ends before topicCount");
+        assertRefused(RequestFrame.decode(halfALength), ErrorCode.INVALID_REQUEST, "ends before groupId's length");
+    }
+
+    @Test
+    void refusesTrailingBytesAfterACompleteDescribeBody() {
+        ByteBuffer afterTopics = request(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0, CORRELATION_ID,
+                concat(int32(1), string("orders"), new byte[] {0x7f}));
+        ByteBuffer afterAGroup = request(ApiKeys.DESCRIBE_GROUP, ApiKeys.VERSION_0, CORRELATION_ID,
+                concat(string("readers"), new byte[] {0x7f}));
+
+        assertRefused(RequestFrame.decode(afterTopics), ErrorCode.INVALID_REQUEST, "left over");
+        assertRefused(RequestFrame.decode(afterAGroup), ErrorCode.INVALID_REQUEST, "left over");
+    }
+
+    @Test
+    void refusesAGroupIdToDescribeOutsideTheSafeCharacterSet() {
+        ByteBuffer frame = request(ApiKeys.DESCRIBE_GROUP, ApiKeys.VERSION_0, CORRELATION_ID,
+                string("../../root"));
+
+        RequestDecoding decoding = RequestFrame.decode(frame);
+
+        assertRefused(decoding, ErrorCode.INVALID_REQUEST, "groupId must be");
+    }
+
+    @Test
+    void refusesAGroupIdToDescribeWhoseLengthIsNegativeOrRunsPastTheEndOfTheFrame() {
+        ByteBuffer negative = request(ApiKeys.DESCRIBE_GROUP, ApiKeys.VERSION_0, CORRELATION_ID, int16(-1));
+        ByteBuffer pastTheEnd = request(ApiKeys.DESCRIBE_GROUP, ApiKeys.VERSION_0, CORRELATION_ID,
+                stringWithLength(Short.MAX_VALUE, "readers"));
+
+        assertRefused(RequestFrame.decode(negative), ErrorCode.INVALID_REQUEST, "negative length");
+        assertRefused(RequestFrame.decode(pastTheEnd), ErrorCode.INVALID_REQUEST, "32767 bytes");
     }
 
     @Test

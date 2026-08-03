@@ -23,8 +23,11 @@ import java.util.function.Supplier;
  * process ending. So this is the one place in the repository that polls, and it polls the way the
  * rest of the code waits — an absolute deadline computed once, a short interval between looks, and a
  * failure that says what never happened. Nothing here asserts how long something took.
+ *
+ * <p>This module's test classes are attached as a test-jar, so waiting for a broker's ready file is
+ * public — it is the one wait another module has to do — and the rest stays inside this package.
  */
-final class Await {
+public final class Await {
 
     /** Long enough that reaching it means something is wrong, short enough that a build still ends. */
     static final long TIMEOUT_SECONDS = 60L;
@@ -43,7 +46,7 @@ final class Await {
      *                      now rather than at the deadline
      * @return the port the broker bound
      */
-    static int brokerPort(Path readyFilePath, JavaProcess broker) {
+    public static int brokerPort(Path readyFilePath, JavaProcess broker) {
         long deadlineNanos = System.nanoTime() + SECONDS.toNanos(TIMEOUT_SECONDS);
         while (System.nanoTime() < deadlineNanos) {
             if (!broker.isAlive()) {

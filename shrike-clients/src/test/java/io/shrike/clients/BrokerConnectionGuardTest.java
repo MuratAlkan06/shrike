@@ -6,8 +6,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.shrike.core.protocol.CreateTopicRequest;
 import io.shrike.core.protocol.CreateTopicResponse;
+import io.shrike.core.protocol.DescribeGroupRequest;
+import io.shrike.core.protocol.DescribeGroupResponse;
+import io.shrike.core.protocol.ErrorCode;
 import io.shrike.core.protocol.ProduceResponse;
 import io.shrike.core.protocol.ResponseFrame;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.Socket;
@@ -95,6 +99,25 @@ class BrokerConnectionGuardTest {
         }
     }
 
+    /**
+     * A describe answer is the first one whose length the caller cannot check by arithmetic: the body
+     * carries a count and then that many entries, so believing the count is what would decide how much
+     * memory the answer costs. Both frames here are complete and short — the client refuses them on
+     * their contents rather than waiting for bytes that are never coming, which is what makes a
+     * {@link MalformedResponseException} rather than a {@link BrokerTimeoutException} the proof.
+     */
+    @Test
+    void closesTheConnectionWhenADescribeAnswerCountsMoreEntriesThanItCarries() throws IOException {
+        byte[] negativeEntryCount = answerWithBody(int32(-1));
+        // One entry's worth of bytes, so the count itself is believable, and a topic name inside them
+        // that claims every byte a length field can hold.
+        byte[] aNameRunningPastTheFrame = answerWithBody(
+                concat(int32(1), int16(Short.MAX_VALUE), new byte[Integer.BYTES + Long.BYTES]));
+
+        assertRefusesTheDescribeAnswer("negative-count", negativeEntryCount, "-1");
+        assertRefusesTheDescribeAnswer("name-past-the-end", aNameRunningPastTheFrame, "32767");
+    }
+
     @Test
     void closesTheConnectionWhenTheBrokerDoesNotAnswerWithinTheReadTimeout() throws IOException {
         try (ScriptedServer server = ScriptedServer.start("silent", socket -> { });
@@ -121,6 +144,50 @@ class BrokerConnectionGuardTest {
 
             assertFalse(connection.isOpen());
         }
+    }
+
+    private static void assertRefusesTheDescribeAnswer(String name, byte[] answer, String reasonFragment)
+            throws IOException {
+        try (ScriptedServer server = ScriptedServer.start(name, socket -> write(socket, answer));
+             BrokerConnection connection = BrokerConnection.open(server.clientConfig(A_SHORT_READ_TIMEOUT_MILLIS))) {
+
+            MalformedResponseException broken = assertThrows(MalformedResponseException.class,
+                    () -> connection.call(new DescribeGroupRequest("readers"), DescribeGroupResponse.class));
+
+            assertTrue(broken.getMessage().contains(reasonFragment),
+                    "the failure quotes the number it refused: " + broken.getMessage());
+            assertFalse(connection.isOpen(), "nothing was sized to that count and the connection is gone");
+        }
+    }
+
+    /**
+     * @param body a body no broker of this build would write
+     * @return a whole frame, length field included, that answers this client's first request
+     */
+    private static byte[] answerWithBody(byte[] body) {
+        ByteBuffer frame = ByteBuffer.allocate(
+                ResponseFrame.LENGTH_FIELD_BYTES + ResponseFrame.MINIMUM_LENGTH_BYTES + body.length);
+        frame.putInt(ResponseFrame.MINIMUM_LENGTH_BYTES + body.length);
+        frame.putInt(BrokerConnection.FIRST_CORRELATION_ID);
+        frame.putShort(ErrorCode.NONE.code());
+        frame.put(body);
+        return frame.array();
+    }
+
+    private static byte[] concat(byte[]... parts) {
+        ByteArrayOutputStream joined = new ByteArrayOutputStream();
+        for (byte[] part : parts) {
+            joined.writeBytes(part);
+        }
+        return joined.toByteArray();
+    }
+
+    private static byte[] int16(int value) {
+        return ByteBuffer.allocate(Short.BYTES).putShort((short) value).array();
+    }
+
+    private static byte[] int32(int value) {
+        return ByteBuffer.allocate(Integer.BYTES).putInt(value).array();
     }
 
     private static void write(Socket socket, byte[] bytes) throws IOException {

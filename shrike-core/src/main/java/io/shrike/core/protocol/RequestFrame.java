@@ -25,6 +25,9 @@ import java.util.Objects;
  *   <li>{@code correlationId} is the client's number and means nothing to the broker but "put this in
  *       the response", which is what lets a client keep more than one request in flight.
  *   <li>A string is {@code len:int16 | UTF-8 bytes} with a length that is never negative.
+ *   <li>A list is {@code count:int32} and then that many elements, and the count is weighed against
+ *       both its own cap and the fewest bytes that many elements could occupy before anything is sized
+ *       to it.
  *   <li>A produced record is {@code keyLen:int32 | key | valueLen:int32 | value}, where a
  *       {@code keyLen} of {@value io.shrike.core.log.RecordFrame#NULL_KEY_LENGTH} means no key at
  *       all — the same convention the record on disk uses, so the two never drift.
@@ -45,6 +48,9 @@ public final class RequestFrame {
 
     /** A produced record on the wire is at least its two length fields. */
     private static final int MINIMUM_RECORD_BYTES = Integer.BYTES + Integer.BYTES;
+
+    /** A named topic on the wire is at least the length field of its name. */
+    private static final int MINIMUM_TOPIC_BYTES = Short.BYTES;
 
     private RequestFrame() {
     }
@@ -77,6 +83,8 @@ public final class RequestFrame {
             case FetchRequest fetch -> encodeFetch(frame, fetch);
             case CommitOffsetRequest commit -> encodeCommitOffset(frame, commit);
             case CreateTopicRequest create -> encodeCreateTopic(frame, create);
+            case DescribeTopicsRequest describeTopics -> encodeDescribeTopics(frame, describeTopics);
+            case DescribeGroupRequest describeGroup -> putString(frame, describeGroup.groupId());
         }
         return frame.flip();
     }
@@ -149,7 +157,17 @@ public final class RequestFrame {
             case CommitOffsetRequest commit -> stringBytes(commit.groupId()) + stringBytes(commit.topic())
                     + Integer.BYTES + Long.BYTES;
             case CreateTopicRequest create -> stringBytes(create.name()) + Integer.BYTES;
+            case DescribeTopicsRequest describeTopics -> Integer.BYTES + namesBytes(describeTopics.topics());
+            case DescribeGroupRequest describeGroup -> stringBytes(describeGroup.groupId());
         };
+    }
+
+    private static long namesBytes(List<String> names) {
+        long totalBytes = 0L;
+        for (String name : names) {
+            totalBytes += stringBytes(name);
+        }
+        return totalBytes;
     }
 
     private static long recordsBytes(List<ProducedRecord> records) {
@@ -201,6 +219,13 @@ public final class RequestFrame {
         frame.putInt(request.partitionCount());
     }
 
+    private static void encodeDescribeTopics(ByteBuffer frame, DescribeTopicsRequest request) {
+        frame.putInt(request.topics().size());
+        for (String topic : request.topics()) {
+            putString(frame, topic);
+        }
+    }
+
     private static void putString(ByteBuffer frame, String value) {
         byte[] utf8 = value.getBytes(UTF_8);
         frame.putShort((short) utf8.length);
@@ -213,6 +238,8 @@ public final class RequestFrame {
             case ApiKeys.FETCH -> decodeFetch(body);
             case ApiKeys.COMMIT_OFFSET -> decodeCommitOffset(body);
             case ApiKeys.CREATE_TOPIC -> decodeCreateTopic(body);
+            case ApiKeys.DESCRIBE_TOPICS -> decodeDescribeTopics(body);
+            case ApiKeys.DESCRIBE_GROUP -> new DescribeGroupRequest(decodeString(body, "groupId"));
             default -> throw new WireFormatException("api key " + apiKey + " has no body this build can read");
         };
     }
@@ -290,6 +317,30 @@ public final class RequestFrame {
         int partitionCount = decodeInt(body, "partitionCount");
 
         return new CreateTopicRequest(name, partitionCount);
+    }
+
+    private static DescribeTopicsRequest decodeDescribeTopics(ByteBuffer body) {
+        int topicCount = decodeInt(body, "topicCount");
+        if (topicCount < 0 || topicCount > DescribeTopicsRequest.MAX_TOPIC_COUNT) {
+            throw new WireFormatException("topicCount " + topicCount + " is outside [0, "
+                    + DescribeTopicsRequest.MAX_TOPIC_COUNT + "]");
+        }
+
+        // The same rule the produce record count follows: nothing is sized to a count until the bytes
+        // to back it are known to be there. The smallest a named topic can be is the length field of
+        // its name, so a count claiming more names than that many length fields is refused before a
+        // list is allocated for it.
+        long smallestTopicsBytes = (long) topicCount * MINIMUM_TOPIC_BYTES;
+        if (smallestTopicsBytes > body.remaining()) {
+            throw new WireFormatException("topicCount " + topicCount + " needs at least " + smallestTopicsBytes
+                    + " bytes of names, but " + body.remaining() + " are left in the frame");
+        }
+
+        List<String> topics = new ArrayList<>(topicCount);
+        for (int index = 0; index < topicCount; index++) {
+            topics.add(decodeString(body, "topic " + index));
+        }
+        return new DescribeTopicsRequest(topics);
     }
 
     private static String decodeString(ByteBuffer body, String field) {

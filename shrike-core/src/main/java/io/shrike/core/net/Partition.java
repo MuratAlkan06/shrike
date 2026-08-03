@@ -2,6 +2,7 @@ package io.shrike.core.net;
 
 import io.shrike.core.log.Log;
 import io.shrike.core.log.LogConfig;
+import io.shrike.core.log.LogStatistics;
 import io.shrike.core.log.ProducedRecord;
 import io.shrike.core.log.RecordFrame;
 import io.shrike.core.log.RecordTooLargeException;
@@ -73,6 +74,15 @@ final class Partition implements Closeable {
     // guarded by: lock
     private final Log log;
 
+    /**
+     * The same object {@link #log} holds, seen through the read-only surface that answers how big it
+     * is. {@link Log} does not extend {@link LogStatistics} — a caller that appends has no business
+     * asking about segment counts — so the one instance is held twice rather than cast on the way to a
+     * question. Read under {@link #lock} like every other call on that object.
+     */
+    // guarded by: lock
+    private final LogStatistics logStatistics;
+
     /** Set once when the broker stops, so a waiter does not have to wait out its deadline first. */
     // guarded by: lock
     private boolean stopped;
@@ -87,7 +97,8 @@ final class Partition implements Closeable {
     private Runnable waiterRegistered = () -> {
     };
 
-    private Partition(String topic, int partition, BrokerConfig config, TimeSource timeSource, Log log) {
+    private Partition(String topic, int partition, BrokerConfig config, TimeSource timeSource, Log log,
+                      LogStatistics logStatistics) {
         this.topic = topic;
         this.partition = partition;
         this.logConfig = config.logConfig();
@@ -98,6 +109,7 @@ final class Partition implements Closeable {
         this.zeroCopyFetch = config.zeroCopyFetch();
         this.timeSource = timeSource;
         this.log = log;
+        this.logStatistics = logStatistics;
     }
 
     /**
@@ -111,8 +123,9 @@ final class Partition implements Closeable {
      * @return the open partition
      */
     static Partition open(BrokerConfig config, String topic, int partition, TimeSource timeSource) {
-        Log log = SegmentedLog.open(config.dataDirectory(), topic, partition, timeSource, config.logConfig());
-        return new Partition(topic, partition, config, timeSource, log);
+        SegmentedLog log = SegmentedLog.open(config.dataDirectory(), topic, partition, timeSource,
+                config.logConfig());
+        return new Partition(topic, partition, config, timeSource, log, log);
     }
 
     String topic() {
@@ -430,6 +443,34 @@ final class Partition implements Closeable {
         long recordBytes = RecordFrame.frameBytes(keyLength, record.value().length);
         if (recordBytes > logConfig.maxRecordBytes()) {
             throw new RecordTooLargeException(topic, partition, recordBytes, logConfig.maxRecordBytes());
+        }
+    }
+
+    /**
+     * Reads what this partition's storage looks like right now, changing nothing.
+     *
+     * <p>All five numbers are taken under {@link #lock}, in one pass, so they describe one instant
+     * rather than five: an append that lands while a describe is being answered is either wholly in the
+     * snapshot or wholly after it. The lock is held for reads of file sizes the log already knows, so
+     * this costs an appending thread the same as any other reader of this partition.
+     *
+     * <p>{@link #deleteRetiredSegments(long)} is the reason the pass has to be one pass rather than a
+     * convenience. It takes this same lock from {@code shrike-retention}'s own thread, and it moves the
+     * first and third of these numbers and both byte counts together; a describe that read them one at
+     * a time could see a start offset retention had just advanced beside a high-water mark from before
+     * it, and {@link io.shrike.core.protocol.PartitionDescription} refuses that pair — which would put
+     * an {@link io.shrike.core.protocol.ErrorCode#INTERNAL} on a read-only request anybody may send.
+     * {@code PartitionDescribeRetentionRaceTest} is what holds that shut.
+     *
+     * @return the snapshot
+     */
+    PartitionStatistics statistics() {
+        lock.lock();
+        try {
+            return new PartitionStatistics(logStatistics.logStartOffset(), logStatistics.highWaterMark(),
+                    logStatistics.segmentCount(), logStatistics.logBytes(), logStatistics.indexBytes());
+        } finally {
+            lock.unlock();
         }
     }
 }

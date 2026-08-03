@@ -9,7 +9,8 @@ package io.shrike.core.protocol;
  * came off the wire and turns a refusal into {@link ErrorCode#INVALID_REQUEST}, and a client that
  * builds one by hand meets the same rules before a byte is sent.
  */
-public sealed interface Request permits ProduceRequest, FetchRequest, CommitOffsetRequest, CreateTopicRequest {
+public sealed interface Request permits ProduceRequest, FetchRequest, CommitOffsetRequest, CreateTopicRequest,
+        DescribeTopicsRequest, DescribeGroupRequest {
 
     /**
      * @return the api key that names this request on the wire

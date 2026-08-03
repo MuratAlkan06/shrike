@@ -1,9 +1,12 @@
 package io.shrike.core.protocol;
 
 import static io.shrike.core.protocol.WireFrames.concat;
+import static io.shrike.core.protocol.WireFrames.int16;
 import static io.shrike.core.protocol.WireFrames.int32;
 import static io.shrike.core.protocol.WireFrames.int64;
 import static io.shrike.core.protocol.WireFrames.response;
+import static io.shrike.core.protocol.WireFrames.string;
+import static io.shrike.core.protocol.WireFrames.stringWithLength;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -14,12 +17,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 
 class ResponseFrameTest {
 
     private static final int CORRELATION_ID = 0x0a0b0c0d;
+
+    /** The first number no api has taken, so this build could never have sent a request naming it. */
+    private static final short UNTAKEN_API_KEY = 6;
 
     @Test
     void roundTripsAProduceResponse() {
@@ -212,7 +219,140 @@ class ResponseFrameTest {
     void refusesToDecodeAResponseToAnApiKeyThisBuildNeverSent() {
         ByteBuffer frame = response(CORRELATION_ID, ErrorCode.NONE.code(), new byte[0]);
 
-        assertThrows(IllegalArgumentException.class, () -> ResponseFrame.decode(ApiKeys.DESCRIBE_GROUP, frame));
+        assertThrows(IllegalArgumentException.class, () -> ResponseFrame.decode(UNTAKEN_API_KEY, frame));
+    }
+
+    @Test
+    void roundTripsADescribeTopicsResponseOverSeveralTopicsAndPartitions() {
+        DescribeTopicsResponse response = new DescribeTopicsResponse(List.of(
+                new TopicDescription("orders", List.of(new PartitionDescription(0, 0L, 12L, 3, 4_096L),
+                        new PartitionDescription(1, 5L, 5L, 1, 0L))),
+                new TopicDescription("events", List.of(
+                        new PartitionDescription(0, 0L, Long.MAX_VALUE, Integer.MAX_VALUE, Long.MAX_VALUE)))));
+
+        DescribeTopicsResponse decoded = decode(response, DescribeTopicsResponse.class);
+
+        assertEquals(response, decoded);
+    }
+
+    @Test
+    void roundTripsADescribeTopicsResponseFromABrokerHoldingNoTopics() {
+        DescribeTopicsResponse response = new DescribeTopicsResponse(List.of());
+
+        DescribeTopicsResponse decoded = decode(response, DescribeTopicsResponse.class);
+
+        assertEquals(List.of(), decoded.topics(), "no topics is an answer, and it is six bytes of body");
+    }
+
+    @Test
+    void roundTripsADescribeGroupResponseAndTheEmptyOneOfAGroupThatCommittedNothing() {
+        DescribeGroupResponse committed = new DescribeGroupResponse(List.of(
+                new GroupOffset("events", 0, 1L), new GroupOffset("orders", 0, 5L),
+                new GroupOffset("orders", 1, Long.MAX_VALUE)));
+
+        assertEquals(committed, decode(committed, DescribeGroupResponse.class));
+        assertEquals(List.of(), decode(new DescribeGroupResponse(List.of()), DescribeGroupResponse.class).offsets());
+    }
+
+    /**
+     * <pre>
+     * 00000001                    topicCount = 1
+     * 0006 6f7264657273           "orders"
+     * 00000001                    partitionCount = 1
+     * 00000000                    partition = 0
+     * 0000000000000000            logStartOffset = 0
+     * 000000000000000c            highWaterMark = 12
+     * 00000003                    segmentCount = 3
+     * 0000000000001000            bytes = 4096
+     * </pre>
+     */
+    @Test
+    void readsTheDescribeTopicsBodyOfABrokerThatBuiltItByHand() {
+        byte[] body = concat(int32(1), string("orders"), int32(1),
+                int32(0), int64(0L), int64(12L), int32(3), int64(4_096L));
+
+        ResponseDecoding decoding = ResponseFrame.decode(ApiKeys.DESCRIBE_TOPICS,
+                response(CORRELATION_ID, ErrorCode.NONE.code(), body));
+
+        assertEquals(new DescribeTopicsResponse(List.of(new TopicDescription("orders",
+                        List.of(new PartitionDescription(0, 0L, 12L, 3, 4_096L))))),
+                assertInstanceOf(ResponseDecoding.Answered.class, decoding, decoding.toString()).response());
+    }
+
+    /**
+     * <pre>
+     * 00000001                    entryCount = 1
+     * 0006 6f7264657273           "orders"
+     * 00000002                    partition = 2
+     * 0000000000000005            committedOffset = 5
+     * </pre>
+     */
+    @Test
+    void readsTheDescribeGroupBodyOfABrokerThatBuiltItByHand() {
+        byte[] body = concat(int32(1), string("orders"), int32(2), int64(5L));
+
+        ResponseDecoding decoding = ResponseFrame.decode(ApiKeys.DESCRIBE_GROUP,
+                response(CORRELATION_ID, ErrorCode.NONE.code(), body));
+
+        assertEquals(new DescribeGroupResponse(List.of(new GroupOffset("orders", 2, 5L))),
+                assertInstanceOf(ResponseDecoding.Answered.class, decoding, decoding.toString()).response());
+    }
+
+    @Test
+    void refusesACountThatIsNegativeOrClaimsMoreEntriesThanBytesRemain() {
+        assertBroken(ApiKeys.DESCRIBE_TOPICS, int32(-1), "topicCount -1 is negative");
+        assertBroken(ApiKeys.DESCRIBE_TOPICS, concat(int32(Integer.MAX_VALUE), string("orders")), "needs at least");
+        assertBroken(ApiKeys.DESCRIBE_TOPICS, concat(int32(1), string("orders"), int32(-1)),
+                "partitionCount of topic 0 -1 is negative");
+        assertBroken(ApiKeys.DESCRIBE_TOPICS, concat(int32(1), string("orders"), int32(Integer.MAX_VALUE)),
+                "needs at least");
+        assertBroken(ApiKeys.DESCRIBE_GROUP, int32(-1), "offsetCount -1 is negative");
+        assertBroken(ApiKeys.DESCRIBE_GROUP, concat(int32(Integer.MAX_VALUE), string("orders")), "needs at least");
+    }
+
+    @Test
+    void refusesADescribedNameWhoseLengthIsNegativeOrRunsPastTheEndOfTheFrame() {
+        assertBroken(ApiKeys.DESCRIBE_TOPICS, concat(int32(1), int16(-1), int32(0)), "negative length");
+        assertBroken(ApiKeys.DESCRIBE_TOPICS,
+                concat(int32(1), stringWithLength(Short.MAX_VALUE, "orders"), int32(0)), "32767 bytes");
+        assertBroken(ApiKeys.DESCRIBE_GROUP, concat(int32(1), int16(-1), int32(0), int64(0L)), "negative length");
+    }
+
+    @Test
+    void refusesADescriptionWhoseNumbersCouldNotDescribeAPartition() {
+        assertBroken(ApiKeys.DESCRIBE_TOPICS,
+                concat(int32(1), string("orders"), int32(1), int32(0), int64(9L), int64(4L), int32(1), int64(0L)),
+                "running backwards");
+        assertBroken(ApiKeys.DESCRIBE_TOPICS,
+                concat(int32(1), string("orders"), int32(1), int32(0), int64(0L), int64(4L), int32(0), int64(0L)),
+                "segmentCount must be at least 1");
+        assertBroken(ApiKeys.DESCRIBE_GROUP, concat(int32(1), string("orders"), int32(0), int64(-1L)),
+                "cannot be one");
+    }
+
+    @Test
+    void refusesADescribeBodyThatEndsInsideAFieldOrCarriesTrailingBytes() {
+        assertBroken(ApiKeys.DESCRIBE_TOPICS, int16(0), "ends before topicCount");
+        // Enough bytes to pass the count's own guard, and four short of the offset the last of them
+        // starts: the guard weighs the smallest an entry could be, and the field check is what catches
+        // an entry that is smaller than the one actually written.
+        assertBroken(ApiKeys.DESCRIBE_GROUP, concat(int32(1), string("orders"), int32(0), int32(0)),
+                "ends before committedOffset");
+        assertBroken(ApiKeys.DESCRIBE_TOPICS, concat(int32(0), new byte[] {0x7f}), "left over");
+    }
+
+    /**
+     * @param apiKey         the api key of the request these bytes claim to answer
+     * @param body           a body no broker of this build would write
+     * @param reasonFragment what the verdict must name, so a refusal is proved to be the right refusal
+     */
+    private static void assertBroken(short apiKey, byte[] body, String reasonFragment) {
+        ResponseDecoding decoding = ResponseFrame.decode(apiKey,
+                response(CORRELATION_ID, ErrorCode.NONE.code(), body));
+
+        String reason = assertInstanceOf(ResponseDecoding.BrokenFrame.class, decoding, decoding.toString()).reason();
+        assertTrue(reason.contains(reasonFragment),
+                "expected a reason naming \"" + reasonFragment + "\" but was: " + reason);
     }
 
     /**

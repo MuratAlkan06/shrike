@@ -405,4 +405,38 @@ public final class GroupOffsetStore {
             throw new IllegalArgumentException(field + " must not be negative, but was " + value);
         }
     }
+
+    /**
+     * Every offset one group has committed, as a snapshot taken under {@link #lock}.
+     *
+     * <p>The order is the {@link TreeMap}'s — topic and then partition — which is the same order that
+     * group's file lists its lines in, so what this answers and what is on disk read the same way.
+     *
+     * <p>A group nothing has ever committed for has no entry here and no file on disk, and it is
+     * answered with an empty list rather than refused: a commit creates a group, so "no such group" and
+     * "a group that has committed nothing" are the same state, and there is no way to tell a caller
+     * apart from the other. That is why this method has no failure of its own.
+     *
+     * @param groupId the group asking, which may be anything a client sent
+     * @return that group's committed offsets, topic and then partition, or an empty list
+     */
+    public List<CommittedOffset> committedOffsets(String groupId) {
+        Objects.requireNonNull(groupId, "groupId");
+
+        lock.lock();
+        try {
+            Map<TopicPartition, Long> offsets = offsetsByGroup.get(SafeName.fold(groupId));
+            if (offsets == null) {
+                return List.of();
+            }
+            List<CommittedOffset> committed = new ArrayList<>(offsets.size());
+            for (Map.Entry<TopicPartition, Long> entry : offsets.entrySet()) {
+                committed.add(new CommittedOffset(entry.getKey().topic(), entry.getKey().partition(),
+                        entry.getValue()));
+            }
+            return committed;
+        } finally {
+            lock.unlock();
+        }
+    }
 }
