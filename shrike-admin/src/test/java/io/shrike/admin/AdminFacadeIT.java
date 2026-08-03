@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -24,6 +25,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -48,6 +50,9 @@ import org.springframework.context.ConfigurableApplicationContext;
 class AdminFacadeIT {
 
     private static final String LOOPBACK = InetAddress.getLoopbackAddress().getHostAddress();
+
+    /** All a chunked answer carrying nothing consists of: one chunk of length zero, and the end. */
+    private static final String CHUNKED_END_OF_BODY = "0\r\n\r\n";
 
     private static final String ORDERS = "orders";
     private static final String SHIPMENTS = "shipments";
@@ -177,6 +182,60 @@ class AdminFacadeIT {
     }
 
     /**
+     * {@code /error} is where the servlet container forwards, and it is reachable from outside like any
+     * other path. Both answers are the facade's own shape: the JSON one because that is the shape, and
+     * the HTML one because a caller's Accept header does not get to choose a second one.
+     */
+    @Test
+    void answersTheContainersErrorPathInItsOwnShapeWhateverTheCallerWillAccept() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        HttpResponse<String> asJson = get("/error", "application/json");
+        HttpResponse<String> asHtml = get("/error", "text/html");
+
+        // Nothing forwarded, so there is no original status to resolve and no failure to report: what
+        // the caller did was ask for a path this facade does not serve.
+        assertPlainError(asJson, 404, "no such endpoint");
+        assertPlainError(asHtml, 404, "no such endpoint");
+        assertTrue(contentTypeOf(asHtml).startsWith("application/json"), contentTypeOf(asHtml));
+        assertFalse(asHtml.body().contains("<"), "an HTML page reached the caller: " + asHtml.body());
+    }
+
+    /**
+     * Tomcat refuses these two prefixes itself, before the dispatcher is asked anything, and forwards
+     * the 404 it chose. Without a controller of this facade's own on that forward, the answer is Spring
+     * Boot's default error body — a different shape, carrying a timestamp and the caller's own path.
+     */
+    @Test
+    void answersAPathTheContainerRefusesInTheSameShapeAsEveryOtherFailure() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        HttpResponse<String> underWebInf = get("/WEB-INF/x");
+        HttpResponse<String> underMetaInf = get("/META-INF/x");
+
+        assertPlainError(underWebInf, 404, "no such endpoint");
+        assertPlainError(underMetaInf, 404, "no such endpoint");
+    }
+
+    /**
+     * A request target holding a broken percent-escape is refused while Tomcat is still parsing bytes,
+     * so no servlet, no filter, and no advice of this facade's ever sees it. What it must not get back
+     * is Tomcat's own HTML report, which names the server and its version.
+     */
+    @Test
+    void answersARequestTomcatRefusesWithAStatusAndAnEmptyBodyRatherThanAPage() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        String answer = rawGet("/%zz");
+
+        assertTrue(answer.startsWith("HTTP/1.1 400"), answer);
+        assertFalse(answer.contains("<"), "a page reached the caller: " + answer);
+        assertFalse(answer.toLowerCase(Locale.ROOT).contains("tomcat"),
+                "the server named itself to the caller: " + answer);
+        assertEquals("", entityOf(answer), "a request the container refused is answered with no body at all");
+    }
+
+    /**
      * Starts a broker in a process of its own and waits for the ready file that says which port it
      * bound.
      *
@@ -244,6 +303,47 @@ class AdminFacadeIT {
     }
 
     /**
+     * @param path   the path to ask for
+     * @param accept the one media type the caller says it will take
+     */
+    private HttpResponse<String> get(String path, String accept) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create("http://" + LOOPBACK + ":" + facadePort + path))
+                .header("Accept", accept)
+                .GET()
+                .build();
+        return http.send(request, HttpResponse.BodyHandlers.ofString(UTF_8));
+    }
+
+    /**
+     * Sends one request line as bytes and reads the whole answer back as bytes. The JDK's HTTP client
+     * will not build a URI holding a broken escape, and that is the point: a request target this server
+     * has to refuse before it parses one cannot be sent through a client that validates it first.
+     *
+     * @param requestTarget what goes between the method and the version, unvalidated
+     * @return the answer, status line and headers and body together
+     */
+    private String rawGet(String requestTarget) throws IOException {
+        try (Socket socket = new Socket(InetAddress.getLoopbackAddress(), facadePort)) {
+            socket.getOutputStream().write(("GET " + requestTarget + " HTTP/1.1\r\nHost: " + LOOPBACK
+                    + "\r\nConnection: close\r\n\r\n").getBytes(UTF_8));
+            socket.getOutputStream().flush();
+            return new String(socket.getInputStream().readAllBytes(), UTF_8);
+        }
+    }
+
+    /**
+     * @param answer a whole HTTP answer as it arrived
+     * @return what the answer carries as content. An answer with no content length declared is framed
+     *         with chunked transfer encoding, whose whole of "nothing" is one terminating chunk, so
+     *         that marker is removed here and an empty body reads as an empty string either way
+     */
+    private static String entityOf(String answer) {
+        int endOfHeaders = answer.indexOf("\r\n\r\n");
+        String body = endOfHeaders < 0 ? "" : answer.substring(endOfHeaders + 4);
+        return CHUNKED_END_OF_BODY.equals(body) ? "" : body;
+    }
+
+    /**
      * @param response  an answer that is not a 200
      * @param status    the status it should carry
      * @param message   the whole of the sentence its body should hold
@@ -265,6 +365,8 @@ class AdminFacadeIT {
         assertFalse(body.contains("/Users/"), "a path on this machine reached the caller: " + body);
         assertFalse(body.contains(workingDirectory.toString()),
                 "the broker's data directory reached the caller: " + body);
+        assertFalse(body.contains("timestamp"),
+                "the framework's own error body reached the caller: " + body);
     }
 
     private static String contentTypeOf(HttpResponse<String> response) {

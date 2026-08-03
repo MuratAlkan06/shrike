@@ -8,6 +8,7 @@ import io.shrike.clients.ShrikeClientException;
 import io.shrike.core.protocol.ErrorCode;
 import java.util.Objects;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -20,8 +21,9 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
  *
  * <p><strong>Nothing about how this facade is built reaches a caller.</strong> No stack trace, no
  * exception class name, no path on anybody's disk, and no message this process did not choose. What
- * failed is logged here, with its cause, for whoever is running the facade; what is answered is the
- * sentence below.
+ * failed is logged here for whoever is running the facade — see
+ * {@link #answer(HttpStatus, String, Exception) answer} for how much of it — and what is answered is
+ * the sentence below.
  *
  * <p>The mapping, in one place because it is the contract:
  * <ul>
@@ -41,6 +43,15 @@ public class ErrorResponses {
 
     /** The whole of what a caller is told about a failure this facade did not expect. */
     static final String INTERNAL_ERROR = "internal error";
+
+    /** A path this facade does not serve, however the caller arrived at it. */
+    static final String NO_SUCH_ENDPOINT = "no such endpoint";
+
+    /** A method this facade does not answer. Every endpoint here reads. */
+    static final String GET_ONLY = "this facade answers GET only";
+
+    /** Any other refusal the container settled, which this facade has no better sentence for. */
+    static final String REQUEST_REFUSED = "request refused";
 
     /**
      * The broker understood the request and refused it. Only one of its codes is something the caller
@@ -103,7 +114,7 @@ public class ErrorResponses {
      */
     @ExceptionHandler({NoHandlerFoundException.class, NoResourceFoundException.class})
     ResponseEntity<ErrorBody> answerUnknownPath(Exception unknown) {
-        return answer(HttpStatus.NOT_FOUND, "no such endpoint", unknown);
+        return answer(HttpStatus.NOT_FOUND, NO_SUCH_ENDPOINT, unknown);
     }
 
     /**
@@ -112,7 +123,7 @@ public class ErrorResponses {
      */
     @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
     ResponseEntity<ErrorBody> answerUnsupportedMethod(HttpRequestMethodNotSupportedException unsupported) {
-        return answer(HttpStatus.METHOD_NOT_ALLOWED, "this facade answers GET only", unsupported);
+        return answer(HttpStatus.METHOD_NOT_ALLOWED, GET_ONLY, unsupported);
     }
 
     /**
@@ -125,16 +136,53 @@ public class ErrorResponses {
     }
 
     /**
+     * The sentence for a status that arrived without an exception behind it, which is what a failure
+     * the servlet container settled on its own looks like by the time it reaches {@link ErrorEndpoint}.
+     *
+     * @param status the status the container is answering with
+     * @return the sentence this facade gives for it
+     */
+    static String sentenceFor(HttpStatus status) {
+        return switch (status) {
+            case NOT_FOUND -> NO_SUCH_ENDPOINT;
+            case METHOD_NOT_ALLOWED -> GET_ONLY;
+            default -> status.is4xxClientError() ? REQUEST_REFUSED : INTERNAL_ERROR;
+        };
+    }
+
+    /**
      * @param status  the status to answer with
      * @param message the sentence the caller is given, which is the whole of the body
-     * @param failure what actually happened, which is logged and never sent
+     * @return the answer, for a failure with no throwable behind it to log
+     */
+    static ResponseEntity<ErrorBody> answer(HttpStatus status, String message) {
+        return answer(status, message, null);
+    }
+
+    /**
+     * <p><strong>How much of a failure is written down depends on who caused it.</strong> A 4xx is
+     * something the caller did, and a caller that can make this process write a line can make it write
+     * one per request: DEBUG, and without the throwable, because forty stack frames per 404 is a disk
+     * somebody else gets to fill. {@code ShrikeBroker.java:382-386} applies exactly this rule to the
+     * broker's own connection logging, for the same reason. A 5xx is this facade or the broker behind
+     * it being in a state an operator has to know about rather than a shape of request anyone can send,
+     * so it keeps its level and its cause.
+     *
+     * @param status  the status to answer with
+     * @param message the sentence the caller is given, which is the whole of the body
+     * @param failure what actually happened, which is logged and never sent, or null when the failure
+     *                was settled by the container and there is no throwable to attach
      * @return the answer
      */
     private static ResponseEntity<ErrorBody> answer(HttpStatus status, String message, Exception failure) {
-        System.Logger.Level level = status.is5xxServerError()
-                ? System.Logger.Level.ERROR
-                : System.Logger.Level.WARNING;
-        LOGGER.log(level, () -> "answering " + status.value() + " " + message, failure);
-        return ResponseEntity.status(status).body(new ErrorBody(message));
+        if (status.is5xxServerError()) {
+            LOGGER.log(System.Logger.Level.ERROR, () -> "answering " + status.value() + " " + message, failure);
+        } else {
+            LOGGER.log(System.Logger.Level.DEBUG, () -> "answering " + status.value() + " " + message);
+        }
+        // The content type is named rather than negotiated: this shape is the one answer a failure
+        // gets, so a caller that will accept only HTML is given the JSON anyway instead of being told
+        // its own Accept header is a second failure.
+        return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON).body(new ErrorBody(message));
     }
 }

@@ -250,7 +250,9 @@ The bodies below came off a broker holding two topics — `orders` with three pa
 {"group":"watchers","partitions":[{"topic":"orders","partition":0,"committedOffset":2,"highWaterMark":5,"lag":3},{"topic":"orders","partition":1,"committedOffset":2,"highWaterMark":2,"lag":0},{"topic":"shipments","partition":0,"committedOffset":1,"highWaterMark":3,"lag":2}]}
 ```
 
-**Every failure is one shape:** `{"error":"<one sentence>"}`, and nothing else. No stack trace, no exception class name, and no path on anybody's disk reaches a caller; what actually failed is logged by the facade, where an operator can read it.
+**Every failure this facade answers is one shape:** `{"error":"<one sentence>"}`, and nothing else — `/error` included, and so are the `/WEB-INF` and `/META-INF` prefixes Tomcat refuses inside the container, both of which the framework would otherwise answer in a shape of its own carrying a timestamp and the caller's path. No stack trace, no exception class name, and no path on anybody's disk reaches a caller; what actually failed is logged by the facade, where an operator can read it — with its cause when the failure belongs to the facade or to the broker, and as one line without one when it belongs to the caller, because a log line a stranger can ask for is a log line a stranger can ask for a million of.
+
+A request Tomcat refuses **before** the servlet stack sees it — a broken percent-escape in the path, a request line longer than the header buffer — never reaches any of that. Those are answered with the status code and an empty body, never a page.
 
 | Status | When | The sentence |
 |---|---|---|
@@ -261,6 +263,7 @@ The bodies below came off a broker holding two topics — `orders` with three pa
 | 405 | a method it does not answer, every endpoint here being a read | `this facade answers GET only` |
 | 502 | something answered on the broker's port with bytes this client will not believe | `broker answer could not be read` |
 | 503 | a broker that cannot be reached, or does not answer in time | `broker unreachable` |
+| 4xx | any other refusal the container settled before a handler was asked | `request refused` |
 | 500 | anything else, which is a bug in the facade | `internal error` |
 
 The 400 sentence names the field the name arrived in — `topic` on a topic path, `groupId` on a group path — and quotes the caller's own input back, cut down when it is long. That quotation is the only detail any error body here carries, and it is the caller's, not the broker's.
@@ -385,6 +388,9 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A facade pointed at a broker that is not listening answers 503 rather than an empty report | `AdminFacadeIT#answersServiceUnavailableWhenTheBrokerIsNotListening` | 6 |
 | A topic name the protocol will not carry is refused by the facade with 400 and the rule it broke, before anything is asked of the broker | `AdminFacadeIT#answersBadRequestForANameTheProtocolWillNotCarry` | 6 |
 | A path the facade does not serve is answered 404 in the same one-field JSON shape as every other failure, never the framework's default error body | `AdminFacadeIT#answersNotFoundWithoutDetailForAPathItDoesNotServe` | 6 |
+| `/error`, where the container forwards, is answered in the facade's own shape whether the caller will accept JSON or HTML, rather than the framework's error body or its HTML page | `AdminFacadeIT#answersTheContainersErrorPathInItsOwnShapeWhateverTheCallerWillAccept` | 6 |
+| A path Tomcat refuses inside the container, `/WEB-INF` and `/META-INF`, comes back in that same one-field shape, without the timestamp and path the framework's default body carries | `AdminFacadeIT#answersAPathTheContainerRefusesInTheSameShapeAsEveryOtherFailure` | 6 |
+| A request Tomcat refuses before the servlet stack sees it is answered with a status code and an empty body, never an HTML page naming the server | `AdminFacadeIT#answersARequestTomcatRefusesWithAStatusAndAnEmptyBodyRatherThanAPage` | 6 |
 | A broker read out of its environment binds the loopback interface when nothing in that environment asks for a wider one | `BrokerLaunchTest#bindsTheLoopbackAddressWhenTheEnvironmentDoesNotAskForAWiderOne` | 6 |
 | Every interface is bound only when the environment says so in so many words | `BrokerLaunchTest#bindsEveryInterfaceOnlyWhenTheEnvironmentSaysSoInSoManyWords` | 6 |
 | A broker process started without a data directory refuses to start rather than choosing a path of its own | `BrokerLaunchTest#refusesToStartWithoutADataDirectory` | 6 |
