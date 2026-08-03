@@ -16,6 +16,12 @@ Status: Slice 2 — segmented log: size-based rolling, a sparse offset index, an
 - Kafka wire-protocol compatibility
 - any web UI
 
+## Recovery
+
+The recovery promise is tail-only. Opening a partition walks the last segment frame by frame — checking each frame's length, CRC32C, magic, and the offset it carries — and cuts the file off after the last whole frame, logging a WARN that names the byte position it truncated at. The records lost that way are records no producer was ever told about. Startup does not fail on a torn tail, and running it twice with no writes in between changes no file and no offset.
+
+Earlier segments are not walked, because a segment is forced before it is sealed. Damage inside a sealed segment is therefore left exactly where it is: startup succeeds, reading the damaged record fails with a corrupt-record error naming its topic, partition, offset, byte position, and file, and the records before and after it still read.
+
 ## Claims
 
 A claim may only be added in the same commit as the test that proves it. CI checks that every Evidence cell below points at something that exists.
@@ -42,3 +48,9 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | Reopening a log recovers it and appends after its last stored record | `SegmentedLogTest#reopensAnExistingLogAndAppendsAfterItsLastRecord` | 2 |
 | A partition reports its log start offset, high-water mark, segment count, and bytes on disk | `SegmentedLogStatisticsTest#reportsOffsetsSegmentCountAndBytesAcrossARoll` | 2 |
 | segment.bytes is capped at 1 GiB, so every byte position inside a segment fits an index entry's int32 field | `LogConfigTest#refusesASegmentBytesOverTheOneGibibyteCap` | 2 |
+| A torn tail is truncated to the last valid record at startup, and startup succeeds: an empty file, a truncated header or payload, a flipped bit, a negative, oversized, or zero length field, and trailing zeros all cost only the records that were being written | `SegmentedLogRecoveryTest#truncatesATornTailToTheLastValidRecordOnRestart` | 2 |
+| Damage inside a sealed segment is left where it is: startup succeeds, that record's read fails with the corrupt-record error, and the records before and after it still read | `SegmentedLogRecoveryTest#keepsDamageInsideASealedSegmentAndStillReadsItsNeighbours` | 2 |
+| A deleted index is rebuilt from the log alone, byte for byte identical to the one the appends had written | `SegmentedLogRecoveryTest#rebuildsADeletedIndexFromTheLogAlone` | 2 |
+| An index entry pointing past the end of its log makes the index untrustworthy, so it is emptied and rebuilt | `SegmentedLogRecoveryTest#rebuildsAnIndexThatPointsPastTheEndOfItsLog` | 2 |
+| A second restart with no writes in between changes no file size and no offset | `SegmentedLogRecoveryTest#changesNoFileAndNoOffsetOnASecondRestartWithoutWrites` | 2 |
+| After a torn tail is truncated, the reported high-water mark and bytes on disk shrink to match what survived | `SegmentedLogRecoveryTest#reportsTheTruncatedSizeAfterRecoveringATornTail` | 2 |
