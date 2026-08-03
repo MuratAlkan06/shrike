@@ -48,7 +48,7 @@ class RecordFrameGoldenBytesTest {
         ProducedRecord record = new ProducedRecord("k".getBytes(UTF_8), "v".getBytes(UTF_8));
         TimeSource fixedClock = () -> TIMESTAMP_MILLIS;
 
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, fixedClock)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, fixedClock)) {
             log.append(record);
         }
 

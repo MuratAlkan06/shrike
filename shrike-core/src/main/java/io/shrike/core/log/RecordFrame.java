@@ -39,6 +39,16 @@ final class RecordFrame {
     static final int MINIMUM_LENGTH_BYTES = CRC_FIELD_BYTES + Byte.BYTES + Byte.BYTES + Long.BYTES + Long.BYTES
             + Integer.BYTES + Integer.BYTES;
 
+    /** Where a frame's {@code offset} field starts, counted from the frame's first byte. */
+    static final int OFFSET_FIELD_POSITION_BYTES = LENGTH_FIELD_BYTES + CRC_FIELD_BYTES + Byte.BYTES + Byte.BYTES;
+
+    /**
+     * The bytes a reader needs in hand to learn how long a frame is and which offset it stores, which
+     * is what a scan looking for one offset among many reads at each frame it steps over. Every whole
+     * frame is at least this long, so a shorter read means the file ends inside a header.
+     */
+    static final int PREFIX_BYTES = OFFSET_FIELD_POSITION_BYTES + Long.BYTES;
+
     private RecordFrame() {
     }
 
