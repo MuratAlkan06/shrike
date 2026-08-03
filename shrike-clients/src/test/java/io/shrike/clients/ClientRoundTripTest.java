@@ -13,6 +13,8 @@ import io.shrike.core.log.StoredRecord;
 import io.shrike.core.net.BrokerConfig;
 import io.shrike.core.net.ShrikeBroker;
 import io.shrike.core.protocol.ErrorCode;
+import io.shrike.core.protocol.GroupOffset;
+import io.shrike.core.protocol.TopicDescription;
 import io.shrike.core.time.SystemTimeSource;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -169,6 +171,59 @@ class ClientRoundTripTest {
                     "the one refusal that answers with a number, so a consumer that has fallen behind the"
                             + " broker's retention learns where it may resume instead of guessing");
             assertTrue(pastTheEnd.getMessage().contains("logStartOffset=0"), pastTheEnd.getMessage());
+        }
+    }
+
+    @Test
+    void describesTheTopicItHasBeenProducingTo() {
+        try (ShrikeProducer producer = ShrikeProducer.open(config);
+             ShrikeTopics topics = ShrikeTopics.open(config)) {
+            producer.send(TOPIC, 0, key("a"), value("first"));
+            producer.send(TOPIC, 0, key("b"), value("second"));
+            producer.send(TOPIC, 1, key("c"), value("third"));
+
+            List<TopicDescription> described = topics.describe(List.of(TOPIC));
+
+            TopicDescription orders = described.get(0);
+            assertEquals(TOPIC, orders.name());
+            assertEquals(PARTITION_COUNT, orders.partitionCount());
+            assertEquals(0L, orders.partitions().get(0).logStartOffset());
+            assertEquals(2L, orders.partitions().get(0).highWaterMark(), "two records went to partition 0");
+            assertEquals(1L, orders.partitions().get(1).highWaterMark(), "and one went to partition 1");
+            assertEquals(1, orders.partitions().get(0).segmentCount(), "three small records do not fill a segment");
+            assertTrue(orders.partitions().get(0).bytes() > orders.partitions().get(1).bytes(),
+                    "the partition holding two records costs more disk than the one holding one");
+            assertEquals(described, topics.describeAll(),
+                    "there is one topic, so naming it and naming none of them are the same answer");
+        }
+    }
+
+    @Test
+    void describesTheOffsetsAGroupHasCommitted() {
+        try (ShrikeProducer producer = ShrikeProducer.open(config);
+             ShrikeConsumer consumer = ShrikeConsumer.open(config);
+             ShrikeGroups groups = ShrikeGroups.open(config)) {
+            producer.send(TOPIC, 0, key("a"), value("first"));
+            producer.send(TOPIC, 1, key("b"), value("second"));
+            consumer.commitOffset(GROUP, TOPIC, 1, 1L);
+            consumer.commitOffset(GROUP, TOPIC, 0, 1L);
+
+            List<GroupOffset> committed = groups.describe(GROUP);
+
+            assertEquals(List.of(new GroupOffset(TOPIC, 0, 1L), new GroupOffset(TOPIC, 1, 1L)), committed,
+                    "the offset to read next for each partition, topic and then partition");
+            assertEquals(List.of(), groups.describe("nobody-has-committed-here"),
+                    "a group that has committed nothing is empty rather than missing");
+        }
+    }
+
+    @Test
+    void raisesUnknownTopicWhenADescribeNamesATopicThisBrokerDoesNotHold() {
+        try (ShrikeTopics topics = ShrikeTopics.open(config)) {
+            BrokerErrorException unknown = assertThrows(BrokerErrorException.class,
+                    () -> topics.describe(List.of("no-such-topic")));
+
+            assertEquals(ErrorCode.UNKNOWN_TOPIC_OR_PARTITION, unknown.errorCode());
         }
     }
 
