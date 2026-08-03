@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
@@ -212,6 +213,39 @@ class ResponseFrameTest {
         ByteBuffer frame = response(CORRELATION_ID, ErrorCode.NONE.code(), new byte[0]);
 
         assertThrows(IllegalArgumentException.class, () -> ResponseFrame.decode(ApiKeys.DESCRIBE_GROUP, frame));
+    }
+
+    /**
+     * A fetch whose records are sent out of the segment file writes its header alone and its records
+     * after it, so the header has to be the prefix of the frame the whole-body encoder would have
+     * written — length field included, which means already counting records that are not in it yet.
+     * A client is not told which of the two answered it and must not be able to work it out.
+     */
+    @Test
+    void laysOutAFetchHeaderThatIsThePrefixOfTheWholeFrameItPromises() {
+        byte[] records = "these bytes stayed in the log file".getBytes(UTF_8);
+        byte[] wholeFrame = bytesOf(ResponseFrame.encode(CORRELATION_ID, new FetchResponse(41L, records)));
+
+        byte[] header = bytesOf(ResponseFrame.encodeFetchHeader(CORRELATION_ID, 41L, records.length));
+
+        assertEquals(ResponseFrame.LENGTH_FIELD_BYTES + ResponseFrame.MINIMUM_LENGTH_BYTES
+                + ResponseFrame.FETCH_RECORDS_PREFIX_BYTES, header.length, "the header stops before the records");
+        assertArrayEquals(Arrays.copyOfRange(wholeFrame, 0, header.length), header);
+        assertArrayEquals(wholeFrame, concat(header, records), "and the two together are that frame");
+    }
+
+    @Test
+    void refusesToLayOutAFetchHeaderForRecordsThatCannotBeCounted() {
+        assertThrows(IllegalArgumentException.class,
+                () -> ResponseFrame.encodeFetchHeader(CORRELATION_ID, 0L, -1));
+        assertThrows(IllegalArgumentException.class,
+                () -> ResponseFrame.encodeFetchHeader(CORRELATION_ID, 0L, Integer.MAX_VALUE));
+    }
+
+    private static byte[] bytesOf(ByteBuffer frame) {
+        byte[] bytes = new byte[frame.remaining()];
+        frame.get(bytes);
+        return bytes;
     }
 
     private static <T extends Response> T decode(Response response, Class<T> type) {

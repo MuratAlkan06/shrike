@@ -7,9 +7,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.shrike.core.time.TimeSource;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -210,6 +213,39 @@ class SegmentedLogRetentionTest {
                 assertRecordDecodes(firstFrame.array(), 0L);
                 assertRecordDecodes(secondFrame.array(), 1L);
             }
+        }
+    }
+
+    /**
+     * The same property, from the side a fetch uses it from. A range opened for sending holds a
+     * channel of its own on the segment file, so the sweep that closes the segment's channel and
+     * unlinks its two names cannot cut the transfer short — and this asks for the whole range
+     * <em>after</em> the deletion, which is the worst version of the timing a connection thread can
+     * meet.
+     */
+    @Test
+    void transfersARangeOpenedBeforeRetentionDeletedTheSegmentItIsIn() throws IOException {
+        try (SegmentedLog log = open(retentionOf(0L, LogConfig.RETENTION_DISABLED))) {
+            appendRecords(log, 0, 6);
+            byte[] beforeDeletion = Files.readAllBytes(logFileOf(0L));
+
+            ByteArrayOutputStream sent = new ByteArrayOutputStream();
+            try (RecordRange range = log.openRange(0L, 2L, Integer.MAX_VALUE);
+                    WritableByteChannel destination = Channels.newChannel(sent)) {
+                int deleted = log.deleteRetiredSegments(nowMillis.get() + ONE_HOUR_MS);
+
+                range.transferTo(destination);
+
+                assertEquals(2, deleted);
+                assertFalse(Files.exists(logFileOf(0L)), "the name is gone from the directory");
+                assertEquals(beforeDeletion.length, range.lengthBytes(),
+                        "and the range still promises every byte the segment held");
+            }
+
+            assertArrayEquals(beforeDeletion, sent.toByteArray(),
+                    "a transfer across a deletion sends the bytes it was opened over, whole");
+            assertRecordDecodes(Arrays.copyOfRange(sent.toByteArray(), 0, RECORD_BYTES), 0L);
+            assertRecordDecodes(Arrays.copyOfRange(sent.toByteArray(), RECORD_BYTES, 2 * RECORD_BYTES), 1L);
         }
     }
 

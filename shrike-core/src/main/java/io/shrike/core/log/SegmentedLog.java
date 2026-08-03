@@ -57,6 +57,12 @@ public final class SegmentedLog implements Log, LogStatistics {
 
     private static final long FIRST_OFFSET = 0L;
 
+    /**
+     * What the shared range check answers with when the range holds nothing. An offset is never
+     * negative, so no readable end offset can be mistaken for it.
+     */
+    private static final long NOTHING_READABLE = -1L;
+
     /** Shared because it is empty and never handed out for writing. */
     private static final byte[] NO_RECORDS = new byte[0];
 
@@ -206,6 +212,35 @@ public final class SegmentedLog implements Log, LogStatistics {
 
     @Override
     public byte[] readRange(long fetchOffset, long limitOffset, int maxBytes) {
+        long endOffset = readableEndOffset(fetchOffset, limitOffset, maxBytes);
+        if (endOffset == NOTHING_READABLE) {
+            return NO_RECORDS;
+        }
+        return segmentHolding(fetchOffset).readRange(fetchOffset, endOffset, maxBytes);
+    }
+
+    @Override
+    public RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes) {
+        long endOffset = readableEndOffset(fetchOffset, limitOffset, maxBytes);
+        if (endOffset == NOTHING_READABLE) {
+            return RecordRange.empty();
+        }
+        return segmentHolding(fetchOffset).openRange(fetchOffset, endOffset, maxBytes);
+    }
+
+    /**
+     * The checks both ways of serving a range make, in one place so that the two cannot disagree
+     * about which offsets a fetch may be answered with or about when the answer is empty.
+     *
+     * @param fetchOffset the offset the range starts at
+     * @param limitOffset the exclusive offset the caller wants to stop before
+     * @param maxBytes    the most bytes the caller wants, checked here and used by the segment
+     * @return the exclusive offset the range stops before, or {@link #NOTHING_READABLE} when there is
+     *         nothing in it
+     * @throws IllegalArgumentException  if {@code maxBytes} is negative
+     * @throws OffsetOutOfRangeException if {@code fetchOffset} is outside the readable range
+     */
+    private long readableEndOffset(long fetchOffset, long limitOffset, int maxBytes) {
         if (maxBytes < 0) {
             throw new IllegalArgumentException("maxBytes must not be negative, but was " + maxBytes);
         }
@@ -215,16 +250,16 @@ public final class SegmentedLog implements Log, LogStatistics {
             throw new OffsetOutOfRangeException(topic, partition, fetchOffset, logStartOffset(), nextOffset());
         }
         if (fetchOffset == nextOffset()) {
-            return NO_RECORDS;
+            return NOTHING_READABLE;
         }
 
         // Clamped here rather than trusted: the high-water mark is the only bound that keeps a
         // consumer from reading a record the broker has not finished acknowledging.
         long endOffset = Math.min(limitOffset, nextOffset());
         if (fetchOffset >= endOffset) {
-            return NO_RECORDS;
+            return NOTHING_READABLE;
         }
-        return segmentHolding(fetchOffset).readRange(fetchOffset, endOffset, maxBytes);
+        return endOffset;
     }
 
     @Override

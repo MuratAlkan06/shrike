@@ -6,7 +6,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.shrike.core.time.TimeSource;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.channels.Channels;
+import java.nio.channels.WritableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -117,6 +120,59 @@ class SegmentedLogRangeTest {
             assertEquals(2 * RECORD_BYTES, twoFramesFit.length);
             assertEquals(RECORD_BYTES, oneFrameFits.length, "a frame that would cross the cap waits for the next read");
         }
+    }
+
+    /**
+     * The range a fetch is sent out of the file must be the range a fetch would have been sent out of
+     * a buffer, because a client is not told which of the two answered it. Both are asked here, over
+     * the same log and for the same offsets, including the cases where the two could most easily
+     * disagree: a segment boundary, a {@code maxBytes} landing inside a frame, the whole-frame
+     * exception for a first frame larger than {@code maxBytes}, and the empty answer at the high-water
+     * mark.
+     */
+    @Test
+    void opensTheSameRangeItWouldHaveReadIntoMemory() throws IOException {
+        LogConfig twoRecordSegments = new LogConfig(LogConfig.DEFAULT_MAX_RECORD_BYTES, TWO_RECORD_SEGMENT_BYTES,
+                LogConfig.DEFAULT_INDEX_INTERVAL_BYTES);
+
+        try (SegmentedLog log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK, twoRecordSegments)) {
+            for (int record = 0; record < 5; record++) {
+                log.append(recordNumber(record));
+            }
+            long highWaterMark = log.nextOffset();
+
+            assertRangesAgree(log, 0L, highWaterMark, PLENTY_OF_BYTES);
+            assertRangesAgree(log, 1L, highWaterMark, PLENTY_OF_BYTES);
+            assertRangesAgree(log, 2L, highWaterMark, PLENTY_OF_BYTES);
+            assertRangesAgree(log, 0L, highWaterMark, 2 * RECORD_BYTES - 1);
+            assertRangesAgree(log, 0L, highWaterMark, 1);
+            assertRangesAgree(log, 0L, 1L, PLENTY_OF_BYTES);
+            assertRangesAgree(log, highWaterMark, highWaterMark, PLENTY_OF_BYTES);
+        }
+    }
+
+    /**
+     * Asserts that the two ways of serving one range cover the same bytes of the same file.
+     *
+     * @param log         the log to ask
+     * @param fetchOffset where the range starts
+     * @param limitOffset the exclusive offset it stops before
+     * @param maxBytes    the most bytes it may cover
+     */
+    private static void assertRangesAgree(SegmentedLog log, long fetchOffset, long limitOffset, int maxBytes)
+            throws IOException {
+        byte[] copied = log.readRange(fetchOffset, limitOffset, maxBytes);
+
+        ByteArrayOutputStream sent = new ByteArrayOutputStream();
+        try (RecordRange range = log.openRange(fetchOffset, limitOffset, maxBytes);
+                WritableByteChannel destination = Channels.newChannel(sent)) {
+            assertEquals(copied.length, range.lengthBytes(),
+                    "the opened range promised a different size from offset " + fetchOffset);
+            range.transferTo(destination);
+        }
+
+        assertArrayEquals(copied, sent.toByteArray(), "the two paths differ from offset " + fetchOffset
+                + " with maxBytes=" + maxBytes);
     }
 
     private static ProducedRecord recordNumber(int record) {

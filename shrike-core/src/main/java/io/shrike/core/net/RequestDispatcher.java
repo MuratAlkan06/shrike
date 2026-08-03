@@ -10,6 +10,7 @@ import io.shrike.core.protocol.CreateTopicRequest;
 import io.shrike.core.protocol.CreateTopicResponse;
 import io.shrike.core.protocol.ErrorCode;
 import io.shrike.core.protocol.FetchRequest;
+import io.shrike.core.protocol.FetchResponse;
 import io.shrike.core.protocol.ProduceRequest;
 import io.shrike.core.protocol.ProduceResponse;
 import io.shrike.core.protocol.Request;
@@ -96,8 +97,16 @@ final class RequestDispatcher {
         }
 
         try {
-            return new Answer.Served(partition.get().fetch(request.fetchOffset(), request.maxBytes(),
-                    request.maxWaitMs(), request.minBytes()));
+            // Two shapes in, two shapes out: a fetch whose records were copied into memory is an
+            // ordinary body, and one whose records are still in the file is the answer the connection
+            // has to write a header for and then send. Nothing here decides which; the partition
+            // already did, from the setting it was started with.
+            return switch (partition.get().fetch(request.fetchOffset(), request.maxBytes(), request.maxWaitMs(),
+                    request.minBytes())) {
+                case FetchedRecords.Copied copied -> new Answer.Served(new FetchResponse(copied.highWaterMark(),
+                        copied.records()));
+                case FetchedRecords.Pinned pinned -> new Answer.Streamed(pinned.highWaterMark(), pinned.records());
+            };
         } catch (OffsetOutOfRangeException e) {
             // The offset comes off the exception rather than from a second call on the partition: it
             // is what the range was when the read was refused, and asking again could answer with a

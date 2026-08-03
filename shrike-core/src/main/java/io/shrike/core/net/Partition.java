@@ -6,7 +6,6 @@ import io.shrike.core.log.ProducedRecord;
 import io.shrike.core.log.RecordFrame;
 import io.shrike.core.log.RecordTooLargeException;
 import io.shrike.core.log.SegmentedLog;
-import io.shrike.core.protocol.FetchResponse;
 import io.shrike.core.time.TimeSource;
 import java.io.Closeable;
 import java.util.List;
@@ -37,6 +36,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@code maxWaitMs} to {@link BrokerConfig#maxFetchWaitMs()}, and its {@code minBytes} to the most
  * bytes a fetch can ever be served. See {@link #clampedWaitMs(int, int)} and
  * {@link #clampedMinBytes(int, int)}.
+ *
+ * <p>An answer may leave this class holding a file open — see {@link #readable} — and it leaves under
+ * the lock rather than after it. That is what lets the connection thread go on sending a fetch's bytes
+ * while this partition takes appends and deletes segments behind it.
  */
 final class Partition implements Closeable {
 
@@ -50,6 +53,9 @@ final class Partition implements Closeable {
 
     /** The longest this partition will hold a fetch open, whatever the request asked for. */
     private final int maxFetchWaitMs;
+
+    /** Whether a fetch is answered out of the segment file rather than out of a buffer. */
+    private final boolean zeroCopyFetch;
 
     /** The clock a fetch's deadline is measured on, injected like every other clock in this broker. */
     private final TimeSource timeSource;
@@ -89,6 +95,7 @@ final class Partition implements Closeable {
         // how much memory one connection may make this broker hold, whichever way the bytes travel.
         this.maxFetchBytes = config.maxRequestBytes();
         this.maxFetchWaitMs = config.maxFetchWaitMs();
+        this.zeroCopyFetch = config.zeroCopyFetch();
         this.timeSource = timeSource;
         this.log = log;
     }
@@ -176,13 +183,14 @@ final class Partition implements Closeable {
      *                    bound; 0 answers immediately
      * @param minBytes    how many bytes are worth answering before that wait is up, capped by what can
      *                    be served; 0 answers immediately
-     * @return the records and the high-water mark they were read against
+     * @return the records and the high-water mark they were read against, in whichever of the two
+     *         shapes {@link #readable} produced. The caller closes it
      * @throws io.shrike.core.log.OffsetOutOfRangeException if {@code fetchOffset} is outside the range
      *                                                      the partition can serve
      * @throws io.shrike.core.log.CorruptRecordException    if a frame in the range no longer matches
      *                                                      what the log knows
      */
-    FetchResponse fetch(long fetchOffset, int maxBytes, int maxWaitMs, int minBytes) {
+    FetchedRecords fetch(long fetchOffset, int maxBytes, int maxWaitMs, int minBytes) {
         int servedMaxBytes = Math.min(maxBytes, maxFetchBytes);
         int servedMinBytes = clampedMinBytes(minBytes, servedMaxBytes);
         int servedMaxWaitMs = clampedWaitMs(maxWaitMs, maxFetchWaitMs);
@@ -198,10 +206,14 @@ final class Partition implements Closeable {
                 long remainingMillis = deadlineMillis - timeSource.currentTimeMillis();
                 boolean answerNow = remainingMillis <= 0 || stopped;
                 if (answerNow || highWaterMark != lastReadHighWaterMark) {
-                    byte[] records = log.readRange(fetchOffset, highWaterMark, servedMaxBytes);
-                    if (answerNow || records.length >= servedMinBytes) {
-                        return new FetchResponse(highWaterMark, records);
+                    FetchedRecords records = readable(fetchOffset, highWaterMark, servedMaxBytes);
+                    if (answerNow || records.recordBytes() >= servedMinBytes) {
+                        return records;
                     }
+                    // Not enough to answer with yet, so whatever it was holding goes back before this
+                    // fetch waits again: a channel kept across a wait is a descriptor held for as long
+                    // as somebody's long poll.
+                    records.close();
                     lastReadHighWaterMark = highWaterMark;
                 }
 
@@ -214,13 +226,39 @@ final class Partition implements Closeable {
                     // whoever set it, rather than swallowing it or failing a request that is fine.
                     Thread.currentThread().interrupt();
                     long interruptedAt = log.nextOffset();
-                    return new FetchResponse(interruptedAt, log.readRange(fetchOffset, interruptedAt,
-                            servedMaxBytes));
+                    return readable(fetchOffset, interruptedAt, servedMaxBytes);
                 }
             }
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Reads what a fetch can be served this instant, by whichever of the two paths this broker was
+     * started with. It is the only place {@code fetch.zero.copy} decides anything: the clamps, the
+     * predicate, and the wait above it are the same either way, and both paths ask the log for the
+     * same range, so which one served a fetch is not something its client can tell from the bytes.
+     *
+     * <p>Both are called under {@link #lock}, and for the zero-copy path that is the whole of the
+     * concurrency story. The channel a range holds is opened here, under the same lock retention takes
+     * to delete a segment — so a range either exists before the unlink, in which case it reads the
+     * inode to the end however many names are left pointing at it, or it is located after the unlink,
+     * in which case the segment is already out of the log and the offset is refused with the one the
+     * log now starts at. There is no third case, and nothing is reference-counted to rule one out.
+     *
+     * @param fetchOffset    the offset to read from
+     * @param highWaterMark  the exclusive offset to stop before, which is where the log is now
+     * @param servedMaxBytes the most bytes this fetch may be answered with
+     * @return the records, which the caller closes
+     */
+    private FetchedRecords readable(long fetchOffset, long highWaterMark, int servedMaxBytes) {
+        if (zeroCopyFetch) {
+            return new FetchedRecords.Pinned(highWaterMark,
+                    log.openRange(fetchOffset, highWaterMark, servedMaxBytes));
+        }
+        return new FetchedRecords.Copied(highWaterMark,
+                log.readRange(fetchOffset, highWaterMark, servedMaxBytes));
     }
 
     /**
@@ -258,6 +296,10 @@ final class Partition implements Closeable {
      * like everything else rather than mutating storage beside a reader. What it holds the lock for is
      * an unlink and a couple of file closes, not a read of the log, so a sweep does not become a pause
      * for the connections using this partition.
+     *
+     * <p>A fetch that is part way through sending a deleted segment's bytes is not something this has
+     * to wait for. The channels it closes are the segment's own; a fetch reads through one it opened
+     * for itself, under this lock, and reads it to the end. {@link #readable} is where that is set out.
      *
      * @param nowMillis the epoch millisecond retention is evaluated at
      * @return how many segments were deleted

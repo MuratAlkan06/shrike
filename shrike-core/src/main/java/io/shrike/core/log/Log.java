@@ -75,6 +75,34 @@ public interface Log extends Closeable {
     byte[] readRange(long fetchOffset, long limitOffset, int maxBytes);
 
     /**
+     * Locates the same range {@link #readRange} would return and opens it instead of reading it: the
+     * caller is handed the file, the byte position, and the byte count, and sends the bytes wherever
+     * they are going itself.
+     *
+     * <p>Every rule above applies unchanged — where the range starts, where it stops, the whole-frame
+     * rule and its first-frame exception — because both methods ask the same segment the same
+     * question and only differ in what they do with the answer. That is deliberate: the bytes a
+     * consumer receives must not depend on which of the two served them.
+     *
+     * <p>The range holds a channel of its own, so the caller closes it once the bytes have gone. What
+     * that buys is stated on {@link RecordRange}: a transfer already under way is not disturbed by
+     * retention deleting the segment it is reading.
+     *
+     * @param fetchOffset the logical record number to start at; {@link #nextOffset()} is legal and
+     *                    yields an empty range
+     * @param limitOffset the exclusive logical record number to stop before, clamped to
+     *                    {@link #nextOffset()} so no range can cross the high-water mark
+     * @param maxBytes    the most bytes to cover, subject to the whole-frame rule above
+     * @return the range, which the caller closes
+     * @throws IllegalArgumentException  if {@code maxBytes} is negative
+     * @throws OffsetOutOfRangeException if {@code fetchOffset} is below the first readable offset or
+     *                                   past {@link #nextOffset()}
+     * @throws CorruptRecordException    if a frame in the range contradicts what the log knows
+     * @throws ShrikeIOException         if the segment cannot be read or opened
+     */
+    RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes);
+
+    /**
      * @return the offset the next append will take, which is also the exclusive upper bound of the
      *         readable offsets: the high-water mark
      */

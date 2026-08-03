@@ -337,6 +337,68 @@ final class LogSegment implements Closeable {
      * @throws ShrikeIOException      if the read fails
      */
     byte[] readRange(long fetchOffset, long limitOffset, int maxBytes) {
+        FramePositions range = locateRange(fetchOffset, limitOffset, maxBytes);
+        int rangeBytes = range.lengthBytes();
+        ByteBuffer records = ByteBuffer.allocate(rangeBytes);
+        try {
+            ByteChannels.readFully(channel, records, range.positionBytes());
+        } catch (IOException e) {
+            throw new ShrikeIOException("cannot read the range from offset " + fetchOffset + " near position "
+                    + range.positionBytes() + " of " + logFile, e);
+        }
+        if (records.hasRemaining()) {
+            throw new CorruptRecordException(
+                    new RecordLocation(topic, partition, fetchOffset, range.positionBytes(), logFile),
+                    "the segment holds " + records.position() + " of the " + rangeBytes
+                            + " bytes its frames declare");
+        }
+        return records.array();
+    }
+
+    /**
+     * Locates the same frames {@link #readRange} would copy and opens the file over them instead, so
+     * that the caller can send them without any of them passing through memory here.
+     *
+     * <p>The channel is a second descriptor on this segment's log file rather than the one this
+     * segment reads and writes through, and the {@link RecordRange} that carries it is what closes
+     * it. {@link RecordRange} says what that buys; the short version is that {@link #delete()} may
+     * run while the range is still being sent.
+     *
+     * @param fetchOffset the offset to start at, which this segment is known to cover
+     * @param limitOffset the exclusive offset to stop before, already clamped to the high-water mark
+     * @param maxBytes    the most bytes to cover, subject to the whole-frame rule
+     * @return the range, which the caller closes
+     * @throws CorruptRecordException if a frame contradicts the offset the walk expects
+     * @throws ShrikeIOException      if the segment cannot be read or opened
+     */
+    RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes) {
+        FramePositions range = locateRange(fetchOffset, limitOffset, maxBytes);
+        if (range.lengthBytes() == 0) {
+            return RecordRange.empty();
+        }
+        try {
+            return RecordRange.of(logFile, FileChannel.open(logFile, StandardOpenOption.READ),
+                    range.positionBytes(), range.lengthBytes());
+        } catch (IOException e) {
+            throw new ShrikeIOException("cannot open " + logFile + " to send the range from offset " + fetchOffset
+                    + " at position " + range.positionBytes(), e);
+        }
+    }
+
+    /**
+     * Walks this segment's frames and decides which bytes a fetch from {@code fetchOffset} is owed.
+     * It is the one place that decision is made: {@link #readRange} copies what it names and
+     * {@link #openRange} opens the file over it, so the two cannot come to different conclusions
+     * about which frames a consumer was promised.
+     *
+     * @param fetchOffset the offset to start at, which this segment is known to cover
+     * @param limitOffset the exclusive offset to stop before, already clamped to the high-water mark
+     * @param maxBytes    the most bytes to cover, subject to the whole-frame rule
+     * @return where the range starts and how long it is
+     * @throws CorruptRecordException if a frame contradicts the offset the walk expects
+     * @throws ShrikeIOException      if the read fails
+     */
+    private FramePositions locateRange(long fetchOffset, long limitOffset, int maxBytes) {
         long positionBytes = index.floorPositionBytes(fetchOffset);
         long startPositionBytes = -1L;
         long endPositionBytes = -1L;
@@ -370,27 +432,17 @@ final class LogSegment implements Closeable {
                 positionBytes += header.frameBytes();
                 endPositionBytes = positionBytes;
             }
-
-            if (startPositionBytes < 0) {
-                throw new CorruptRecordException(
-                        new RecordLocation(topic, partition, fetchOffset, positionBytes, logFile),
-                        "the segment ends before this offset was found");
-            }
-
-            int rangeBytes = (int) (endPositionBytes - startPositionBytes);
-            ByteBuffer records = ByteBuffer.allocate(rangeBytes);
-            ByteChannels.readFully(channel, records, startPositionBytes);
-            if (records.hasRemaining()) {
-                throw new CorruptRecordException(
-                        new RecordLocation(topic, partition, fetchOffset, startPositionBytes, logFile),
-                        "the segment holds " + records.position() + " of the " + rangeBytes
-                                + " bytes its frames declare");
-            }
-            return records.array();
         } catch (IOException e) {
             throw new ShrikeIOException("cannot read the range from offset " + fetchOffset + " near position "
                     + positionBytes + " of " + logFile, e);
         }
+
+        if (startPositionBytes < 0) {
+            throw new CorruptRecordException(
+                    new RecordLocation(topic, partition, fetchOffset, positionBytes, logFile),
+                    "the segment ends before this offset was found");
+        }
+        return new FramePositions(startPositionBytes, (int) (endPositionBytes - startPositionBytes));
     }
 
     /**
@@ -476,6 +528,16 @@ final class LogSegment implements Closeable {
         long frameBytes() {
             return RecordFrame.LENGTH_FIELD_BYTES + (long) lengthBytes;
         }
+    }
+
+    /**
+     * Where a range of whole frames starts inside this segment and how many bytes it occupies. Both
+     * ways of serving a fetch are built on one of these, which is what keeps them agreeing.
+     *
+     * @param positionBytes the byte position the first frame of the range starts at
+     * @param lengthBytes   how many bytes of whole frames the range covers, never a partial one
+     */
+    private record FramePositions(long positionBytes, int lengthBytes) {
     }
 
     /**

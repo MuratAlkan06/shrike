@@ -42,6 +42,12 @@ public final class ResponseFrame {
      */
     public static final int OFFSET_OUT_OF_RANGE_BODY_BYTES = Long.BYTES;
 
+    /**
+     * What a fetch response carries before its records: the high-water mark and the size of the
+     * records block, in that order.
+     */
+    public static final int FETCH_RECORDS_PREFIX_BYTES = Long.BYTES + Integer.BYTES;
+
     private ResponseFrame() {
     }
 
@@ -79,6 +85,44 @@ public final class ResponseFrame {
             }
         }
         return frame.flip();
+    }
+
+    /**
+     * Lays out everything a fetch response carries <em>before</em> its records: the length field, the
+     * correlation id, {@link ErrorCode#NONE}, the high-water mark, and how many bytes of record frames
+     * follow. The frames themselves are not here — this is the header a broker writes when it is about
+     * to send them straight out of the segment file — and the length field already counts them,
+     * because a length is a promise about the whole frame and not about the part of it that is in
+     * memory.
+     *
+     * <p>What this produces is the first {@value #LENGTH_FIELD_BYTES} plus {@value #MINIMUM_LENGTH_BYTES}
+     * plus {@value #FETCH_RECORDS_PREFIX_BYTES} bytes of what {@link #encode} produces for the same
+     * answer, byte for byte. That is the point of it: which of the two ways a fetch is served must not
+     * be something a client can tell from the bytes.
+     *
+     * @param correlationId    the number the request carried
+     * @param highWaterMark    the offset the partition will append next
+     * @param recordsSizeBytes how many bytes of record frames will follow this header
+     * @return the encoded header
+     * @throws IllegalArgumentException if the size is negative, or if the whole response would be too
+     *                                  large for a frame to describe
+     */
+    public static ByteBuffer encodeFetchHeader(int correlationId, long highWaterMark, int recordsSizeBytes) {
+        if (recordsSizeBytes < 0) {
+            throw new IllegalArgumentException("recordsSizeBytes must not be negative, but was " + recordsSizeBytes);
+        }
+
+        long frameBytes = (long) LENGTH_FIELD_BYTES + MINIMUM_LENGTH_BYTES + FETCH_RECORDS_PREFIX_BYTES
+                + recordsSizeBytes;
+        if (frameBytes > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("a response of " + frameBytes
+                    + " bytes cannot be framed: the length field is an int32");
+        }
+
+        ByteBuffer header = ByteBuffer.allocate(LENGTH_FIELD_BYTES + MINIMUM_LENGTH_BYTES
+                + FETCH_RECORDS_PREFIX_BYTES);
+        putEnvelope(header, (int) (frameBytes - LENGTH_FIELD_BYTES), correlationId, ErrorCode.NONE);
+        return header.putLong(highWaterMark).putInt(recordsSizeBytes).flip();
     }
 
     /**
@@ -230,8 +274,24 @@ public final class ResponseFrame {
     }
 
     private static ByteBuffer allocateFrame(int frameBytes, int correlationId, ErrorCode errorCode) {
-        ByteBuffer frame = ByteBuffer.allocate(frameBytes);
-        frame.putInt(frameBytes - LENGTH_FIELD_BYTES);
+        return putEnvelope(ByteBuffer.allocate(frameBytes), frameBytes - LENGTH_FIELD_BYTES, correlationId,
+                errorCode);
+    }
+
+    /**
+     * Writes the three fields every response begins with. It is the only place that layout is written,
+     * so a header written ahead of records still on disk and a whole frame written from memory cannot
+     * describe themselves differently.
+     *
+     * @param frame         the buffer to write into, positioned at its first byte
+     * @param lengthBytes   what the length field declares, which counts every byte after itself and so
+     *                      is not the same as what this buffer holds
+     * @param correlationId the number the request carried
+     * @param errorCode     the code the envelope carries
+     * @return the same buffer, positioned after the envelope
+     */
+    private static ByteBuffer putEnvelope(ByteBuffer frame, int lengthBytes, int correlationId, ErrorCode errorCode) {
+        frame.putInt(lengthBytes);
         frame.putInt(correlationId);
         frame.putShort(errorCode.code());
         return frame;
