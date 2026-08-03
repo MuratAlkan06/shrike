@@ -1,19 +1,30 @@
 package io.shrike.core.net;
 
+import io.shrike.core.group.CommittedOffset;
 import io.shrike.core.group.GroupOffsetStore;
 import io.shrike.core.log.CorruptRecordException;
 import io.shrike.core.log.OffsetOutOfRangeException;
 import io.shrike.core.log.RecordTooLargeException;
+import io.shrike.core.log.SafeName;
 import io.shrike.core.protocol.CommitOffsetRequest;
 import io.shrike.core.protocol.CommitOffsetResponse;
 import io.shrike.core.protocol.CreateTopicRequest;
 import io.shrike.core.protocol.CreateTopicResponse;
+import io.shrike.core.protocol.DescribeGroupRequest;
+import io.shrike.core.protocol.DescribeGroupResponse;
+import io.shrike.core.protocol.DescribeTopicsRequest;
+import io.shrike.core.protocol.DescribeTopicsResponse;
 import io.shrike.core.protocol.ErrorCode;
 import io.shrike.core.protocol.FetchRequest;
 import io.shrike.core.protocol.FetchResponse;
+import io.shrike.core.protocol.GroupOffset;
+import io.shrike.core.protocol.PartitionDescription;
 import io.shrike.core.protocol.ProduceRequest;
 import io.shrike.core.protocol.ProduceResponse;
 import io.shrike.core.protocol.Request;
+import io.shrike.core.protocol.TopicDescription;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -32,7 +43,9 @@ import java.util.Optional;
  *
  * <ul>
  *   <li>{@link ErrorCode#UNKNOWN_TOPIC_OR_PARTITION} — no such topic, or a partition number outside
- *       the count the topic was created with, including a negative one.
+ *       the count the topic was created with, including a negative one. A describe that <em>names</em>
+ *       a topic this broker does not hold earns it too; a describe that names none of them asks for
+ *       every topic there is, and a broker holding none answers that with no topics.
  *   <li>{@link ErrorCode#OFFSET_OUT_OF_RANGE} — a fetch below the first offset a partition still holds
  *       or past its high-water mark, or a commit past that mark. The mark itself is <em>in</em> range
  *       in both cases: it is where a caught-up consumer sits. This is the one refusal that answers
@@ -74,6 +87,8 @@ final class RequestDispatcher {
             case FetchRequest fetch -> read(fetch);
             case CommitOffsetRequest commit -> commitOffset(commit);
             case CreateTopicRequest create -> createTopic(create);
+            case DescribeTopicsRequest describeTopics -> describeTopics(describeTopics);
+            case DescribeGroupRequest describeGroup -> describeGroup(describeGroup);
         };
     }
 
@@ -149,6 +164,71 @@ final class RequestDispatcher {
         } catch (TooManyPartitionsException e) {
             return new Answer.Refused(ErrorCode.INVALID_REQUEST, e.getMessage());
         }
+    }
+
+    /**
+     * A named topic this broker does not hold is refused; a request naming none of them is asking about
+     * every topic there is, and a broker holding none of those answers with an empty list. The two are
+     * different questions rather than the same question with different answers: a caller that spelled a
+     * topic out is owed the news that it is not here, and a caller that spelled nothing out has asked
+     * something an empty broker answers truthfully.
+     */
+    private Answer describeTopics(DescribeTopicsRequest request) {
+        List<Topic> described;
+        if (request.describesEveryTopic()) {
+            described = topics.topics();
+        } else {
+            described = new ArrayList<>(request.topics().size());
+            for (String name : request.topics()) {
+                Optional<Topic> topic = topics.topic(name);
+                if (topic.isEmpty()) {
+                    return new Answer.Refused(ErrorCode.UNKNOWN_TOPIC_OR_PARTITION,
+                            "this broker holds no topic=" + name);
+                }
+                described.add(topic.get());
+            }
+        }
+
+        List<TopicDescription> descriptions = new ArrayList<>(described.size());
+        for (Topic topic : described) {
+            descriptions.add(describe(topic));
+        }
+        return new Answer.Served(new DescribeTopicsResponse(descriptions));
+    }
+
+    /**
+     * Each partition's five numbers are read in one pass under that partition's own lock, so a
+     * description names one instant of that partition rather than five. Nothing holds a lock across two
+     * partitions, so a topic's description can straddle an append to one of them — which is what a
+     * report about a broker that is still taking writes is.
+     */
+    private static TopicDescription describe(Topic topic) {
+        List<PartitionDescription> partitions = new ArrayList<>(topic.partitionCount());
+        for (Partition partition : topic.partitions()) {
+            PartitionStatistics statistics = partition.statistics();
+            // What a partition costs is one number to whoever is watching a disk fill up, and the split
+            // between records and the index that finds them is the log package's business.
+            long bytes = statistics.logBytes() + statistics.indexBytes();
+            partitions.add(new PartitionDescription(partition.partition(), statistics.logStartOffset(),
+                    statistics.highWaterMark(), statistics.segmentCount(), bytes));
+        }
+        return new TopicDescription(SafeName.fold(topic.name()), partitions);
+    }
+
+    /**
+     * A group this broker has never heard of is answered with no entries rather than refused. A commit
+     * is what creates a group — there is no create-group api and no group registry — so "no such group"
+     * and "a group that has committed nothing" are one state, and an error code that claimed to tell
+     * them apart would be claiming to know something this broker does not.
+     */
+    private Answer describeGroup(DescribeGroupRequest request) {
+        List<CommittedOffset> committed = groupOffsets.committedOffsets(request.groupId());
+
+        List<GroupOffset> offsets = new ArrayList<>(committed.size());
+        for (CommittedOffset offset : committed) {
+            offsets.add(new GroupOffset(offset.topic(), offset.partition(), offset.offset()));
+        }
+        return new Answer.Served(new DescribeGroupResponse(offsets));
     }
 
     private static Answer unknownTopicOrPartition(String topic, int partition) {

@@ -1,10 +1,16 @@
 package io.shrike.core.protocol;
 
+import static io.shrike.core.protocol.WireFrames.concat;
+import static io.shrike.core.protocol.WireFrames.int32;
+import static io.shrike.core.protocol.WireFrames.request;
+import static io.shrike.core.protocol.WireFrames.string;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.shrike.core.log.ProducedRecord;
 import java.nio.ByteBuffer;
@@ -75,6 +81,75 @@ class RequestFrameTest {
     }
 
     @Test
+    void roundTripsADescribeTopicsRequestThatNamesNoTopicAndSoMeansEveryTopic() {
+        DescribeTopicsRequest request = DescribeTopicsRequest.everyTopic();
+
+        DescribeTopicsRequest decoded = decode(request, DescribeTopicsRequest.class);
+
+        assertEquals(List.of(), decoded.topics());
+        assertTrue(decoded.describesEveryTopic(), "a count of zero is how the wire says every topic");
+    }
+
+    @Test
+    void roundTripsADescribeTopicsRequestThatNamesSeveralTopics() {
+        DescribeTopicsRequest request = new DescribeTopicsRequest(List.of("orders", "events", "orders.eu-west_1"));
+
+        DescribeTopicsRequest decoded = decode(request, DescribeTopicsRequest.class);
+
+        assertEquals(List.of("orders", "events", "orders.eu-west_1"), decoded.topics(),
+                "the names come back in the order they were asked about");
+        assertFalse(decoded.describesEveryTopic());
+    }
+
+    @Test
+    void roundTripsADescribeGroupRequest() {
+        DescribeGroupRequest request = new DescribeGroupRequest("billing-group");
+
+        DescribeGroupRequest decoded = decode(request, DescribeGroupRequest.class);
+
+        assertEquals(request, decoded);
+    }
+
+    /**
+     * The body a client that does not share this build's encoder would lay out, both ways: these are the
+     * bytes the encoder writes, and these are the bytes the decoder reads back as the same request.
+     *
+     * <pre>
+     * 00000000            topicCount = 0, which is every topic
+     * </pre>
+     *
+     * <pre>
+     * 00000002            topicCount = 2
+     * 0006 6f7264657273   "orders"
+     * 0006 6576656e7473   "events"
+     * </pre>
+     */
+    @Test
+    void readsTheDescribeTopicsBodyOfAClientThatBuiltItByHand() {
+        byte[] everyTopic = int32(0);
+        byte[] twoTopics = concat(int32(2), string("orders"), string("events"));
+
+        assertArrayEquals(everyTopic, bodyOf(DescribeTopicsRequest.everyTopic()));
+        assertArrayEquals(twoTopics, bodyOf(new DescribeTopicsRequest(List.of("orders", "events"))));
+        assertEquals(DescribeTopicsRequest.everyTopic(), decodeBody(ApiKeys.DESCRIBE_TOPICS, everyTopic));
+        assertEquals(new DescribeTopicsRequest(List.of("orders", "events")),
+                decodeBody(ApiKeys.DESCRIBE_TOPICS, twoTopics));
+    }
+
+    /**
+     * <pre>
+     * 0007 726561646572 73   "readers"
+     * </pre>
+     */
+    @Test
+    void readsTheDescribeGroupBodyOfAClientThatBuiltItByHand() {
+        byte[] body = string("readers");
+
+        assertArrayEquals(body, bodyOf(new DescribeGroupRequest("readers")));
+        assertEquals(new DescribeGroupRequest("readers"), decodeBody(ApiKeys.DESCRIBE_GROUP, body));
+    }
+
+    @Test
     void echoesTheCorrelationIdOfEveryRequestBackToTheCaller() {
         CreateTopicRequest request = new CreateTopicRequest("orders", 1);
 
@@ -114,5 +189,21 @@ class RequestFrameTest {
                 decoding.toString());
         assertEquals(CORRELATION_ID, accepted.correlationId());
         return assertInstanceOf(type, accepted.request());
+    }
+
+    /** @return everything the encoder wrote after the envelope, which is the body alone */
+    private static byte[] bodyOf(Request request) {
+        ByteBuffer frame = WireFrames.afterLength(RequestFrame.encode(CORRELATION_ID, request));
+
+        byte[] body = new byte[frame.remaining() - RequestFrame.MINIMUM_LENGTH_BYTES];
+        frame.duplicate().position(frame.position() + RequestFrame.MINIMUM_LENGTH_BYTES).get(body);
+        return body;
+    }
+
+    /** @return the request those hand-built body bytes are, under an envelope naming that api key */
+    private static Request decodeBody(short apiKey, byte[] body) {
+        RequestDecoding decoding = RequestFrame.decode(request(apiKey, ApiKeys.VERSION_0, CORRELATION_ID, body));
+
+        return assertInstanceOf(RequestDecoding.Accepted.class, decoding, decoding.toString()).request();
     }
 }

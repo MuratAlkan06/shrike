@@ -25,7 +25,7 @@ request:  length:int32 | apiKey:int16 | apiVersion:int16 | correlationId:int32 |
 response: length:int32 | correlationId:int32 | errorCode:int16 | body
 ```
 
-The response repeats neither the api key nor the version. The correlation id is the client's own number, echoed back untouched, and it is what says which request an answer belongs to — which is what lets a fetch held open for a while be answered after a produce that arrived later. A version belongs to an api key rather than to the connection, and this build speaks version 0 of four keys:
+The response repeats neither the api key nor the version. The correlation id is the client's own number, echoed back untouched, and it is what says which request an answer belongs to — which is what lets a fetch held open for a while be answered after a produce that arrived later. A version belongs to an api key rather than to the connection, and this build speaks version 0 of six keys:
 
 | Key | Api | Request body | Answer |
 |---|---|---|---|
@@ -33,8 +33,12 @@ The response repeats neither the api key nor the version. The correlation id is 
 | 1 | fetch | topic, partition, fetchOffset, maxBytes, maxWaitMs, minBytes | the partition's high-water mark and a block of record frames |
 | 2 | commit offset | groupId, topic, partition, offset | an empty body |
 | 3 | create topic | name, partitionCount | an empty body |
+| 4 | describe topics | the topics to describe, or none of them to mean all of them | one entry per topic: its name, and per partition its log start offset, high-water mark, segment count, and bytes on disk |
+| 5 | describe group | groupId | one entry per partition that group has committed an offset for: topic, partition, and the next offset to read |
 
-Keys 4 and 5 are reserved for later slices. Nothing implements them, so a request naming one is refused exactly like an api key that does not exist.
+No key past 5 exists. A request naming one is refused as an invalid request, exactly like an api key that never will.
+
+**Describing reads and changes nothing, and the two describes disagree about what "not here" means.** A describe that names a topic this broker does not hold is refused with `unknown topic or partition`, because a caller that spelled a name out is owed the news that it is not here. A describe of a group this broker has never heard of is answered with `none` and no entries: there is no create-group api and no group registry, so a commit is what brings a group into being, and a group that has committed nothing and a group that does not exist are one state that no error code could honestly tell apart. A describe that names no topic at all is asking about every topic there is, and a broker holding none answers that with no topics rather than a failure. Topic names come back folded — `orders` and `Orders` are one topic, as below — so the topic in a describe of a group and the topic in a describe of topics are the same string.
 
 | Code | Name | Means |
 |---|---|---|
@@ -249,3 +253,11 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | On that same machine, commit, and JVM, the closed-loop p99 service time of one append measured 5.97 ms under `per-record`, under macOS `fsync(2)` and not `F_FULLFSYNC`, over 2 492 timed samples of about as many appends, and 3.79 µs under `interval` over 333 677 timed samples drawn from several million appends | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
 | On that same machine, commit, and JVM, serving one 1 MiB range into a loopback socket measured 2 567.3 ± 62.2 fetches a second through `FileChannel.transferTo` and 2 253.5 ± 36.9 through a buffered read | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
 | On that same machine, commit, and JVM, writing the same 1 048 478 bytes into the same loopback socket with no log behind it measured 14 637.6 ± 213.2 writes a second, which is 17.5% of the transfer path's time per fetch and 15.4% of the buffered path's | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
+| A describe that names a topic this broker does not hold is refused with unknown topic or partition | `BrokerDescribeTest#refusesADescribeThatNamesATopicThisBrokerDoesNotHold` | 6 |
+| A describe that names no topic asks about every topic there is, and a broker holding none answers with no topics rather than a failure | `BrokerDescribeTest#describesEveryTopicOfABrokerHoldingNoneAsNoTopicsRatherThanAFailure` | 6 |
+| A group this broker has never heard of is described with no committed offsets rather than refused, because a commit is what creates a group | `BrokerDescribeTest#describesAGroupThatHasNeverCommittedAsNoOffsetsRatherThanAFailure` | 6 |
+| A describe reports a partition's log start offset, high-water mark, segment count, and a byte count equal to what its log and index files actually occupy, across a segment roll | `BrokerDescribeTest#reportsThePartitionsOffsetsSegmentCountAndBytesOnDiskAcrossASegmentRoll` | 6 |
+| A describe of a group returns exactly the offsets that group committed and nobody else's, topic and then partition, whatever order the commits arrived in | `BrokerDescribeTest#describesExactlyTheOffsetsAGroupCommittedInTopicThenPartitionOrder` | 6 |
+| A topic is described under the folded name that is its identity, whatever casing created it or asks about it | `BrokerDescribeTest#describesATopicUnderTheFoldedNameThatIsItsIdentityWhateverCasingAsksForIt` | 6 |
+| A describe request whose topic count claims more names than the frame could hold is refused before a list is sized to it | `RequestFrameHostileBytesTest#refusesATopicCountThatClaimsMoreNamesThanBytesRemain` | 6 |
+| A describe answer whose count is negative, or claims more entries than the frame could hold, is refused by the reader that would have to allocate for it | `ResponseFrameTest#refusesACountThatIsNegativeOrClaimsMoreEntriesThanBytesRemain` | 6 |

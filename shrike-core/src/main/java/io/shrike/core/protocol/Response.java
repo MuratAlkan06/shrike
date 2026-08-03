@@ -7,7 +7,8 @@ package io.shrike.core.protocol;
  * <p>Only a response whose error code is {@link ErrorCode#NONE} has a body at all: an error is the
  * whole answer, so its body is empty and there is no record here for it.
  */
-public sealed interface Response permits ProduceResponse, FetchResponse, CommitOffsetResponse, CreateTopicResponse {
+public sealed interface Response permits ProduceResponse, FetchResponse, CommitOffsetResponse, CreateTopicResponse,
+        DescribeTopicsResponse, DescribeGroupResponse {
 
     /**
      * @return the api key of the request this answers, which the envelope does not repeat

@@ -8,6 +8,9 @@ import org.junit.jupiter.api.Test;
 
 class ApiKeysTest {
 
+    /** The first number no api has taken. Nothing implements it, so a request naming it is refused. */
+    private static final short UNTAKEN_API_KEY = 6;
+
     @Test
     void freezesTheWireNumberOfEveryApiKey() {
         assertEquals(0, ApiKeys.PRODUCE);
@@ -20,17 +23,18 @@ class ApiKeysTest {
     }
 
     @Test
-    void implementsTheFourApiKeysThatHaveRequestBodies() {
+    void implementsEveryApiKeyThatHasARequestBody() {
         assertTrue(ApiKeys.isImplemented(ApiKeys.PRODUCE));
         assertTrue(ApiKeys.isImplemented(ApiKeys.FETCH));
         assertTrue(ApiKeys.isImplemented(ApiKeys.COMMIT_OFFSET));
         assertTrue(ApiKeys.isImplemented(ApiKeys.CREATE_TOPIC));
+        assertTrue(ApiKeys.isImplemented(ApiKeys.DESCRIBE_TOPICS));
+        assertTrue(ApiKeys.isImplemented(ApiKeys.DESCRIBE_GROUP));
     }
 
     @Test
-    void treatsTheReservedApiKeysAsNotImplemented() {
-        assertFalse(ApiKeys.isImplemented(ApiKeys.DESCRIBE_TOPICS));
-        assertFalse(ApiKeys.isImplemented(ApiKeys.DESCRIBE_GROUP));
+    void treatsANumberNoApiHasTakenAsNotImplemented() {
+        assertFalse(ApiKeys.isImplemented(UNTAKEN_API_KEY));
         assertFalse(ApiKeys.isImplemented((short) -1));
         assertFalse(ApiKeys.isImplemented(Short.MAX_VALUE));
         assertFalse(ApiKeys.isImplemented(Short.MIN_VALUE));
@@ -42,9 +46,12 @@ class ApiKeysTest {
         assertTrue(ApiKeys.isSupportedVersion(ApiKeys.FETCH, ApiKeys.VERSION_0));
         assertTrue(ApiKeys.isSupportedVersion(ApiKeys.COMMIT_OFFSET, ApiKeys.VERSION_0));
         assertTrue(ApiKeys.isSupportedVersion(ApiKeys.CREATE_TOPIC, ApiKeys.VERSION_0));
+        assertTrue(ApiKeys.isSupportedVersion(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0));
+        assertTrue(ApiKeys.isSupportedVersion(ApiKeys.DESCRIBE_GROUP, ApiKeys.VERSION_0));
 
         assertFalse(ApiKeys.isSupportedVersion(ApiKeys.PRODUCE, (short) 1));
         assertFalse(ApiKeys.isSupportedVersion(ApiKeys.FETCH, (short) -1));
-        assertFalse(ApiKeys.isSupportedVersion(ApiKeys.DESCRIBE_TOPICS, ApiKeys.VERSION_0));
+        assertFalse(ApiKeys.isSupportedVersion(ApiKeys.DESCRIBE_GROUP, (short) 1));
+        assertFalse(ApiKeys.isSupportedVersion(UNTAKEN_API_KEY, ApiKeys.VERSION_0));
     }
 }

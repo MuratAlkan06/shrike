@@ -1,8 +1,12 @@
 package io.shrike.core.protocol;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
@@ -24,9 +28,18 @@ import java.util.OptionalLong;
  *       {@link ErrorCode#OFFSET_OUT_OF_RANGE}, whose body is the int64 offset that partition now
  *       starts at. Every other code still carries an empty body and a reader still refuses one that
  *       does not.
+ *   <li>A string is {@code len:int16 | UTF-8 bytes} with a length that is never negative, which is the
+ *       same string a request carries.
+ *   <li>A list is {@code count:int32} and then that many elements, and the count is weighed against the
+ *       fewest bytes that many elements could occupy before anything is sized to it.
  *   <li>The envelope does not repeat the api key: a client knows what it asked for, and the
  *       correlation id says which question this answers.
  * </ul>
+ *
+ * <p>Decoding treats every byte as hostile, exactly as {@link RequestFrame} does. The broker is not a
+ * privileged writer: four bytes claiming a list of two billion entries are as cheap to send from a
+ * broker's port as from a client's, so nothing here is allocated for a declared count or length until
+ * that number has been weighed against the bytes actually in hand.
  */
 public final class ResponseFrame {
 
@@ -47,6 +60,19 @@ public final class ResponseFrame {
      * records block, in that order.
      */
     public static final int FETCH_RECORDS_PREFIX_BYTES = Long.BYTES + Integer.BYTES;
+
+    /** {@code partition | logStartOffset | highWaterMark | segmentCount | bytes}, every field fixed. */
+    private static final int PARTITION_DESCRIPTION_BYTES =
+            Integer.BYTES + Long.BYTES + Long.BYTES + Integer.BYTES + Long.BYTES;
+
+    /** A described topic is at least its name's length field and its partition count. */
+    private static final int MINIMUM_TOPIC_DESCRIPTION_BYTES = Short.BYTES + Integer.BYTES;
+
+    /** {@code partition | committedOffset} — what one group offset holds beyond its topic name. */
+    private static final int GROUP_OFFSET_BYTES_WITHOUT_TOPIC = Integer.BYTES + Long.BYTES;
+
+    /** A group offset on the wire is at least its topic's length field and those two fields. */
+    private static final int MINIMUM_GROUP_OFFSET_BYTES = Short.BYTES + GROUP_OFFSET_BYTES_WITHOUT_TOPIC;
 
     private ResponseFrame() {
     }
@@ -83,6 +109,8 @@ public final class ResponseFrame {
             case CreateTopicResponse createTopic -> {
                 // An empty body: the request already named the partitions.
             }
+            case DescribeTopicsResponse describeTopics -> encodeDescribeTopics(frame, describeTopics);
+            case DescribeGroupResponse describeGroup -> encodeDescribeGroup(frame, describeGroup);
         }
         return frame.flip();
     }
@@ -270,7 +298,62 @@ public final class ResponseFrame {
             case FetchResponse fetch -> Long.BYTES + Integer.BYTES + (long) fetch.records().length;
             case CommitOffsetResponse commitOffset -> 0L;
             case CreateTopicResponse createTopic -> 0L;
+            case DescribeTopicsResponse describeTopics -> Integer.BYTES + describedTopicsBytes(describeTopics.topics());
+            case DescribeGroupResponse describeGroup -> Integer.BYTES
+                    + (long) describeGroup.offsets().size() * GROUP_OFFSET_BYTES_WITHOUT_TOPIC
+                    + topicNamesBytes(describeGroup.offsets());
         };
+    }
+
+    private static long describedTopicsBytes(List<TopicDescription> topics) {
+        long totalBytes = 0L;
+        for (TopicDescription topic : topics) {
+            totalBytes += stringBytes(topic.name()) + Integer.BYTES
+                    + (long) topic.partitionCount() * PARTITION_DESCRIPTION_BYTES;
+        }
+        return totalBytes;
+    }
+
+    private static long topicNamesBytes(List<GroupOffset> offsets) {
+        long totalBytes = 0L;
+        for (GroupOffset offset : offsets) {
+            totalBytes += stringBytes(offset.topic());
+        }
+        return totalBytes;
+    }
+
+    private static long stringBytes(String value) {
+        return Short.BYTES + (long) value.getBytes(UTF_8).length;
+    }
+
+    private static void encodeDescribeTopics(ByteBuffer frame, DescribeTopicsResponse response) {
+        frame.putInt(response.topics().size());
+        for (TopicDescription topic : response.topics()) {
+            putString(frame, topic.name());
+            frame.putInt(topic.partitionCount());
+            for (PartitionDescription partition : topic.partitions()) {
+                frame.putInt(partition.partition());
+                frame.putLong(partition.logStartOffset());
+                frame.putLong(partition.highWaterMark());
+                frame.putInt(partition.segmentCount());
+                frame.putLong(partition.bytes());
+            }
+        }
+    }
+
+    private static void encodeDescribeGroup(ByteBuffer frame, DescribeGroupResponse response) {
+        frame.putInt(response.offsets().size());
+        for (GroupOffset offset : response.offsets()) {
+            putString(frame, offset.topic());
+            frame.putInt(offset.partition());
+            frame.putLong(offset.committedOffset());
+        }
+    }
+
+    private static void putString(ByteBuffer frame, String value) {
+        byte[] utf8 = value.getBytes(UTF_8);
+        frame.putShort((short) utf8.length);
+        frame.put(utf8);
     }
 
     private static ByteBuffer allocateFrame(int frameBytes, int correlationId, ErrorCode errorCode) {
@@ -303,8 +386,86 @@ public final class ResponseFrame {
             case ApiKeys.FETCH -> decodeFetch(body);
             case ApiKeys.COMMIT_OFFSET -> new CommitOffsetResponse();
             case ApiKeys.CREATE_TOPIC -> new CreateTopicResponse();
+            case ApiKeys.DESCRIBE_TOPICS -> decodeDescribeTopics(body);
+            case ApiKeys.DESCRIBE_GROUP -> decodeDescribeGroup(body);
             default -> throw new WireFormatException("api key " + apiKey + " has no body this build can read");
         };
+    }
+
+    private static DescribeTopicsResponse decodeDescribeTopics(ByteBuffer body) {
+        int topicCount = decodeCount(body, "topicCount", MINIMUM_TOPIC_DESCRIPTION_BYTES);
+
+        List<TopicDescription> topics = new ArrayList<>(topicCount);
+        for (int index = 0; index < topicCount; index++) {
+            topics.add(decodeTopicDescription(body, index));
+        }
+        return new DescribeTopicsResponse(topics);
+    }
+
+    private static TopicDescription decodeTopicDescription(ByteBuffer body, int index) {
+        String name = decodeString(body, "name of topic " + index);
+        int partitionCount = decodeCount(body, "partitionCount of topic " + index, PARTITION_DESCRIPTION_BYTES);
+
+        List<PartitionDescription> partitions = new ArrayList<>(partitionCount);
+        for (int partition = 0; partition < partitionCount; partition++) {
+            partitions.add(new PartitionDescription(decodeInt(body, "partition"),
+                    decodeLong(body, "logStartOffset"), decodeLong(body, "highWaterMark"),
+                    decodeInt(body, "segmentCount"), decodeLong(body, "bytes")));
+        }
+        return new TopicDescription(name, partitions);
+    }
+
+    private static DescribeGroupResponse decodeDescribeGroup(ByteBuffer body) {
+        int offsetCount = decodeCount(body, "offsetCount", MINIMUM_GROUP_OFFSET_BYTES);
+
+        List<GroupOffset> offsets = new ArrayList<>(offsetCount);
+        for (int index = 0; index < offsetCount; index++) {
+            offsets.add(new GroupOffset(decodeString(body, "topic of offset " + index),
+                    decodeInt(body, "partition"), decodeLong(body, "committedOffset")));
+        }
+        return new DescribeGroupResponse(offsets);
+    }
+
+    /**
+     * Reads a count and refuses one nothing could be behind.
+     *
+     * <p>This is the broker's own rule pointed the other way, and for the same reason: four bytes off a
+     * socket can ask for a list of two billion entries, and a reader that sizes a list before it has
+     * weighed the count against the bytes in hand can be brought down by those four bytes. The smallest
+     * an element can be is its fixed fields plus the length field of any string it carries.
+     *
+     * @param body             the body, positioned at the count
+     * @param field            what the count is of, quoted in a refusal
+     * @param minimumItemBytes the fewest bytes one element can occupy
+     * @return the count, which is safe to size a list to
+     */
+    private static int decodeCount(ByteBuffer body, String field, int minimumItemBytes) {
+        int count = decodeInt(body, field);
+        if (count < 0) {
+            throw new WireFormatException(field + " " + count + " is negative");
+        }
+        long smallestBytes = (long) count * minimumItemBytes;
+        if (smallestBytes > body.remaining()) {
+            throw new WireFormatException(field + " " + count + " needs at least " + smallestBytes
+                    + " bytes, but " + body.remaining() + " are left in the frame");
+        }
+        return count;
+    }
+
+    private static String decodeString(ByteBuffer body, String field) {
+        requireBytes(body, Short.BYTES, field + "'s length");
+        short lengthBytes = body.getShort();
+        if (lengthBytes < 0) {
+            throw new WireFormatException(field + " declares a negative length of " + lengthBytes);
+        }
+        if (lengthBytes > body.remaining()) {
+            throw new WireFormatException(field + " declares " + lengthBytes + " bytes, but " + body.remaining()
+                    + " are left in the frame");
+        }
+
+        byte[] utf8 = new byte[lengthBytes];
+        body.get(utf8);
+        return new String(utf8, UTF_8);
     }
 
     private static FetchResponse decodeFetch(ByteBuffer body) {

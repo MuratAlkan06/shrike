@@ -9,9 +9,9 @@ package io.shrike.core.protocol;
  * nothing else, so the method is short; the day produce grows a version 1, fetch does not have to
  * move with it.
  *
- * <p>{@link #DESCRIBE_TOPICS} and {@link #DESCRIBE_GROUP} are numbers held in reserve so that a later
- * slice cannot accidentally spend them on something else. Nothing implements them, so a request
- * naming one is an invalid request today.
+ * <p>A wire number can be added but never renumbered, which is why {@link #DESCRIBE_TOPICS} and
+ * {@link #DESCRIBE_GROUP} were spelled out and held in reserve before anything implemented them. Both
+ * are implemented now; the numbers they were reserved under are the numbers they took.
  */
 public final class ApiKeys {
 
@@ -27,10 +27,10 @@ public final class ApiKeys {
     /** Create a topic with a fixed number of partitions. */
     public static final short CREATE_TOPIC = 3;
 
-    /** Reserved for a later slice; not implemented, so a request naming it is refused. */
+    /** Read what this broker holds, topic by topic and partition by partition. Changes nothing. */
     public static final short DESCRIBE_TOPICS = 4;
 
-    /** Reserved for a later slice; not implemented, so a request naming it is refused. */
+    /** Read the offsets one consumer group has committed. Changes nothing. */
     public static final short DESCRIBE_GROUP = 5;
 
     /** The only api version that exists: every implemented key speaks this one and no other. */
@@ -45,7 +45,7 @@ public final class ApiKeys {
      */
     public static boolean isImplemented(short apiKey) {
         return switch (apiKey) {
-            case PRODUCE, FETCH, COMMIT_OFFSET, CREATE_TOPIC -> true;
+            case PRODUCE, FETCH, COMMIT_OFFSET, CREATE_TOPIC, DESCRIBE_TOPICS, DESCRIBE_GROUP -> true;
             default -> false;
         };
     }
