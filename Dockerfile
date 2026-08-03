@@ -65,6 +65,17 @@ EXPOSE 9750
 USER shrike
 WORKDIR /var/lib/shrike
 
+# Healthy means something is listening, and that is all this checks: it opens a TCP connection to the
+# port and closes it, sending no request, naming no api key, and appending nothing. A probe that
+# spoke the protocol would be a client this image had to carry and keep in step with the broker; a
+# probe that read the ready file would say what was true when the broker started rather than what is
+# true now. The JRE image ships bash, and bash opens a socket by redirecting onto /dev/tcp, so the
+# check costs one shell every interval instead of the JVM a java-based probe would have to start.
+# The port comes from the environment, so `docker run -e SHRIKE_PORT=` moves the broker and the
+# check that watches it together.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${SHRIKE_PORT}"]
+
 # shrike-core depends on the JDK alone, so one jar is the whole classpath. The exec form is what
 # makes java pid 1, so `docker stop` reaches it: the JVM answers the SIGTERM by running the
 # shrike-broker-stop hook, which closes the broker and forces the segment every partition was
