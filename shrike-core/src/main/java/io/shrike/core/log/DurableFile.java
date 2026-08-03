@@ -130,6 +130,42 @@ public final class DurableFile {
     }
 
     /**
+     * Gives a file a different name in the same directory, durably: one atomic move, then the directory
+     * itself forced, so a reader after a power cut finds the file under one name or the other and never
+     * under neither.
+     *
+     * <p>These are the last two steps of {@link #replace(Path, byte[])} and none of the others, because
+     * the bytes are already on the device: nothing here is written and nothing is copied. What asks for
+     * it is a startup that has to move a file onto the name this build stores it under.
+     *
+     * <p>An atomic move takes the target's name whether or not something else already holds it, so a
+     * caller that has not established that nothing does is asking to lose a file.
+     *
+     * @param source the file as it is named now
+     * @param target the name it should have, in the same directory
+     * @throws IllegalArgumentException if the two do not name files in one directory
+     * @throws ShrikeIOException        if the move or the force fails, in which case the file still has
+     *                                  the name it had
+     */
+    public static void rename(Path source, Path target) {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(target, "target");
+
+        Path directory = target.getParent();
+        if (directory == null || !directory.equals(source.getParent())) {
+            throw new IllegalArgumentException("source and target must name files in one directory, but were "
+                    + source + " and " + target);
+        }
+
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+            forceDirectory(directory);
+        } catch (IOException e) {
+            throw new ShrikeIOException("cannot rename " + source + " to " + target, e);
+        }
+    }
+
+    /**
      * Forces a directory itself, which is what puts a rename on the device rather than only the bytes
      * the renamed file holds.
      *

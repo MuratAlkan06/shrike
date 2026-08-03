@@ -120,6 +120,17 @@ public final class ShrikeBroker implements AutoCloseable {
     private final AtomicLong nextConnectionNumber = new AtomicLong(1L);
 
     /**
+     * A test seam, and the only field here that production code never writes. It runs on the acceptor
+     * during a handoff, after the connection's place under the cap has been taken and before anything
+     * has been allocated for it — the narrowest window in which a failure could leak that place, the
+     * socket, or the acceptor itself. A test makes it throw the way running out of memory would;
+     * production leaves it doing nothing.
+     */
+    // volatile because a test installs it from its own thread and shrike-acceptor is what reads it.
+    private volatile Runnable connectionReserved = () -> {
+    };
+
+    /**
      * The one accepting thread. Not final because it starts after the broker is built, since a thread
      * handed a half-built broker would be the worse trade; volatile because {@link #close()} may be
      * called from a thread that never watched it being set.
@@ -250,6 +261,19 @@ public final class ShrikeBroker implements AutoCloseable {
         return groupOffsets;
     }
 
+    /**
+     * Installs the test seam described on {@link #connectionReserved}. Package-private for the same
+     * reason as {@link #partition(String, int)}: there is no way to say "fail this handoff" over a
+     * socket, and a broker that could be told so from outside would be a broker with a way to be
+     * emptied.
+     *
+     * @param seam what to run during a handoff, once that connection's place under the cap is taken
+     */
+    void onConnectionReserved(Runnable seam) {
+        Objects.requireNonNull(seam, "seam");
+        connectionReserved = seam;
+    }
+
     private void startAccepting() {
         acceptor = new Thread(this::acceptConnections, ACCEPTOR_THREAD_NAME);
         acceptor.start();
@@ -264,7 +288,11 @@ public final class ShrikeBroker implements AutoCloseable {
      * this call — so the acceptor backs off and tries again rather than counting failures towards a
      * number that ends it. Exhausting descriptors is a condition that clears on its own as connections
      * close, and an acceptor that had given up would turn it into an outage that lasts until somebody
-     * restarts the broker. The loop ends when the broker is stopping, and only then.
+     * restarts the broker. A handoff that fails is the same kind of thing and is treated the same way:
+     * {@link #serveOrClose(SocketChannel)} throws nothing at all — it gives back the place under the cap
+     * and the socket, and says whether the failure was about this process rather than about that one
+     * socket, in which case the acceptor backs off too. The loop ends when the broker is stopping, and
+     * only then.
      */
     private void acceptConnections() {
         long consecutiveFailures = 0L;
@@ -286,7 +314,9 @@ public final class ShrikeBroker implements AutoCloseable {
                 awaitStopFor(ACCEPT_BACKOFF_MILLIS);
                 continue;
             }
-            serveOrClose(socket);
+            if (!serveOrClose(socket)) {
+                awaitStopFor(ACCEPT_BACKOFF_MILLIS);
+            }
         }
     }
 
@@ -304,11 +334,25 @@ public final class ShrikeBroker implements AutoCloseable {
     }
 
     /**
-     * Gives one accepted socket a thread, or closes it because the broker is full or on its way down.
-     * A refused connection is closed here, on the acceptor, which is the cheapest thing that can happen
-     * to it.
+     * Gives one accepted socket a thread, or closes it because the broker is full, on its way down, or
+     * unable to hand it over at all. A refused connection is closed here, on the acceptor, which is the
+     * cheapest thing that can happen to it.
+     *
+     * <p>Everything from the moment a place under the cap is taken is covered by one unwind, and no
+     * throwable leaves this method. That is not defensive habit: constructing the connection,
+     * constructing the thread, registering it, and starting it can each fail with an
+     * {@code OutOfMemoryError} under exactly the pressure where a leaked place under the cap, a leaked
+     * map entry, or a leaked socket costs the most — and a throwable that reached the accept loop would
+     * end the one thread this broker accepts on while its port stayed bound and its ready file stayed
+     * where it was, which is a broker that is up and deaf.
+     *
+     * @param socket the accepted socket
+     * @return whether the next socket may be accepted straight away. False means the handoff failed for
+     *         a reason that is about this process rather than about this socket — out of memory, out of
+     *         native threads — so the acceptor waits on the stop signal before it accepts again rather
+     *         than meeting the same wall at the speed of a loop
      */
-    private void serveOrClose(SocketChannel socket) {
+    private boolean serveOrClose(SocketChannel socket) {
         if (stopping.get() || !reserveConnection()) {
             // DEBUG rather than WARNING on purpose: this line is written by whoever is connecting, and
             // a caller that can make the broker log as fast as it can open sockets can fill a disk.
@@ -316,50 +360,61 @@ public final class ShrikeBroker implements AutoCloseable {
                     + (stopping.get() ? "this broker is stopping" : "connectionCap=" + config.connectionCap()
                     + " connections are already open"));
             closeQuietly(socket, "a connection this broker would not serve");
-            return;
+            return true;
         }
 
         String name = CONNECTION_THREAD_PREFIX + nextConnectionNumber.getAndIncrement();
+        // Null until there is a connection to give back, because a failure before that has only the
+        // socket and the place under the cap to return.
+        Connection reserved = null;
         try {
+            connectionReserved.run();
+
             // Small requests and small answers, one at a time: waiting to see whether another write is
             // coming would add a round trip's delay to every response.
             socket.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
-        } catch (IOException e) {
-            LOGGER.log(System.Logger.Level.WARNING, name + " could not be configured, so it was closed", e);
-            closeQuietly(socket, name);
-            openConnectionCount.decrementAndGet();
-            return;
-        }
 
-        Connection connection = new Connection(name, socket, new RequestReader(config.maxRequestBytes()), dispatcher);
-        Thread thread = new Thread(() -> {
-            try {
-                connection.serve();
-            } finally {
-                openConnections.remove(connection);
-                openConnectionCount.decrementAndGet();
+            Connection connection = new Connection(name, socket, new RequestReader(config.maxRequestBytes()),
+                    dispatcher);
+            reserved = connection;
+            Thread thread = new Thread(() -> {
+                try {
+                    connection.serve();
+                } finally {
+                    openConnections.remove(connection);
+                    openConnectionCount.decrementAndGet();
+                }
+            }, name);
+
+            // Registered before the check, not after it, and that order is the whole guard — unchanged
+            // by the unwind around it, which only ever removes this entry again. close() sets stopping
+            // before it walks this map, so a close that walked the map without seeing this entry had not
+            // set stopping yet when it walked — and then this read sees it. One of the two closes the
+            // connection, and neither can leave it open with nobody left to close it.
+            openConnections.put(connection, thread);
+            if (stopping.get()) {
+                abandon(connection, socket);
+                return true;
             }
-        }, name);
 
-        // Registered before the check, not after it, and that order is the whole guard. close() sets
-        // stopping before it walks this map, so a close that walked the map without seeing this entry
-        // had not set stopping yet when it walked — and then this read sees it. One of the two closes
-        // the connection, and neither can leave it open with nobody left to close it.
-        openConnections.put(connection, thread);
-        if (stopping.get()) {
-            abandon(connection);
-            return;
-        }
-
-        try {
+            // The last statement the unwind covers, and one of the reasons it exists: a start that
+            // throws leaves a map entry and a place under the cap that the thread body was going to give
+            // back and now never will.
             thread.start();
+            return true;
+        } catch (IOException e) {
+            // About this socket rather than about this broker — the peer went away between the accept
+            // and here — so the next one is worth accepting at once.
+            LOGGER.log(System.Logger.Level.WARNING, name + " could not be configured, so it was closed", e);
+            abandon(reserved, socket);
+            return true;
         } catch (Throwable e) {
-            // A thread that could not start is the pressure case this unwinding exists for: out of
-            // native threads, the moment a slot and a socket are worth most. The reservation and the
-            // map entry are given back here rather than in the thread body that will never run.
-            LOGGER.log(System.Logger.Level.WARNING, name + " could not be started, so it was closed", e);
-            abandon(connection);
-            throw e;
+            // Out of memory, out of native threads: the pressure case this unwinding exists for, at the
+            // moment a place under the cap and a socket are worth most. Everything this connection took
+            // goes back, and the acceptor stays alive to serve the connections that are already open.
+            LOGGER.log(System.Logger.Level.WARNING, name + " could not be handed a thread, so it was closed", e);
+            abandon(reserved, socket);
+            return false;
         }
     }
 
@@ -368,11 +423,19 @@ public final class ShrikeBroker implements AutoCloseable {
      * served: its map entry, its place under the cap, and its socket. It runs at most once per
      * connection, because the thread that would otherwise give those back either never started or is
      * not going to.
+     *
+     * @param connection the connection, or null when the handoff failed before there was one, in which
+     *                   case there is no map entry and the socket is what there is to close
+     * @param socket     the accepted socket
      */
-    private void abandon(Connection connection) {
-        openConnections.remove(connection);
+    private void abandon(Connection connection, SocketChannel socket) {
+        if (connection == null) {
+            closeQuietly(socket, "a connection this broker could not hand to a thread");
+        } else {
+            openConnections.remove(connection);
+            connection.close();
+        }
         openConnectionCount.decrementAndGet();
-        connection.close();
     }
 
     /**

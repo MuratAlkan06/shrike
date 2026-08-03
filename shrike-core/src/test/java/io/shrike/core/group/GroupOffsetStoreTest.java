@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.OptionalLong;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -29,6 +30,10 @@ import org.junit.jupiter.api.io.TempDir;
 class GroupOffsetStoreTest {
 
     private static final String GROUP = "readers";
+
+    /** The same group id, spelled the way a file written before the fold could have been named. */
+    private static final String SAME_GROUP_CAPITALISED = "Readers";
+
     private static final String OTHER_GROUP = "auditors";
     private static final String TOPIC = "orders";
     private static final String OTHER_TOPIC = "events";
@@ -149,6 +154,39 @@ class GroupOffsetStoreTest {
     }
 
     /**
+     * A data directory written before group ids were folded holds one file whose name is not the folded
+     * one. Opening it renames that file, because leaving it would open today and refuse every start
+     * after the next commit: the commit writes the folded name, and the two files together are the pair
+     * the next open refuses.
+     *
+     * <p>Nothing here depends on the filesystem. A case-sensitive one performs a rename and a
+     * case-insensitive one performs a rename that only changes the spelling; either way the name the
+     * directory lists afterwards is the folded one, which is what this asserts.
+     */
+    @Test
+    void renamesAGroupFileWrittenUnderAnUnfoldedNameOntoItsFoldedName() throws IOException {
+        Path groups = Files.createDirectories(dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME));
+        Files.writeString(groups.resolve(SAME_GROUP_CAPITALISED + GroupOffsetStore.FILE_SUFFIX),
+                GroupOffsetStore.VERSION_HEADER + "\n" + TOPIC + " 0 5\n", UTF_8);
+
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+
+        assertEquals(List.of(GROUP + GroupOffsetStore.FILE_SUFFIX), fileNamesIn(groups),
+                "the name the directory lists is the folded one, and it is the only file there");
+        assertEquals(OptionalLong.of(5L), store.committedOffset(GROUP, TOPIC, 0),
+                "the offsets that file held are the offsets the store holds");
+
+        store.commit(GROUP, TOPIC, 1, 7L);
+
+        assertEquals(List.of(GROUP + GroupOffsetStore.FILE_SUFFIX), fileNamesIn(groups),
+                "a commit after the rename writes that same file rather than a second one beside it");
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory);
+        assertEquals(OptionalLong.of(5L), reopened.committedOffset(GROUP, TOPIC, 0),
+                "and the next start opens rather than refusing, with everything that was committed");
+        assertEquals(OptionalLong.of(7L), reopened.committedOffset(GROUP, TOPIC, 1));
+    }
+
+    /**
      * Two files that name one group are state this build never writes and cannot act on, so the open
      * says so instead of picking one. The pair can only exist on a filesystem that keeps two casings
      * apart, which is why the test asks whether it got two files before asserting anything — and asserts
@@ -177,5 +215,17 @@ class GroupOffsetStoreTest {
         assertThrows(IllegalArgumentException.class, () -> store.commit("../escape", TOPIC, 0, 1L));
         assertThrows(IllegalArgumentException.class, () -> store.commit(GROUP, "../escape", 0, 1L));
         assertThrows(IllegalArgumentException.class, () -> store.commit(GROUP, TOPIC, -1, 1L));
+    }
+
+    /**
+     * @param directory a directory
+     * @return the names it lists, which on a filesystem that folds case is still the spelling each name
+     *         is stored under
+     * @throws IOException if it cannot be listed
+     */
+    private static List<String> fileNamesIn(Path directory) throws IOException {
+        try (Stream<Path> entries = Files.list(directory)) {
+            return entries.map(entry -> entry.getFileName().toString()).sorted().toList();
+        }
     }
 }

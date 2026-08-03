@@ -63,11 +63,16 @@ public final class SafeName {
      * Folds a name to the identity it is stored and looked up under.
      *
      * <p>A name becomes a path — {@code <topic>-<partition>/} for a partition, {@code <groupId>.offsets}
-     * for a group — and a path on APFS or on Windows does not tell two casings apart. So identity here
-     * is at most as fine-grained as the filesystem's: {@code orders} and {@code Orders} are one topic
-     * everywhere, on every filesystem, rather than two topics that share one directory on some of them.
-     * Every legal character is ASCII, and {@link Locale#ROOT} is what keeps the fold from depending on
-     * the machine's locale.
+     * for a group — and a path on APFS, the filesystem this build is developed on, does not tell two
+     * casings apart. So identity here is at most as fine-grained as the filesystem's: {@code orders} and
+     * {@code Orders} are one topic everywhere, on every filesystem, rather than two topics that share one
+     * directory on some of them. Every legal character is ASCII, and {@link Locale#ROOT} is what keeps
+     * the fold from depending on the machine's locale.
+     *
+     * <p>Case-insensitivity of the APFS kind is the whole of what this settles. Windows folds more than
+     * case — {@code nul}, {@code con}, {@code aux}, and {@code com1} are reserved device names that the
+     * rule above admits — so running there would need a rule about those too; it is out of reach anyway,
+     * because forcing a directory means opening it for reading, which Windows refuses.
      *
      * @param name a name that has already passed {@link #isValid(String)}
      * @return the identity two names that differ only in case share

@@ -57,6 +57,28 @@ class DurableFileTest {
     }
 
     @Test
+    void renamesAFileOntoAnotherNameInTheSameDirectory() throws IOException {
+        Path source = directory.resolve("Readers.offsets");
+        DurableFile.replace(source, "contents\n".getBytes(UTF_8));
+
+        DurableFile.rename(source, directory.resolve("readers.offsets"));
+
+        assertEquals(List.of("readers.offsets"), Files.list(directory).map(path -> path.getFileName().toString())
+                .sorted().toList(), "one file, under the name it was moved to");
+        assertEquals("contents\n", Files.readString(directory.resolve("readers.offsets"), UTF_8),
+                "a rename moves the name and never the bytes");
+    }
+
+    @Test
+    void refusesToRenameAcrossDirectories() {
+        Path source = directory.resolve("topics");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> DurableFile.rename(source, directory.resolve("elsewhere").resolve("topics")),
+                "a move is atomic within one filesystem and this one forces one directory, so it renames in place");
+    }
+
+    @Test
     void failsWhenTheDirectoryItWouldWriteIntoIsNotThere() {
         Path target = directory.resolve("no-such-directory").resolve("topics");
 

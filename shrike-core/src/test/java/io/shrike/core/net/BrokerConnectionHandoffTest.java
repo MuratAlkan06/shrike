@@ -1,0 +1,85 @@
+package io.shrike.core.net;
+
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.shrike.core.protocol.CreateTopicRequest;
+import io.shrike.core.protocol.ResponseDecoding;
+import java.nio.file.Path;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+/**
+ * What happens to the acceptor when handing a socket to a thread fails.
+ *
+ * <p>The failure it is written for is the one that arrives under memory pressure — out of native
+ * threads, out of heap — at the moment the place under the connection cap, the socket, and the acceptor
+ * thread itself are worth the most. A broker whose acceptor died would keep its port, keep its ready
+ * file, and never accept again; a broker that leaked the place under the cap would shrink that cap by
+ * one for as long as it ran.
+ *
+ * <p>The failure is injected through the package-private {@code onConnectionReserved} seam, because
+ * running the machine out of native threads is not something a test may do to the build it is part of.
+ * The cap here is one connection, so a leaked place under it is the difference between the second
+ * client being served and the second client being closed on.
+ */
+class BrokerConnectionHandoffTest {
+
+    private static final int ONE_CONNECTION_AT_A_TIME = 1;
+    private static final String TOPIC = "orders";
+    private static final int ONLY_PARTITION_COUNT = 1;
+    private static final int FIRST_CORRELATION_ID = 1;
+
+    @TempDir
+    Path dataDirectory;
+
+    private ShrikeBroker broker;
+    private ExecutorService readerThread;
+
+    @BeforeEach
+    void startBroker() {
+        broker = ShrikeBroker.start(BrokerHarness.config(dataDirectory, ONE_CONNECTION_AT_A_TIME),
+                BrokerHarness.SYSTEM_CLOCK);
+        readerThread = Executors.newSingleThreadExecutor();
+    }
+
+    @AfterEach
+    void stopBroker() {
+        readerThread.shutdownNow();
+        broker.close();
+    }
+
+    @Test
+    void closesTheSocketAndKeepsAcceptingWhenAConnectionHandoffFails() throws Exception {
+        CountDownLatch handoffFailed = new CountDownLatch(1);
+        AtomicBoolean failTheNextHandoff = new AtomicBoolean(true);
+        broker.onConnectionReserved(() -> {
+            if (failTheNextHandoff.compareAndSet(true, false)) {
+                handoffFailed.countDown();
+                throw new OutOfMemoryError("unable to create native thread (thrown by a test seam)");
+            }
+        });
+
+        try (WireClient failed = WireClient.connectTo(broker)) {
+            Future<Boolean> closed = readerThread.submit(failed::isClosedWithNoReply);
+
+            Await.latch(handoffFailed, "the handoff of the first connection to fail");
+            assertTrue(Await.value(closed, "the broker to close the socket it could not hand over"),
+                    "a socket whose handoff failed is closed rather than left open with nobody serving it");
+        }
+
+        try (WireClient served = WireClient.connectTo(broker)) {
+            assertInstanceOf(ResponseDecoding.Answered.class,
+                    served.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
+                    "the acceptor survived the failed handoff, and the place under the cap that handoff took"
+                            + " came back with it");
+        }
+    }
+}

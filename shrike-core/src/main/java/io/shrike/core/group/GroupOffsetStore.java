@@ -10,7 +10,10 @@ import java.io.UncheckedIOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
@@ -50,10 +53,18 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link SafeName#fold(String)} before they are used as an identity or as a path. Group {@code readers}
  * and group {@code Readers} are one group with one file, rather than two groups whose files are the
  * same file on APFS and two files on ext4 — which is what would let one group's whole set of committed
- * offsets be overwritten by another's. A directory holding two files that fold together was written by
- * something other than this build, and it fails the open rather than picking one.
+ * offsets be overwritten by another's.
+ *
+ * <p>A file whose name is not already folded is renamed onto its folded name as the store opens, so
+ * that memory and disk agree from then on: the alternative is a directory that opens today and refuses
+ * every start after the first commit, because the commit would write {@code readers.offsets} beside the
+ * {@code Readers.offsets} that was already there. A directory holding <em>both</em> casings at once is
+ * the one case a rename cannot settle — there is no way to tell which file a group's next read should
+ * trust — so it fails the open, naming both files and the repair.
  */
 public final class GroupOffsetStore {
+
+    private static final System.Logger LOGGER = System.getLogger(GroupOffsetStore.class.getName());
 
     /** The directory holding every group's file, created when the store opens. */
     public static final String DIRECTORY_NAME = "groups";
@@ -218,40 +229,105 @@ public final class GroupOffsetStore {
     }
 
     /**
-     * Reads every group file in the directory. A file whose name is not a {@link SafeName} followed by
-     * {@link #FILE_SUFFIX} is not one this store wrote, so it is left alone rather than parsed.
+     * Reads every group file in the directory, having first put each one under the folded name this
+     * build stores it under.
      *
-     * <p>Two files whose group ids fold together fail the open. This build writes one file per folded
-     * id, so a pair like that came from something else, and there is no way to tell which of them a
-     * group's next read should trust — the wrong guess silently redelivers or silently skips records.
+     * <p>Two files whose group ids fold together fail the open, and they fail it before anything is
+     * renamed, so a directory this refuses is a directory it has not touched. This build writes one file
+     * per folded id, so a pair like that came from something else, and there is no way to tell which of
+     * them a group's next read should trust — the wrong guess silently redelivers or silently skips
+     * records. A single file that is merely spelled in another casing is a different thing: nothing is
+     * ambiguous about it, so it is renamed rather than refused.
      *
      * @throws IOException       if the directory cannot be listed
-     * @throws ShrikeIOException if a file that is ours cannot be read, does not parse, or shares a
+     * @throws ShrikeIOException if a file that is ours cannot be renamed, read, or parsed, or shares a
      *                           folded group id with another
      */
     private void loadEveryGroup() throws IOException {
         Map<String, String> fileNamesByGroup = new HashMap<>();
+        for (String fileName : ourFileNames()) {
+            String group = SafeName.fold(fileName.substring(0, fileName.length() - FILE_SUFFIX.length()));
+            String sameGroup = fileNamesByGroup.put(group, fileName);
+            if (sameGroup != null) {
+                throw twoFilesOneGroup(group, sameGroup, fileName);
+            }
+        }
+
+        for (Map.Entry<String, String> group : fileNamesByGroup.entrySet()) {
+            Path file = foldOnDisk(group.getKey(), group.getValue());
+            offsetsByGroup.put(group.getKey(), parse(file, group.getKey()));
+        }
+    }
+
+    /**
+     * @return the names of the files in the groups directory that are this store's, sorted so that a
+     *         refusal names the same two files whichever order the directory listed them in. A file
+     *         whose name is not a {@link SafeName} followed by {@link #FILE_SUFFIX} is not one this
+     *         store wrote, so it is left alone rather than parsed
+     * @throws IOException if the directory cannot be listed
+     */
+    private List<String> ourFileNames() throws IOException {
+        List<String> fileNames = new ArrayList<>();
+        // Listed to the end before anything is renamed: what a directory stream shows for an entry that
+        // is renamed while the stream is open is a question POSIX does not answer.
         try (DirectoryStream<Path> entries = Files.newDirectoryStream(groupsDirectory)) {
             for (Path entry : entries) {
                 String fileName = entry.getFileName().toString();
                 if (!fileName.endsWith(FILE_SUFFIX)) {
                     continue;
                 }
-                String groupId = fileName.substring(0, fileName.length() - FILE_SUFFIX.length());
-                if (!SafeName.isValid(groupId)) {
-                    continue;
+                if (SafeName.isValid(fileName.substring(0, fileName.length() - FILE_SUFFIX.length()))) {
+                    fileNames.add(fileName);
                 }
-                String group = SafeName.fold(groupId);
-                String sameGroup = fileNamesByGroup.put(group, fileName);
-                if (sameGroup != null) {
-                    throw new ShrikeIOException("the committed offsets in " + groupsDirectory + " name one group twice:"
-                            + " " + sameGroup + " and " + fileName + " differ only in case, and a group id is"
-                            + " case-insensitive because the file it names is",
-                            new IOException("two group files, one group"));
-                }
-                offsetsByGroup.put(group, parse(entry, group));
             }
         }
+        Collections.sort(fileNames);
+        return fileNames;
+    }
+
+    /**
+     * Renames a group file whose name is not the folded one onto the folded one, durably, so that the
+     * file this store reads and the file its next commit writes are the same file. Without it, a
+     * directory holding {@code Readers.offsets} opens, commits once — writing {@code readers.offsets}
+     * beside it — and refuses every start after that.
+     *
+     * <p>The pair a rename could not settle has already failed the open, so the folded name is one
+     * nothing else in this directory claims.
+     *
+     * @param group    the folded group id
+     * @param fileName the name the file has now
+     * @return the file this group's offsets are read from
+     * @throws ShrikeIOException if the rename cannot be made durable
+     */
+    private Path foldOnDisk(String group, String fileName) {
+        Path file = groupsDirectory.resolve(fileName);
+        Path folded = fileOf(group);
+        if (file.equals(folded)) {
+            return file;
+        }
+
+        // A file this build renamed is a fact about somebody's data directory, so it is said out loud
+        // rather than done quietly.
+        LOGGER.log(System.Logger.Level.WARNING, () -> "renaming " + file + " to " + folded + ": a group id is"
+                + " case-insensitive because the file it names is, so one group's committed offsets live under one"
+                + " folded file name");
+        DurableFile.rename(file, folded);
+        return folded;
+    }
+
+    /**
+     * @param group  the folded id both files claim
+     * @param first  one file's name
+     * @param second the other's
+     * @return the refusal, which names the repair because only a human can make it: which of the two
+     *         files holds the offsets this group should resume from is not a question the bytes answer
+     */
+    private ShrikeIOException twoFilesOneGroup(String group, String first, String second) {
+        return new ShrikeIOException("the committed offsets in " + groupsDirectory + " name one group twice: "
+                + first + " and " + second + " differ only in case, and a group id is case-insensitive because the"
+                + " file it names is; to repair it by hand, keep whichever of the two holds the offsets this group"
+                + " should resume from, name it " + group + FILE_SUFFIX + ", and remove the other",
+                new IOException("two group files, one group"));
     }
 
     /**
