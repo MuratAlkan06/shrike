@@ -39,6 +39,27 @@
       <artifactId>shrike-clients</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!-- Versionless on purpose: the BOM imported above is what pins it, and it is the only Spring
+         coordinate in this build. It brings the embedded server, the request mapping, and the JSON
+         codec this facade answers with. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- The broker process harness, published by shrike-clients as a second artifact so that this
+         module's *IT classes start a real broker rather than a copy of one. -->
+    <dependency>
+      <groupId>io.shrike</groupId>
+      <artifactId>shrike-clients</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -52,5 +73,50 @@
         </plugin>
       </plugins>
     </pluginManagement>
+
+    <plugins>
+      <!-- Repackages the module jar into one that carries its dependencies and can be started with
+           java -jar. The packaging slice launches this facade that way. -->
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>repackage-as-a-runnable-jar</id>
+            <goals>
+              <goal>repackage</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- The *IT classes start a broker as a separate operating-system process and the facade in
+           this one, so they run in the integration-test phase against the built artifacts rather than
+           beside the unit tests. Surefire ignores an *IT by default; verify is what fails the build
+           when one does. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>run-integration-tests</id>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+        <configuration>
+          <!-- Without this the forked JVM's java.class.path is a manifest-only jar, and the tests
+               launch child JVMs with the classpath they were given. -->
+          <useManifestOnlyJar>false</useManifestOnlyJar>
+          <!-- Failsafe would otherwise test the module's jar, and by the time it runs, repackage has
+               turned that jar into a runnable one whose classes live under BOOT-INF/classes where no
+               plain classloader looks. This is what Spring Boot's own documentation prescribes for a
+               build that does not inherit from spring-boot-starter-parent, which this one does not. -->
+          <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+        </configuration>
+      </plugin>
+    </plugins>
   </build>
 </project>
