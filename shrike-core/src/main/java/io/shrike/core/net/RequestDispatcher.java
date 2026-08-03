@@ -2,6 +2,7 @@ package io.shrike.core.net;
 
 import io.shrike.core.group.CommittedOffset;
 import io.shrike.core.group.GroupOffsetStore;
+import io.shrike.core.group.TooManyGroupsException;
 import io.shrike.core.log.CorruptRecordException;
 import io.shrike.core.log.OffsetOutOfRangeException;
 import io.shrike.core.log.RecordTooLargeException;
@@ -57,8 +58,11 @@ import java.util.Optional;
  *       {@code max.record.bytes}. Checked for every record of a request before any of them is
  *       appended, so a request with one oversized record stores none of them.
  *   <li>{@link ErrorCode#INVALID_REQUEST} — a negative offset to commit, which the wire format allows
- *       and this broker does not, or a create that would push this broker past the partitions it may
- *       hold open.
+ *       and this broker does not, a create that would push this broker past the partitions it may
+ *       hold open, or a commit that would create a consumer group past the groups it may hold. The
+ *       last two are one code because they are one kind of answer: a request this broker understood
+ *       and will not act on, whose remedy is a number an operator raises rather than anything the
+ *       caller can retry into.
  *   <li>{@link ErrorCode#TOPIC_ALREADY_EXISTS} — a repeat create, whatever partition count it asks
  *       for, including one whose name differs from an existing topic's only in case.
  * </ul>
@@ -151,8 +155,14 @@ final class RequestDispatcher {
                     + " partition=" + request.partition());
         }
 
-        groupOffsets.commit(request.groupId(), request.topic(), request.partition(), request.offset());
-        return new Answer.Served(new CommitOffsetResponse());
+        try {
+            groupOffsets.commit(request.groupId(), request.topic(), request.partition(), request.offset());
+            return new Answer.Served(new CommitOffsetResponse());
+        } catch (TooManyGroupsException e) {
+            // The same code the partition budget answers with, because it is the same kind of refusal:
+            // the request is legal and the broker holds as many of the thing it asks for as it may.
+            return new Answer.Refused(ErrorCode.INVALID_REQUEST, e.getMessage());
+        }
     }
 
     private Answer createTopic(CreateTopicRequest request) {

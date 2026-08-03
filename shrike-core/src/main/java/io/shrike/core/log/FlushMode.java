@@ -8,8 +8,11 @@ package io.shrike.core.log;
  * runs in, and neither axis implies the other: a mode says what a failure of the machine may cost, and
  * at-least-once says what a failure of a consumer may cost.
  *
- * <p>A mode is an enum rather than a string because a spelling this build does not understand has to
- * be a compile error rather than a broker that starts and quietly promises something else.
+ * <p>A mode is an enum rather than a string because the spellings this build understands are then
+ * written down in exactly one place. Inside this build a spelling it does not understand is a compile
+ * error; from outside, {@code SHRIKE_FLUSH_MODE} carries one at startup, where it is a broker that
+ * refuses to start and says which two spellings it takes — never a broker that starts and quietly
+ * promises something else.
  */
 public enum FlushMode {
 

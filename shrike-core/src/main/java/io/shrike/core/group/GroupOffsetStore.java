@@ -61,6 +61,17 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@code Readers.offsets} that was already there. A directory holding <em>both</em> casings at once is
  * the one case a rename cannot settle — there is no way to tell which file a group's next read should
  * trust — so it fails the open, naming both files and the repair.
+ *
+ * <p><strong>How many groups there may be is budgeted.</strong> A commit naming a group this store does
+ * not hold creates one, and nothing removes it once it is on the device, so the budget the store is
+ * opened with is what keeps anything that can send a commit from filling this directory: a commit that
+ * would create a group past it raises {@link TooManyGroupsException} instead, before anything is
+ * written. A commit that creates a group and fails before its file takes the group's name removes it
+ * again, so what holds a place under the budget is a group with a file behind it and never a failure —
+ * and a commit that fails after that name is on the device keeps both, because the file is there. A
+ * commit for a group that is already here is never refused by the budget, including a group loaded from
+ * a directory that already held more of them than the budget allows — that is a start, not a request,
+ * and it opens with a WARN and every group it found.
  */
 public final class GroupOffsetStore {
 
@@ -81,6 +92,9 @@ public final class GroupOffsetStore {
     private final Path groupsDirectory;
     private final DurableFile.StepObserver observer;
 
+    /** The most groups a commit may create. What is already on disk is loaded whatever this says. */
+    private final int maxTotalGroups;
+
     private final ReentrantLock lock = new ReentrantLock();
 
     /**
@@ -92,21 +106,25 @@ public final class GroupOffsetStore {
     // guarded by: lock
     private final Map<String, Map<TopicPartition, Long>> offsetsByGroup = new HashMap<>();
 
-    private GroupOffsetStore(Path groupsDirectory, DurableFile.StepObserver observer) {
+    private GroupOffsetStore(Path groupsDirectory, int maxTotalGroups, DurableFile.StepObserver observer) {
         this.groupsDirectory = groupsDirectory;
+        this.maxTotalGroups = maxTotalGroups;
         this.observer = observer;
     }
 
     /**
      * Opens the store under {@code dataDirectory}, creating the groups directory when it is not there
-     * and loading every group file that is.
+     * and loading every group file that is — including more of them than the budget allows, which is a
+     * WARN and not a refusal.
      *
-     * @param dataDirectory the directory every path is derived from
+     * @param dataDirectory  the directory every path is derived from
+     * @param maxTotalGroups the most groups a commit may create from here on
      * @return the loaded store
-     * @throws ShrikeIOException if the directory or one of its files cannot be read
+     * @throws IllegalArgumentException if the budget is below 1, which is a store no commit could use
+     * @throws ShrikeIOException        if the directory or one of its files cannot be read
      */
-    public static GroupOffsetStore open(Path dataDirectory) {
-        return open(dataDirectory, DurableFile.StepObserver.IGNORED);
+    public static GroupOffsetStore open(Path dataDirectory, int maxTotalGroups) {
+        return open(dataDirectory, maxTotalGroups, DurableFile.StepObserver.IGNORED);
     }
 
     /**
@@ -114,23 +132,29 @@ public final class GroupOffsetStore {
      * {@link DurableFile.StepObserver}: it exists so a test can prove that a commit returns only after
      * the file it wrote is on the device.
      *
-     * @param dataDirectory the directory every path is derived from
-     * @param observer      the seam
+     * @param dataDirectory  the directory every path is derived from
+     * @param maxTotalGroups the most groups a commit may create from here on
+     * @param observer       the seam
      * @return the loaded store
-     * @throws ShrikeIOException if the directory or one of its files cannot be read
+     * @throws IllegalArgumentException if the budget is below 1, which is a store no commit could use
+     * @throws ShrikeIOException        if the directory or one of its files cannot be read
      */
-    static GroupOffsetStore open(Path dataDirectory, DurableFile.StepObserver observer) {
+    static GroupOffsetStore open(Path dataDirectory, int maxTotalGroups, DurableFile.StepObserver observer) {
         Objects.requireNonNull(dataDirectory, "dataDirectory");
         Objects.requireNonNull(observer, "observer");
+        if (maxTotalGroups < 1) {
+            throw new IllegalArgumentException("maxTotalGroups must be at least 1, but was " + maxTotalGroups);
+        }
 
         Path groupsDirectory = dataDirectory.resolve(DIRECTORY_NAME);
-        GroupOffsetStore store = new GroupOffsetStore(groupsDirectory, observer);
+        GroupOffsetStore store = new GroupOffsetStore(groupsDirectory, maxTotalGroups, observer);
         try {
             Files.createDirectories(groupsDirectory);
             store.loadEveryGroup();
         } catch (IOException e) {
             throw new ShrikeIOException("cannot open the group offsets directory " + groupsDirectory, e);
         }
+        store.warnIfPastTheBudget();
         return store;
     }
 
@@ -146,7 +170,17 @@ public final class GroupOffsetStore {
      * @param offset    the next offset that group should read
      * @throws IllegalArgumentException if a name is not a {@link SafeName}, if the partition is
      *                                  negative, or if the offset is negative
-     * @throws ShrikeIOException        if the commit cannot be made durable
+     * @throws TooManyGroupsException   if this commit would create a group and the broker already holds
+     *                                  all the groups it may. A group that is already here is never
+     *                                  refused for it, and nothing is written when one is
+     * @throws ShrikeIOException        if the commit cannot be made durable, in which case this store
+     *                                  holds whatever the device does. A failure before the file took the
+     *                                  group's name puts everything back: the offset goes to what it was,
+     *                                  and a commit that had just created the group un-creates it, so a
+     *                                  failure that wrote nothing takes no place under the budget. A
+     *                                  failure after it keeps the offset and the group, because the file
+     *                                  is there for the next start to read — and still throws, because
+     *                                  nothing confirmed the write was durable
      */
     public void commit(String groupId, String topic, int partition, long offset) {
         SafeName.require(groupId, "groupId");
@@ -159,14 +193,44 @@ public final class GroupOffsetStore {
 
         lock.lock();
         try {
-            Map<TopicPartition, Long> offsets = offsetsByGroup.computeIfAbsent(group, id -> new TreeMap<>());
+            Map<TopicPartition, Long> offsets = offsetsByGroup.get(group);
+            boolean creatingTheGroup = offsets == null;
+            if (creatingTheGroup) {
+                // Asked and answered under the one lock every commit holds, which is what makes the
+                // budget exact: a group is created here and nowhere else, so two commits arriving at
+                // once cannot both find the last place free. Nothing has been written or changed yet
+                // when this throws, so a refused commit leaves the store exactly as it found it; a
+                // commit that gets past here and then fails leaves it holding what the device holds,
+                // which the rollback below is what decides.
+                if (offsetsByGroup.size() >= maxTotalGroups) {
+                    throw new TooManyGroupsException(group, offsetsByGroup.size(), maxTotalGroups);
+                }
+                offsets = new TreeMap<>();
+                offsetsByGroup.put(group, offsets);
+            }
             Long previousOffset = offsets.put(key, offset);
+            StepsTaken steps = new StepsTaken(observer);
             try {
-                DurableFile.replace(fileOf(group), render(offsets), observer);
+                DurableFile.replace(fileOf(group), render(offsets), steps);
             } catch (RuntimeException e) {
                 // The file is what this store is; memory that disagrees with it would answer the next
-                // read with an offset no restart could produce.
-                restore(offsets, key, previousOffset);
+                // read something no restart over this directory could produce. So what a failure rolls
+                // back is decided by the move and by nothing else: before it, the group's name has
+                // nothing behind it and the whole change goes; at it, <group>.offsets is a file every
+                // later reader finds, and the store keeps what that file holds even though the commit
+                // still fails, because the write was never confirmed durable.
+                if (!steps.hasMoved()) {
+                    if (creatingTheGroup) {
+                        // A group whose first commit never took its name on the device is a group with
+                        // no file behind it, and leaving the entry would hold a place under the budget
+                        // for the life of the process. Anything that can make a write fail — a full
+                        // disk is enough — could take every place that way, one failed commit at a
+                        // time, so this undoes the creation as well as the offset.
+                        offsetsByGroup.remove(group);
+                    } else {
+                        restore(offsets, key, previousOffset);
+                    }
+                }
                 throw e;
             }
         } finally {
@@ -256,6 +320,29 @@ public final class GroupOffsetStore {
         for (Map.Entry<String, String> group : fileNamesByGroup.entrySet()) {
             Path file = foldOnDisk(group.getKey(), group.getValue());
             offsetsByGroup.put(group.getKey(), parse(file, group.getKey()));
+        }
+    }
+
+    /**
+     * Says out loud that this directory already holds more groups than the configured budget, which is
+     * what a lowered budget looks like from the inside. Every group that was there is loaded — see
+     * {@link #open(Path, int)} — and the next commit that would create a new one is what pays for it.
+     *
+     * <p>A WARN because this is a fact about the data directory a broker was started over rather than
+     * an answer to anybody's request: nobody is being refused yet, and the operator who lowered the
+     * number is the one who needs to read it.
+     *
+     * <p>It reads {@link #offsetsByGroup} without taking {@link #lock}, which is the one place that
+     * does: it runs inside {@code open}, on the thread that is building the store, before any other
+     * thread has a reference to it and therefore before any commit can exist.
+     */
+    private void warnIfPastTheBudget() {
+        int held = offsetsByGroup.size();
+        if (held > maxTotalGroups) {
+            LOGGER.log(System.Logger.Level.WARNING, () -> "the committed offsets in " + groupsDirectory + " name "
+                    + held + " groups, past the budget of " + maxTotalGroups + " this broker was started with; every"
+                    + " one of them is loaded and can still commit, and no group beyond them is created until the"
+                    + " budget is raised");
         }
     }
 
@@ -437,6 +524,43 @@ public final class GroupOffsetStore {
             return committed;
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * How far one commit's write got, which is the only thing that says what a failure has to undo: the
+     * atomic move is what gives a file the group's name, so a failure before it left nothing behind that
+     * name and a failure after it left a file the next start will read.
+     *
+     * <p>It records the step before passing it on, and the order is the point: a step is reported once it
+     * has run, so an observer that throws is standing in for a device that failed <em>after</em> that step
+     * — and a move that ran is a move this store must not pretend away.
+     */
+    private static final class StepsTaken implements DurableFile.StepObserver {
+
+        private final DurableFile.StepObserver watching;
+
+        // confined to: the thread inside commit that made it, which holds lock for the whole write
+        private boolean hasMoved;
+
+        StepsTaken(DurableFile.StepObserver watching) {
+            this.watching = watching;
+        }
+
+        @Override
+        public void completed(DurableFile.Step step) {
+            if (step == DurableFile.Step.MOVED) {
+                hasMoved = true;
+            }
+            watching.completed(step);
+        }
+
+        /**
+         * @return whether the file has taken the group's name, so that what is on the device is what this
+         *         commit wrote rather than what was there before it
+         */
+        boolean hasMoved() {
+            return hasMoved;
         }
     }
 }

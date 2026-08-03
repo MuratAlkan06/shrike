@@ -41,8 +41,9 @@ final class BrokerHarness {
     static BrokerConfig config(Path dataDirectory, int connectionCap) {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
-                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), connectionCap, defaults.maxTotalPartitions(),
-                defaults.readyFilePath(), LogConfig.defaults());
+                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), connectionCap, defaults.readTimeoutMs(),
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(),
+                LogConfig.defaults());
     }
 
     /**
@@ -53,8 +54,9 @@ final class BrokerHarness {
     static BrokerConfig configWithZeroCopyFetch(Path dataDirectory) {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
-                defaults.maxFetchWaitMs(), true, defaults.connectionCap(), defaults.maxTotalPartitions(),
-                defaults.readyFilePath(), defaults.logConfig());
+                defaults.maxFetchWaitMs(), true, defaults.connectionCap(), defaults.readTimeoutMs(),
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(),
+                defaults.logConfig());
     }
 
     /**
@@ -65,8 +67,9 @@ final class BrokerHarness {
     static BrokerConfig configWithBufferedFetch(Path dataDirectory) {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
-                defaults.maxFetchWaitMs(), false, defaults.connectionCap(), defaults.maxTotalPartitions(),
-                defaults.readyFilePath(), defaults.logConfig());
+                defaults.maxFetchWaitMs(), false, defaults.connectionCap(), defaults.readTimeoutMs(),
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(),
+                defaults.logConfig());
     }
 
     /**
@@ -78,8 +81,22 @@ final class BrokerHarness {
     static BrokerConfig configWithPartitionBudget(Path dataDirectory, int maxTotalPartitions) {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
-                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), defaults.connectionCap(), maxTotalPartitions,
-                defaults.readyFilePath(), LogConfig.defaults());
+                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), defaults.connectionCap(), defaults.readTimeoutMs(),
+                maxTotalPartitions, defaults.maxTotalGroups(), defaults.readyFilePath(), LogConfig.defaults());
+    }
+
+    /**
+     * @param dataDirectory  the test's temporary directory
+     * @param maxTotalGroups the group budget this broker enforces
+     * @return the same configuration with a budget a test can fill with a handful of commits rather
+     *         than with a thousand of them
+     */
+    static BrokerConfig configWithGroupBudget(Path dataDirectory, int maxTotalGroups) {
+        BrokerConfig defaults = config(dataDirectory);
+        return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
+                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), defaults.connectionCap(),
+                defaults.readTimeoutMs(), defaults.maxTotalPartitions(), maxTotalGroups, defaults.readyFilePath(),
+                LogConfig.defaults());
     }
 
     /**
@@ -91,8 +108,23 @@ final class BrokerHarness {
     static BrokerConfig configWithLogConfig(Path dataDirectory, LogConfig logConfig) {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
-                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), defaults.connectionCap(),
-                defaults.maxTotalPartitions(), defaults.readyFilePath(), logConfig);
+                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), defaults.connectionCap(), defaults.readTimeoutMs(),
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(), logConfig);
+    }
+
+    /**
+     * @param dataDirectory the test's temporary directory
+     * @param connectionCap the cap this broker enforces
+     * @param readTimeoutMs the longest one connection may spend reading, or waiting to read, one request
+     * @return the same configuration with the two bounds a connection is held to, so a test can cross
+     *         either without opening sixty-four sockets or holding one open for thirty seconds
+     */
+    static BrokerConfig configWithReadTimeout(Path dataDirectory, int connectionCap, int readTimeoutMs) {
+        BrokerConfig defaults = config(dataDirectory);
+        return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
+                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), connectionCap, readTimeoutMs,
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(),
+                LogConfig.defaults());
     }
 
     /**

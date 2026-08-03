@@ -57,11 +57,13 @@ public final class DurableFile {
     }
 
     /**
-     * Told about each {@link Step} as it completes.
+     * Told about each {@link Step} as it completes, once that step has run.
      *
-     * <p>This is a test seam and nothing else: fsync leaves no trace a JVM can observe, so the only
-     * way to prove that a caller is told about a write <em>after</em> the write was made durable — and
-     * not before — is to have the sequence say what it did as it did it. Production code uses
+     * <p>It exists because this sequence leaves no trace a JVM can otherwise observe. A test reads it to
+     * prove that a caller is told about a write <em>after</em> the write was made durable and not before.
+     * A caller that has to undo something when a write fails reads it for the other half of the same
+     * fact: the move is what gives the new bytes the target's name, so a failure reported before it left
+     * the old file in place, and a failure reported after it did not. Most callers want
      * {@link #IGNORED}.
      */
     @FunctionalInterface

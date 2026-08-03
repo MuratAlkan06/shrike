@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.shrike.core.log.FlushMode;
+import io.shrike.core.log.LogConfig;
 import java.net.InetAddress;
 import java.nio.file.Path;
 import java.util.List;
@@ -66,6 +68,68 @@ class BrokerLaunchTest {
 
         assertEquals(19750, launch.config().port());
         assertEquals(Path.of("/run/shrike/ready"), launch.config().readyFilePath());
+    }
+
+    @Test
+    void runsTheDefaultsItAlwaysRanWhenNothingButTheDataDirectoryIsSet() {
+        Map<String, String> environment = Map.of(BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY);
+
+        BrokerLaunch launch = BrokerLaunch.from(NO_ARGUMENTS, environment);
+
+        Path dataDirectory = Path.of(DATA_DIRECTORY);
+        assertEquals(BrokerConfig.defaults(dataDirectory, 9750, dataDirectory.resolve("shrike.ready")),
+                launch.config(),
+                "a broker told only where to store things runs what it ran before any of this could be set");
+    }
+
+    @Test
+    void readsEverySettingFromTheVariableThatNamesIt() {
+        Map<String, String> environment = Map.ofEntries(
+                Map.entry(BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY),
+                Map.entry(BrokerLaunch.RETENTION_MS_VARIABLE, "86400000"),
+                Map.entry(BrokerLaunch.RETENTION_BYTES_VARIABLE, "1073741824"),
+                Map.entry(BrokerLaunch.FLUSH_MODE_VARIABLE, "per-record"),
+                Map.entry(BrokerLaunch.FLUSH_INTERVAL_MS_VARIABLE, "250"),
+                Map.entry(BrokerLaunch.FLUSH_INTERVAL_BYTES_VARIABLE, "2097152"),
+                Map.entry(BrokerLaunch.SEGMENT_BYTES_VARIABLE, "67108864"),
+                Map.entry(BrokerLaunch.MAX_RECORD_BYTES_VARIABLE, "524288"),
+                Map.entry(BrokerLaunch.INDEX_INTERVAL_BYTES_VARIABLE, "8192"),
+                Map.entry(BrokerLaunch.MAX_FETCH_WAIT_MS_VARIABLE, "5000"),
+                Map.entry(BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE, "1048576"),
+                Map.entry(BrokerLaunch.READ_TIMEOUT_MS_VARIABLE, "7500"),
+                Map.entry(BrokerLaunch.FETCH_ZERO_COPY_VARIABLE, "False"),
+                Map.entry(BrokerLaunch.CONNECTION_CAP_VARIABLE, "8"),
+                Map.entry(BrokerLaunch.MAX_TOTAL_PARTITIONS_VARIABLE, "32"),
+                Map.entry(BrokerLaunch.MAX_TOTAL_GROUPS_VARIABLE, "16"));
+
+        BrokerConfig config = BrokerLaunch.from(NO_ARGUMENTS, environment).config();
+
+        Path dataDirectory = Path.of(DATA_DIRECTORY);
+        LogConfig namedLogConfig = new LogConfig(524_288, 67_108_864, 8192, 86_400_000L, 1_073_741_824L,
+                FlushMode.PER_RECORD, 250L, 2_097_152L);
+        assertEquals(new BrokerConfig(dataDirectory, 9750, 1_048_576, 5_000, false, 8, 7_500, 32, 16,
+                        dataDirectory.resolve("shrike.ready"), namedLogConfig), config,
+                "every value the environment named reached the one field its variable names");
+        assertFalse(config.zeroCopyFetch(), "a fetch's records are read into memory because a variable said so");
+        assertEquals(FlushMode.PER_RECORD, config.logConfig().flushMode(),
+                "the durability promise a broker runs under is one an operator can now make");
+    }
+
+    @Test
+    void takesEitherFlushModeSpellingInWhateverLettersItArrivesIn() {
+        Map<String, String> shouted = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.FLUSH_MODE_VARIABLE, "PER-RECORD");
+        Map<String, String> mixed = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.FLUSH_MODE_VARIABLE, "Interval");
+
+        LogConfig fromShouted = BrokerLaunch.from(NO_ARGUMENTS, shouted).config().logConfig();
+        LogConfig fromMixed = BrokerLaunch.from(NO_ARGUMENTS, mixed).config().logConfig();
+
+        assertEquals(FlushMode.PER_RECORD, fromShouted.flushMode(),
+                "an environment is typed by hand, so the letters it was typed in are not the setting");
+        assertEquals(FlushMode.INTERVAL, fromMixed.flushMode(), "and the other spelling reads the same way");
     }
 
     @Test
@@ -135,6 +199,106 @@ class BrokerLaunchTest {
 
         assertTrue(refusal.getMessage().contains(BrokerLaunch.BIND_ADDRESS_VARIABLE), refusal.getMessage());
         assertTrue(refusal.getMessage().contains(":not:an:address"), refusal.getMessage());
+    }
+
+    @Test
+    void readsANewVariableSetToNothingAsOneThatWasNotSet() {
+        Map<String, String> blanks = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.SEGMENT_BYTES_VARIABLE, "",
+                BrokerLaunch.FLUSH_MODE_VARIABLE, "   ");
+
+        LogConfig logConfig = BrokerLaunch.from(NO_ARGUMENTS, blanks).config().logConfig();
+
+        assertEquals(LogConfig.DEFAULT_SEGMENT_BYTES, logConfig.segmentBytes(),
+                "docker run -e SHRIKE_SEGMENT_BYTES= is an operator saying nothing about segments");
+        assertEquals(LogConfig.DEFAULT_FLUSH_MODE, logConfig.flushMode(),
+                "and a variable holding only blanks says nothing either");
+    }
+
+    @Test
+    void refusesASettingThatIsNotAWholeNumberNamingTheVariableAndQuotingWhatItWasGiven() {
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.SEGMENT_BYTES_VARIABLE, "128MiB");
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.SEGMENT_BYTES_VARIABLE), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("128MiB"), refusal.getMessage());
+        assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, Map.of(
+                        BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                        BrokerLaunch.RETENTION_MS_VARIABLE, "forever")),
+                "the settings counted in longs are read the same way, and \"forever\" is not a number of them");
+    }
+
+    @Test
+    void refusesASettingOutsideItsRangeNamingTheVariableThatSetItAndKeepingTheRecordsSentence() {
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.SEGMENT_BYTES_VARIABLE, String.valueOf(LogConfig.MAX_SEGMENT_BYTES + 1));
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.SEGMENT_BYTES_VARIABLE),
+                "the record owns the bound and the launch says which variable crossed it: " + refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("segmentBytes must not exceed "
+                + LogConfig.MAX_SEGMENT_BYTES), "the record's own sentence is kept whole: " + refusal.getMessage());
+        IllegalArgumentException capRefusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, Map.of(
+                        BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                        BrokerLaunch.CONNECTION_CAP_VARIABLE, "0")));
+        assertTrue(capRefusal.getMessage().contains(BrokerLaunch.CONNECTION_CAP_VARIABLE),
+                "one pattern, whichever record holds the bound: " + capRefusal.getMessage());
+    }
+
+    @Test
+    void refusesAReadTimeoutOfZeroNamingTheVariableThatWouldHaveClosedEveryConnection() {
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.READ_TIMEOUT_MS_VARIABLE, "0");
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.READ_TIMEOUT_MS_VARIABLE), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("readTimeoutMs must be at least 1"),
+                "the record owns the bound and the launch says which variable crossed it: " + refusal.getMessage());
+    }
+
+    @Test
+    void refusesAFlushModeSpellingThisBuildDoesNotKnowAndSaysWhichTwoItTakes() {
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.FLUSH_MODE_VARIABLE, "per-batch");
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.FLUSH_MODE_VARIABLE), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("per-batch"), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("per-record") && refusal.getMessage().contains("interval"),
+                "a spelling that promises nothing this build can keep is answered with the two that do: "
+                        + refusal.getMessage());
+    }
+
+    @Test
+    void refusesAZeroCopySettingThatIsNeitherTrueNorFalseRatherThanReadingItAsFalse() {
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.FETCH_ZERO_COPY_VARIABLE, "yes");
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.FETCH_ZERO_COPY_VARIABLE), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("yes"), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("true") && refusal.getMessage().contains("false"),
+                "a word that is not one of the two is refused rather than read as the second: "
+                        + refusal.getMessage());
     }
 
     @Test
