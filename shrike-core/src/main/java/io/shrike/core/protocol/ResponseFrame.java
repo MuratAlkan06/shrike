@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 
 /**
  * The response frame: the one place that knows the byte layout of a response.
@@ -19,7 +20,10 @@ import java.util.Optional;
  *   <li>{@code length} counts every byte after itself, so a frame occupies {@code 4 + length} bytes.
  *   <li>{@code correlationId} is the number the request carried, echoed back untouched.
  *   <li>{@code errorCode} of {@link ErrorCode#NONE} means the body that follows is the answer.
- *       Anything else means the body is empty and the code is the whole answer.
+ *       Anything else means the code is the answer, and the body is empty — with one exception,
+ *       {@link ErrorCode#OFFSET_OUT_OF_RANGE}, whose body is the int64 offset that partition now
+ *       starts at. Every other code still carries an empty body and a reader still refuses one that
+ *       does not.
  *   <li>The envelope does not repeat the api key: a client knows what it asked for, and the
  *       correlation id says which question this answers.
  * </ul>
@@ -31,6 +35,12 @@ public final class ResponseFrame {
 
     /** The smallest legal {@code length}: a correlation id and an error code, which is an error. */
     public static final int MINIMUM_LENGTH_BYTES = Integer.BYTES + Short.BYTES;
+
+    /**
+     * The body of an {@link ErrorCode#OFFSET_OUT_OF_RANGE} response: one int64, the offset the
+     * partition can still be read from. It is the only error body this protocol has.
+     */
+    public static final int OFFSET_OUT_OF_RANGE_BODY_BYTES = Long.BYTES;
 
     private ResponseFrame() {
     }
@@ -77,10 +87,13 @@ public final class ResponseFrame {
      * numbers it earned.
      *
      * @param correlationId the number the request carried
-     * @param errorCode     what went wrong, which cannot be {@link ErrorCode#NONE}
+     * @param errorCode     what went wrong, which cannot be {@link ErrorCode#NONE} and cannot be
+     *                      {@link ErrorCode#OFFSET_OUT_OF_RANGE}
      * @return the encoded frame
      * @throws IllegalArgumentException if the code is {@link ErrorCode#NONE}, which would be an error
-     *                                  response saying nothing went wrong
+     *                                  response saying nothing went wrong, or
+     *                                  {@link ErrorCode#OFFSET_OUT_OF_RANGE}, which is the one code
+     *                                  that owes the caller a body
      */
     public static ByteBuffer encodeError(int correlationId, ErrorCode errorCode) {
         Objects.requireNonNull(errorCode, "errorCode");
@@ -88,8 +101,34 @@ public final class ResponseFrame {
             throw new IllegalArgumentException("an error response cannot carry " + ErrorCode.NONE
                     + ": use encode with a body instead");
         }
+        // Refused here rather than trusted to be got right at every call site: a code 2 with no body
+        // is a frame every reader of this protocol rejects, so it must not be possible to write one.
+        if (errorCode == ErrorCode.OFFSET_OUT_OF_RANGE) {
+            throw new IllegalArgumentException(ErrorCode.OFFSET_OUT_OF_RANGE + " carries the log start offset:"
+                    + " use encodeOffsetOutOfRange instead");
+        }
 
         return allocateFrame(LENGTH_FIELD_BYTES + MINIMUM_LENGTH_BYTES, correlationId, errorCode).flip();
+    }
+
+    /**
+     * Lays out the one error response that carries a body: {@link ErrorCode#OFFSET_OUT_OF_RANGE} and
+     * the offset the partition can still be read from.
+     *
+     * <p>It is a deliberate exception to "an error is a code and nothing else", and it buys exactly
+     * one thing: a consumer whose committed offset has fallen behind retention learns where to resume
+     * in the same answer that refuses it, instead of guessing between the start and the end of a
+     * partition it cannot see. The number is not sensitive — it is the oldest offset the broker will
+     * serve to anyone who asks for it — and no other code gains a body from this.
+     *
+     * @param correlationId  the number the request carried
+     * @param logStartOffset the lowest offset that partition can still serve
+     * @return the encoded frame
+     */
+    public static ByteBuffer encodeOffsetOutOfRange(int correlationId, long logStartOffset) {
+        ByteBuffer frame = allocateFrame(LENGTH_FIELD_BYTES + MINIMUM_LENGTH_BYTES + OFFSET_OUT_OF_RANGE_BODY_BYTES,
+                correlationId, ErrorCode.OFFSET_OUT_OF_RANGE);
+        return frame.putLong(logStartOffset).flip();
     }
 
     /**
@@ -122,11 +161,7 @@ public final class ResponseFrame {
             return new ResponseDecoding.BrokenFrame("error code " + errorCodeNumber + " is not one this build knows");
         }
         if (errorCode.get() != ErrorCode.NONE) {
-            if (body.hasRemaining()) {
-                return new ResponseDecoding.BrokenFrame("an error response carries an empty body, but "
-                        + body.remaining() + " bytes follow the code " + errorCode.get());
-            }
-            return new ResponseDecoding.Failed(correlationId, errorCode.get());
+            return decodeFailure(correlationId, errorCode.get(), body);
         }
 
         try {
@@ -147,6 +182,34 @@ public final class ResponseFrame {
             // mistake in one of those checks into a verdict rather than an escaped exception.
             return new ResponseDecoding.BrokenFrame("the body of api key " + apiKey + " ends inside a field");
         }
+    }
+
+    /**
+     * Reads what an error response carries after its code, which is nothing at all except for
+     * {@link ErrorCode#OFFSET_OUT_OF_RANGE}. Both halves are exact: bytes behind any other code are a
+     * frame this build refuses, and a code 2 without its eight are too, so neither a body that should
+     * not be there nor one that should is silently accepted.
+     *
+     * @param correlationId the number this answer echoes
+     * @param errorCode     the code it carries, never {@link ErrorCode#NONE}
+     * @param body          whatever follows the code
+     * @return the failure, or a verdict that these bytes are not one
+     */
+    private static ResponseDecoding decodeFailure(int correlationId, ErrorCode errorCode, ByteBuffer body) {
+        if (errorCode != ErrorCode.OFFSET_OUT_OF_RANGE) {
+            if (body.hasRemaining()) {
+                return new ResponseDecoding.BrokenFrame("an error response carries an empty body, but "
+                        + body.remaining() + " bytes follow the code " + errorCode);
+            }
+            return new ResponseDecoding.Failed(correlationId, errorCode, OptionalLong.empty());
+        }
+
+        if (body.remaining() != OFFSET_OUT_OF_RANGE_BODY_BYTES) {
+            return new ResponseDecoding.BrokenFrame(errorCode + " carries the log start offset in "
+                    + OFFSET_OUT_OF_RANGE_BODY_BYTES + " bytes, but " + body.remaining()
+                    + " bytes follow the code");
+        }
+        return new ResponseDecoding.Failed(correlationId, errorCode, OptionalLong.of(body.getLong()));
     }
 
     /**

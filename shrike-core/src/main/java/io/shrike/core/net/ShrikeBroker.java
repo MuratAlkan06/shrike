@@ -6,6 +6,7 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import io.shrike.core.group.GroupOffsetStore;
 import io.shrike.core.log.ShrikeIOException;
 import io.shrike.core.protocol.RequestReader;
+import io.shrike.core.retention.RetentionSweep;
 import io.shrike.core.time.TimeSource;
 import java.io.Closeable;
 import java.io.IOException;
@@ -36,16 +37,20 @@ import java.util.concurrent.atomic.AtomicLong;
  * same connection an hour apart. Connections are capped: at
  * {@link BrokerConfig#connectionCap()} the next socket is accepted and immediately closed. Accepting
  * and closing is the point — the acceptor never blocks and nothing is queued, so a client that opens
- * a thousand sockets costs a thousand closes rather than a thousand threads.
+ * a thousand sockets costs a thousand closes rather than a thousand threads. One more thread,
+ * {@code shrike-retention}, does nothing but ask each partition to delete the segments retention no
+ * longer keeps; with retention off, which is the default, it asks and there is nothing to do.
  *
  * <p><strong>Starting.</strong> The topic registry and every partition log are opened and recovered
- * first, then the committed offsets are loaded, then the socket binds, then the acceptor starts, and
- * only then is the {@link ReadyFile} written. A reader that can see the ready file can connect.
+ * first, then the committed offsets are loaded, then the socket binds, then the acceptor and the
+ * retention thread start, and only then is the {@link ReadyFile} written. A reader that can see the
+ * ready file can connect.
  *
- * <p><strong>Stopping.</strong> Stop accepting, wake every fetch that is waiting on a partition, close
- * the open connections so their threads come out of their blocking reads, join those threads under a
- * bounded deadline, and close every log — which forces the segment it was still writing. Nothing is
- * deleted, including the ready file.
+ * <p><strong>Stopping.</strong> Stop accepting, stop retention and wait for a sweep in flight, wake
+ * every fetch that is waiting on a partition, close the open connections so their threads come out of
+ * their blocking reads, join those threads under a bounded deadline, and close every log — which
+ * forces the segment it was still writing. Nothing is deleted on the way out, including the ready
+ * file: what retention deletes it deletes while the broker is running and says so in the log.
  *
  * <p><strong>Durability.</strong> A produce is acknowledged once its bytes are with the operating
  * system, not once they are on the device: that is what {@code SegmentedLog.append} promises and this
@@ -87,6 +92,10 @@ public final class ShrikeBroker implements AutoCloseable {
     private final TopicRegistry topics;
     private final GroupOffsetStore groupOffsets;
     private final RequestDispatcher dispatcher;
+
+    /** The {@code shrike-retention} thread and its schedule; built here, started by {@link #start}. */
+    private final RetentionSweep retention;
+
     private final int port;
 
     /**
@@ -138,12 +147,13 @@ public final class ShrikeBroker implements AutoCloseable {
     private volatile Thread acceptor;
 
     private ShrikeBroker(BrokerConfig config, ServerSocketChannel serverChannel, TopicRegistry topics,
-                         GroupOffsetStore groupOffsets, int port) {
+                         GroupOffsetStore groupOffsets, TimeSource timeSource, int port) {
         this.config = config;
         this.serverChannel = serverChannel;
         this.topics = topics;
         this.groupOffsets = groupOffsets;
         this.dispatcher = new RequestDispatcher(topics, groupOffsets);
+        this.retention = new RetentionSweep(topics, timeSource, RetentionSweep.DEFAULT_CHECK_INTERVAL_MILLIS);
         this.port = port;
     }
 
@@ -173,13 +183,15 @@ public final class ShrikeBroker implements AutoCloseable {
         try {
             GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory);
             ServerSocketChannel serverChannel = bind(config);
-            broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, boundPort(serverChannel));
+            broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, timeSource,
+                    boundPort(serverChannel));
         } catch (RuntimeException e) {
             topics.close();
             throw e;
         }
 
         try {
+            broker.retention.start();
             broker.startAccepting();
             ReadyFile.write(config.readyFilePath(), broker.port, ProcessHandle.current().pid());
         } catch (RuntimeException e) {
@@ -215,6 +227,9 @@ public final class ShrikeBroker implements AutoCloseable {
 
         closeQuietly(serverChannel, "the listening socket");
         joinBounded(acceptor, STOP_TIMEOUT_MILLIS);
+        // Before the logs are closed, because a sweep in flight is holding a partition lock and is
+        // about to unlink a file: waiting for it here is what keeps a shutdown from racing it.
+        retention.close();
 
         // Woken before their sockets are closed, so a fetch that is part way through a long poll
         // returns rather than being joined against for a deadline it was told it could use.

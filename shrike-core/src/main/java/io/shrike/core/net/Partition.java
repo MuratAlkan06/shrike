@@ -21,10 +21,10 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <p>The lock is the whole design. {@link SegmentedLog} says plainly that nothing in it is safe to
  * call from two threads at once, so every append and every read of this partition happens under
- * {@link #lock} — connection threads take turns rather than sharing a file position. The high-water
- * mark needs no field of its own for the same reason: it <em>is</em> the log's next offset, read
- * under the lock that the appending thread held when it moved it, so there is no second copy of it to
- * drift.
+ * {@link #lock} — connection threads take turns rather than sharing a file position, and so does the
+ * retention thread when it deletes a segment. The high-water mark needs no field of its own for the
+ * same reason: it <em>is</em> the log's next offset, read under the lock that the appending thread
+ * held when it moved it, so there is no second copy of it to drift.
  *
  * <p>A fetch that has fewer bytes than it asked for checks what it has and registers as a waiter
  * <em>under the same lock</em> that a produce holds while it appends and signals. That is what makes
@@ -231,6 +231,42 @@ final class Partition implements Closeable {
         lock.lock();
         try {
             return log.nextOffset();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * @return the lowest offset this partition can still serve, which retention moves forward as it
+     *         deletes segments
+     */
+    long logStartOffset() {
+        lock.lock();
+        try {
+            return log.logStartOffset();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Deletes the stored records retention no longer keeps, under the same lock a produce and a fetch
+     * hold.
+     *
+     * <p>That lock is the whole of the concurrency story here. {@code shrike-retention} is a thread of
+     * its own, and the segment list it shortens is the same list a fetch walks, so it takes its turn
+     * like everything else rather than mutating storage beside a reader. What it holds the lock for is
+     * an unlink and a couple of file closes, not a read of the log, so a sweep does not become a pause
+     * for the connections using this partition.
+     *
+     * @param nowMillis the epoch millisecond retention is evaluated at
+     * @return how many segments were deleted
+     * @throws io.shrike.core.log.ShrikeIOException if a segment's files cannot be removed
+     */
+    int deleteRetiredSegments(long nowMillis) {
+        lock.lock();
+        try {
+            return log.deleteRetiredSegments(nowMillis);
         } finally {
             lock.unlock();
         }

@@ -19,7 +19,8 @@ import java.util.Objects;
  * <ul>
  *   <li>a request — dispatch it and write the answer;
  *   <li>a refusal — write the error code with an empty body and keep reading, because the caller is
- *       talking, just wrongly;
+ *       talking, just wrongly. The frame guard never produces {@code OFFSET_OUT_OF_RANGE}, which is
+ *       the one code that owes a body, so the refusals that arrive here have none;
  *   <li>a broken frame — close the connection and send nothing at all, because a frame whose length
  *       could not be believed has no correlation id worth addressing a reply to.
  * </ul>
@@ -113,6 +114,13 @@ final class Connection implements AutoCloseable {
                     LOGGER.log(System.Logger.Level.DEBUG, () -> name + " answered api key "
                             + accepted.request().apiKey() + " with " + refused.errorCode() + ": " + refused.reason());
                     yield ResponseFrame.encodeError(accepted.correlationId(), refused.errorCode());
+                }
+                case Answer.OutOfRange outOfRange -> {
+                    LOGGER.log(System.Logger.Level.DEBUG, () -> name + " answered api key "
+                            + accepted.request().apiKey() + " with " + ErrorCode.OFFSET_OUT_OF_RANGE
+                            + " and logStartOffset=" + outOfRange.logStartOffset() + ": " + outOfRange.reason());
+                    yield ResponseFrame.encodeOffsetOutOfRange(accepted.correlationId(),
+                            outOfRange.logStartOffset());
                 }
             };
         } catch (RuntimeException e) {

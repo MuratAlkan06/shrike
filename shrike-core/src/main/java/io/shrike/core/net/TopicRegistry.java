@@ -6,6 +6,7 @@ import io.shrike.core.log.DurableFile;
 import io.shrike.core.log.SafeName;
 import io.shrike.core.log.ShrikeIOException;
 import io.shrike.core.protocol.CreateTopicRequest;
+import io.shrike.core.retention.SegmentDeletion;
 import io.shrike.core.time.TimeSource;
 import java.io.Closeable;
 import java.io.IOException;
@@ -55,7 +56,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link BrokerConfig#maxTotalPartitions()}, counted across every topic, because each one costs a
  * directory and two open file handles for as long as the broker runs.
  */
-final class TopicRegistry implements Closeable {
+final class TopicRegistry implements Closeable, SegmentDeletion {
 
     /** The file listing every topic, directly under the data directory. */
     static final String FILE_NAME = "topics";
@@ -182,6 +183,34 @@ final class TopicRegistry implements Closeable {
      */
     Optional<Partition> partition(String topic, int partition) {
         return topic(topic).flatMap(found -> found.partition(partition));
+    }
+
+    /**
+     * Deletes the segments retention no longer keeps, in every partition of every topic. This is what
+     * one sweep of {@code shrike-retention} does, and it is the only thing that package knows about
+     * this one.
+     *
+     * <p>A partition whose files cannot be removed is a WARN and the sweep goes on to the next one.
+     * The alternative is worse in the way that matters: one unreadable directory would otherwise stop
+     * every other partition from being trimmed, and the next sweep would meet the same wall. Nothing
+     * is lost by carrying on — the partition that failed is tried again in a minute, and whatever went
+     * wrong is named in the log.
+     *
+     * @param nowMillis the epoch millisecond retention is evaluated at
+     */
+    @Override
+    public void deleteRetiredSegments(long nowMillis) {
+        for (Topic topic : topicsByFoldedName.values()) {
+            for (Partition partition : topic.partitions()) {
+                try {
+                    partition.deleteRetiredSegments(nowMillis);
+                } catch (ShrikeIOException e) {
+                    LOGGER.log(System.Logger.Level.WARNING, "retention could not trim topic=" + topic.name()
+                            + " partition=" + partition.partition() + ", so it was left as it is and the next"
+                            + " sweep will try again", e);
+                }
+            }
+        }
     }
 
     /**

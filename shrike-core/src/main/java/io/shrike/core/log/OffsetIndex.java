@@ -4,6 +4,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
@@ -220,6 +221,23 @@ final class OffsetIndex implements Closeable {
      */
     void force() throws IOException {
         channel.force(true);
+    }
+
+    /**
+     * Closes the index file and unlinks it, which is what retention does to the index of a segment it
+     * has deleted. Unlinking removes the name and nothing else: a reader that already holds this file
+     * open goes on reading the bytes it opened, and the space comes back when the last of those
+     * readers closes.
+     *
+     * @throws ShrikeIOException if the file cannot be closed or removed
+     */
+    void delete() {
+        close();
+        try {
+            Files.deleteIfExists(indexFile);
+        } catch (IOException e) {
+            throw new ShrikeIOException("cannot delete index file " + indexFile, e);
+        }
     }
 
     /**

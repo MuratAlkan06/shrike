@@ -60,6 +60,19 @@ final class BrokerHarness {
 
     /**
      * @param dataDirectory the test's temporary directory
+     * @param logConfig     the sizes and retention bounds every partition of this broker opens with
+     * @return the same configuration with a storage policy a test can reach without producing
+     *         gigabytes or waiting a week
+     */
+    static BrokerConfig configWithLogConfig(Path dataDirectory, LogConfig logConfig) {
+        BrokerConfig defaults = config(dataDirectory);
+        return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
+                defaults.maxFetchWaitMs(), defaults.connectionCap(), defaults.maxTotalPartitions(),
+                defaults.readyFilePath(), logConfig);
+    }
+
+    /**
+     * @param dataDirectory the test's temporary directory
      * @return a started broker, which the test closes
      */
     static ShrikeBroker start(Path dataDirectory) {

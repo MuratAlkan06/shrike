@@ -4,7 +4,9 @@ import java.io.Closeable;
 
 /**
  * The append-only record log of one topic partition. Records go in at the end and come back out by
- * offset, where an offset is a logical record number and never a byte count.
+ * offset, where an offset is a logical record number and never a byte count. Nothing is ever rewritten
+ * in place; the only thing that leaves a log is whole segments of its oldest records, which is what
+ * {@link #deleteRetiredSegments(long)} does and what {@link #logStartOffset()} then reports.
  *
  * <p>A log has a single writer. Nothing here is safe to call from two threads at once.
  */
@@ -77,6 +79,27 @@ public interface Log extends Closeable {
      *         readable offsets: the high-water mark
      */
     long nextOffset();
+
+    /**
+     * @return the lowest offset this log can still serve, which is the inclusive lower bound of the
+     *         readable offsets. It is 0 until retention deletes something, and it only ever moves
+     *         forward; a read below it is refused with this number, so a consumer that fell behind
+     *         retention can reset to the oldest record that still exists
+     */
+    long logStartOffset();
+
+    /**
+     * Deletes the oldest stored records this log is no longer configured to keep, in whole segments.
+     *
+     * <p>This is the one operation that removes acknowledged records, so it is deliberately something
+     * a caller asks for at a moment of its choosing rather than something an append does on the side.
+     * What "no longer kept" means is the implementation's policy, and it is stated there.
+     *
+     * @param nowMillis the epoch millisecond retention is evaluated at, from the caller's time source
+     * @return how many segments were deleted
+     * @throws ShrikeIOException if a segment's files cannot be removed
+     */
+    int deleteRetiredSegments(long nowMillis);
 
     /**
      * Closes the log's file. Implementations state in their own documentation what closing means for

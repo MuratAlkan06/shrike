@@ -4,8 +4,9 @@ import java.util.Optional;
 
 /**
  * The single int16 a response envelope carries to say what happened. {@link #NONE} means the body
- * that follows is the answer; anything else means the body is empty and this code is the whole
- * answer.
+ * that follows is the answer; anything else means this code is the answer and the body is empty —
+ * except {@link #OFFSET_OUT_OF_RANGE}, which carries the offset the partition now starts at, because
+ * a client that has fallen behind retention cannot act on the code alone.
  *
  * <p>The numbers are the wire, so they are frozen: a code may be added, never renumbered.
  */
@@ -17,7 +18,10 @@ public enum ErrorCode {
     /** The topic, or that partition of it, is not one the broker knows. */
     UNKNOWN_TOPIC_OR_PARTITION(1),
 
-    /** The offset asked for is outside the range the partition can serve. */
+    /**
+     * The offset asked for is outside the range the partition can serve. Its response body is the
+     * int64 offset that partition now starts at, which is the one error body this protocol has.
+     */
     OFFSET_OUT_OF_RANGE(2),
 
     /** A record's stored bytes no longer match their checksum. */

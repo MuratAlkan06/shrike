@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.util.HexFormat;
+import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 
 class ResponseFrameTest {
@@ -74,7 +75,38 @@ class ResponseFrameTest {
     @Test
     void readsAnErrorResponseBackAsAFailureWhicheverRequestItAnswers() {
         ByteBuffer frame = WireFrames.afterLength(
-                ResponseFrame.encodeError(CORRELATION_ID, ErrorCode.OFFSET_OUT_OF_RANGE));
+                ResponseFrame.encodeError(CORRELATION_ID, ErrorCode.UNKNOWN_TOPIC_OR_PARTITION));
+
+        ResponseDecoding decoding = ResponseFrame.decode(ApiKeys.FETCH, frame);
+
+        ResponseDecoding.Failed failed = assertInstanceOf(ResponseDecoding.Failed.class, decoding,
+                decoding.toString());
+        assertEquals(CORRELATION_ID, failed.correlationId());
+        assertEquals(ErrorCode.UNKNOWN_TOPIC_OR_PARTITION, failed.errorCode());
+        assertEquals(OptionalLong.empty(), failed.logStartOffset(),
+                "every code but offset out of range answers with the code and nothing else");
+    }
+
+    /**
+     * <pre>
+     * 0000000e            length         = 14 bytes follow the length field
+     * 0a0b0c0d            correlationId
+     * 0002                errorCode      = 2, offset out of range
+     * 00000000ee6b2800    logStartOffset = 4 000 000 000, past what an int32 could carry
+     * </pre>
+     */
+    @Test
+    void encodesOffsetOutOfRangeAsACodeAndTheOffsetThePartitionNowStartsAt() {
+        ByteBuffer frame = ResponseFrame.encodeOffsetOutOfRange(CORRELATION_ID, 4_000_000_000L);
+
+        byte[] frameBytes = new byte[frame.remaining()];
+        frame.duplicate().get(frameBytes);
+        assertEquals("0000000e0a0b0c0d000200000000ee6b2800", HexFormat.of().formatHex(frameBytes));
+    }
+
+    @Test
+    void readsOffsetOutOfRangeBackWithTheOffsetItCarries() {
+        ByteBuffer frame = WireFrames.afterLength(ResponseFrame.encodeOffsetOutOfRange(CORRELATION_ID, 41L));
 
         ResponseDecoding decoding = ResponseFrame.decode(ApiKeys.FETCH, frame);
 
@@ -82,6 +114,27 @@ class ResponseFrameTest {
                 decoding.toString());
         assertEquals(CORRELATION_ID, failed.correlationId());
         assertEquals(ErrorCode.OFFSET_OUT_OF_RANGE, failed.errorCode());
+        assertEquals(OptionalLong.of(41L), failed.logStartOffset());
+    }
+
+    @Test
+    void refusesAnOffsetOutOfRangeResponseWithoutItsLogStartOffset() {
+        for (byte[] body : new byte[][] {new byte[0], int32(41), concat(int64(41L), int32(0))}) {
+            ByteBuffer frame = response(CORRELATION_ID, ErrorCode.OFFSET_OUT_OF_RANGE.code(), body);
+
+            ResponseDecoding decoding = ResponseFrame.decode(ApiKeys.FETCH, frame);
+
+            assertTrue(assertInstanceOf(ResponseDecoding.BrokenFrame.class, decoding).reason()
+                    .contains("log start offset"), decoding.toString());
+        }
+    }
+
+    @Test
+    void refusesToEncodeOffsetOutOfRangeWithoutItsBody() {
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> ResponseFrame.encodeError(CORRELATION_ID, ErrorCode.OFFSET_OUT_OF_RANGE));
+
+        assertTrue(refusal.getMessage().contains("encodeOffsetOutOfRange"), refusal.getMessage());
     }
 
     @Test

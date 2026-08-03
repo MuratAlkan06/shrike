@@ -19,6 +19,7 @@ import java.net.InetAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.OptionalLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -148,7 +149,26 @@ class ClientRoundTripTest {
             assertEquals(ErrorCode.UNKNOWN_TOPIC_OR_PARTITION, unknownTopic.errorCode());
             assertEquals(BrokerConnection.FIRST_CORRELATION_ID, unknownTopic.correlationId(),
                     "the failure names the request it answers, which is the client's own number");
+            assertEquals(OptionalLong.empty(), unknownTopic.logStartOffset(),
+                    "every code but offset out of range is the whole answer, with nothing behind it");
             assertEquals(0L, afterTheError.highWaterMark(), "an error answers a request without ending the connection");
+        }
+    }
+
+    @Test
+    void raisesOffsetOutOfRangeCarryingTheOffsetThePartitionCanStillBeReadFrom() {
+        try (ShrikeProducer producer = ShrikeProducer.open(config);
+             ShrikeConsumer consumer = ShrikeConsumer.open(config)) {
+            producer.send(TOPIC, 0, key("a"), value("first"));
+
+            BrokerErrorException pastTheEnd = assertThrows(BrokerErrorException.class,
+                    () -> consumer.fetch(TOPIC, 0, 9L, PLENTY_OF_BYTES, ANSWER_IMMEDIATELY_MS, ANY_BYTES));
+
+            assertEquals(ErrorCode.OFFSET_OUT_OF_RANGE, pastTheEnd.errorCode());
+            assertEquals(OptionalLong.of(0L), pastTheEnd.logStartOffset(),
+                    "the one refusal that answers with a number, so a consumer that has fallen behind the"
+                            + " broker's retention learns where it may resume instead of guessing");
+            assertTrue(pastTheEnd.getMessage().contains("logStartOffset=0"), pastTheEnd.getMessage());
         }
     }
 

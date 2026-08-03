@@ -40,7 +40,7 @@ Keys 4 and 5 are reserved for later slices. Nothing implements them, so a reques
 |---|---|---|
 | 0 | none | the body that follows is the answer |
 | 1 | unknown topic or partition | no such topic, or a partition number outside the count it was created with |
-| 2 | offset out of range | the offset is outside what that partition can serve |
+| 2 | offset out of range | the offset is outside what that partition can serve; the body is the int64 offset it can still be read from |
 | 3 | corrupt record | a stored frame no longer matches its checksum |
 | 4 | frame too large | a produce record is larger than `max.record.bytes`; none of that request's records were stored |
 | 5 | invalid request | the bytes parsed as an envelope, but their contents break a rule of the protocol |
@@ -48,7 +48,7 @@ Keys 4 and 5 are reserved for later slices. Nothing implements them, so a reques
 | 7 | topic already exists | a topic of that name is already there, whatever partition count was asked for |
 | 99 | internal | the broker failed for a reason of its own, which it does not describe to the caller |
 
-**An error response carries an empty body.** The code is the whole answer, so the same six bytes answer every api, and a body behind a non-zero code is a frame a client refuses rather than reads.
+**An error response carries an empty body, with one exception.** For eight of the nine codes the code is the whole answer, so the same six bytes answer every api, and a body behind one of them is a frame a client refuses rather than reads. The exception is `offset out of range`, which carries eight bytes: the offset that partition can still be read from. It exists because a consumer whose committed offset has been deleted by retention would otherwise have to choose between re-reading everything that survived and skipping records that are still there, and neither is a choice it can make from a code alone. The rule is exact in both directions — a code 2 without those eight bytes is refused as surely as a body behind any other code — and the number is nothing a legal fetch would not have been told anyway. No api key was added for it.
 
 **Long-poll fetch.** A fetch that finds fewer than `minBytes` of records readable is held open for up to `maxWaitMs` and answered the moment an append to that partition makes enough available; a wait that runs out is answered with whatever is there — usually nothing — and the code `none`, because "there is nothing new yet" is an answer rather than a failure. A `maxWaitMs` or `minBytes` of 0 is answered on the first pass without waiting at all.
 
@@ -79,6 +79,16 @@ Keys 4 and 5 are reserved for later slices. Nothing implements them, so a reques
 The recovery promise is tail-only. Opening a partition walks the last segment frame by frame — checking each frame's length, CRC32C, magic, and the offset it carries — and cuts the file off after the last whole frame, logging a WARN that names the byte position it truncated at. The records lost that way are records no producer was ever told about. Startup does not fail on a torn tail, and running it twice with no writes in between changes no file and no offset.
 
 Earlier segments are not walked, because a segment is forced before it is sealed. Damage inside a sealed segment is therefore left exactly where it is: startup succeeds, reading the damaged record fails with a corrupt-record error naming its topic, partition, offset, byte position, and file, and the records before and after it still read.
+
+## Retention
+
+**Retention deletes acknowledged records, on purpose, by a policy you configure.** That is what it is for, and it is worth saying in those words rather than in softer ones. Two settings decide it, per partition log: `retention.ms` deletes a sealed segment once every record in it is that many milliseconds old, and `retention.bytes` deletes the oldest sealed segments until the partition's log files add up to no more than that many bytes. **Both default to −1, which is off: a broker started without naming them keeps every record it has ever stored.**
+
+A segment's age is the largest record timestamp inside it — the timestamp the broker stamped when it appended the newest record it holds — and never a file's modification time, which a copy or a restore resets while the records do not change. Because the age comes from the newest record, no record is ever deleted inside its own window. Whole sealed segments only: the segment still taking appends is never deleted, however old it is and however large the partition has grown, so a partition can sit above `retention.bytes` by the size of that one segment.
+
+A deletion is announced rather than silent. It is asked for by configuration, it happens on a thread named `shrike-retention` that sweeps once a minute, and each segment that goes is an INFO line naming the topic, the partition, the base offset, the bytes, the reason, and the offset the partition starts at afterwards. Deleting the oldest segments moves that start offset forward, and a fetch below it is answered `offset out of range` **carrying the new start offset**, so a consumer that was down long enough to fall behind is told where it may resume instead of guessing.
+
+This is a different thing from the delivery semantics above, and neither weakens the other. At-least-once is about what a failure may do to a record — redeliver it, never silently drop it. Retention is about what an operator has asked the broker to stop storing after a stated age or size, which is neither a failure nor silent. With retention off, which is the default, the two never meet at all.
 
 ## Claims
 
@@ -141,3 +151,17 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A handler that throws commits nothing, and the very same records are read again | `CommitAfterProcessingTest#commitsNothingWhenTheHandlerThrowsAndReadsTheSameRecordsAgain` | 4 |
 | The offset is committed only after the handler has returned: while it runs, the group's file says nothing about those records | `CommitAfterProcessingTest#commitsTheOffsetToReadNextOnlyOnceTheHandlerHasReturned` | 4 |
 | Delivery is at-least-once across a kill: a member killed with SIGKILL while holding records it had processed and not committed has every one of them delivered again to the process started in its place, which begins exactly at the offset the broker had stored, and no produced record is missing from any journal | `ConsumerGroupRedeliveryIT#redeliversTheRecordsAKilledMemberProcessedButNeverCommittedToTheMemberThatReplacesIt` | 4 |
+| A broker started without naming retention keeps every record it has ever stored, exactly as it did before retention existed | `SegmentedLogRetentionTest#deletesNothingWhenBothRetentionBoundsAreOff` | 5 |
+| A sealed segment whose newest record is older than retention.ms is deleted, and the segment still taking records is not | `SegmentedLogRetentionTest#deletesTheSealedSegmentsWhoseNewestRecordIsOlderThanRetentionMs` | 5 |
+| A segment is aged by its newest record, so no record is deleted inside its own retention window | `SegmentedLogRetentionTest#keepsASegmentHoldingOneRecordInsideRetentionMs` | 5 |
+| A segment's age survives a restart and comes from the timestamps in its records: setting every file's modification time to now changes nothing about what retention deletes | `SegmentedLogRetentionTest#datesAReopenedSegmentFromItsLastRecordRatherThanFromTheFilesOnDisk` | 5 |
+| Segments come off the oldest end until the partition holds no more than retention.bytes, and everything above the new start still reads | `SegmentedLogRetentionTest#deletesTheOldestSegmentsFirstUntilThePartitionIsUnderRetentionBytes` | 5 |
+| The segment taking appends is never deleted, whatever the bounds say, and the partition goes on taking records | `SegmentedLogRetentionTest#keepsTheSegmentStillTakingRecordsHoweverOldOrHoweverLargeItIs` | 5 |
+| A read below the offset retention moved to is refused with that offset, and reads from it onwards are served | `SegmentedLogRetentionTest#refusesReadsBelowTheStartOffsetRetentionMovedAndServesEverythingAboveIt` | 5 |
+| A reader holding a channel open on a segment retention deletes reads it whole: the bytes match what was on disk and still checksum, because unlinking removes a name and not the file behind it | `SegmentedLogRetentionTest#readsASegmentWholeThroughAChannelOpenedBeforeRetentionDeletedIt` | 5 |
+| A fetch below the offset retention moved to is answered offset out of range carrying that offset, over the wire | `BrokerRetentionTest#answersAFetchBelowTheOffsetRetentionMovedToWithThatOffset` | 5 |
+| Fetching from the offset that refusal named is served the records that survived | `BrokerRetentionTest#servesTheRecordsFromTheOffsetItsRefusalNamed` | 5 |
+| An offset-out-of-range response round-trips its log start offset, and one without those eight bytes is refused as a broken frame | `ResponseFrameTest#refusesAnOffsetOutOfRangeResponseWithoutItsLogStartOffset` | 5 |
+| The offset reaches a caller of the client library on the typed failure, while every other error code carries nothing | `ClientRoundTripTest#raisesOffsetOutOfRangeCarryingTheOffsetThePartitionCanStillBeReadFrom` | 5 |
+| Retention sweeps on a thread named shrike-retention, repeatedly, and closing it ends that thread | `RetentionSweepTest#sweepsOnItsOwnNamedThreadUntilItIsClosed` | 5 |
+| What counts as old is measured against the injected clock, so a test advances time instead of waiting | `RetentionSweepTest#sweepsWithTheTimeItReadsFromTheInjectedClock` | 5 |
