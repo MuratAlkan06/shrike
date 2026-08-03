@@ -52,6 +52,14 @@ import org.openjdk.jmh.annotations.Warmup;
  * costs. It is not a measurement of the file read alone, and neither number is a measurement of a
  * network. Both paths pay the same socket, which is what leaves the difference between them.
  *
+ * <p><strong>The transfer path opens a file descriptor per fetch and the buffered path does not.</strong>
+ * {@link SegmentedLog#openRange} opens a second descriptor on the segment file and the
+ * {@link RecordRange} closes it once the range has been sent, while {@link SegmentedLog#readRange}
+ * reads through the channel the segment already holds. That asymmetry is the broker's rather than this
+ * benchmark's — {@code LogSegment.openRange} is the same call a served fetch makes, and the second
+ * descriptor is what lets a range still be sent after retention has deleted the segment it is in — so
+ * the open and the close are inside the transfer number rather than taken out of it.
+ *
  * <p>The response header is outside both calls, because it is byte for byte the same in both paths and
  * is written the same way in both. What varies is only how the records block reaches the wire.
  *

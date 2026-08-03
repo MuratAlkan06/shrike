@@ -37,6 +37,14 @@ import org.openjdk.jmh.annotations.Warmup;
  * retention off — so a segment roll and the force that seals it fall inside the measurement exactly
  * as they fall inside a running broker's.
  *
+ * <p><strong>Only the {@code interval} arm reaches a roll.</strong> At the rates the two modes run
+ * at, a {@code per-record} trial appends about two thousand records over its warmup and measured
+ * seconds — some 310 KiB of frames — and never comes near the 128 MiB {@code segment.bytes}, so it
+ * rolls no segment at all. An {@code interval} trial appends about four million in the same eight
+ * seconds, some 610 MiB, and rolls and seals a segment about every 128 MiB while it does. The cost of
+ * rolling and sealing is therefore charged to the {@code interval} arm alone, and it lands in that
+ * arm's tail.
+ *
  * <p><strong>What is not measured, in {@code interval} mode, is the time bound.</strong> The
  * {@code shrike-flush} thread is a broker's, not a log's, and it forces from a thread of its own; the
  * bound that shows up here is the volume one, because that is the bound an append itself can cross.
@@ -74,7 +82,9 @@ public class FlushPolicyBenchmark {
 
     /**
      * Opens a log of its own for this trial, so a measurement never starts on a directory another one
-     * left behind.
+     * left behind. Fresh per trial and not per iteration: the warmup and measurement iterations of one
+     * trial all append to this same log, so under {@code interval} it goes on growing and rolling
+     * across them.
      *
      * @throws IOException if the directory cannot be created
      */
