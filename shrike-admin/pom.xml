@@ -17,10 +17,61 @@
 
   <properties>
     <spring-boot.version>3.5.16</spring-boot.version>
+    <jackson-bom.version>2.21.5</jackson-bom.version>
+    <tomcat-embed.version>10.1.57</tomcat-embed.version>
   </properties>
 
+  <!-- Order is the whole mechanism here. The Spring BOM is imported rather than inherited, and a
+       <properties> override of the kind spring-boot-starter-parent documents does nothing to an
+       imported BOM: the version it pins is the one that wins. What does win is an earlier entry in
+       this same section, because the first declaration of a coordinate is the one Maven keeps. So
+       everything this module means to move off what Spring Boot 3.5.16 pins is declared above the
+       import, and nothing below it can pull those back. DESIGN.md carries why this line of Spring
+       is being patched by hand at all. -->
   <dependencyManagement>
     <dependencies>
+      <!-- The reactor's parent already imports this, and the Spring BOM imported below would
+           otherwise override it for this module alone: JUnit 5.12.2 here against 5.14.4 in the two
+           modules that do not name Spring. Tests in one build run one version. -->
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>${junit.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+
+      <!-- Three moderate deserialization advisories against what Boot 3.5.16 pins. None of them is
+           reachable from this facade — it answers JSON and never reads any — so this is hygiene
+           rather than a fix, and it is a BOM import so that every jackson artifact on the path
+           moves together. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson-bom.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+
+      <!-- The embedded server, ahead of the BOM that pins an older one. All three artifacts carry
+           the same version on purpose: they are one release of Tomcat, and a build that mixed them
+           would be running a combination Tomcat never tested. -->
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-core</artifactId>
+        <version>${tomcat-embed.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-el</artifactId>
+        <version>${tomcat-embed.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-websocket</artifactId>
+        <version>${tomcat-embed.version}</version>
+      </dependency>
+
       <!-- Imported here rather than inherited from spring-boot-starter-parent so the
            reactor keeps its own parent and Spring stays scoped to this module. -->
       <dependency>
