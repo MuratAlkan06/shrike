@@ -1,9 +1,13 @@
 package io.shrike.core.net;
 
+import io.shrike.core.log.FlushMode;
+import io.shrike.core.log.LogConfig;
+import io.shrike.core.protocol.RequestReader;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -13,24 +17,47 @@ import java.util.Optional;
  *
  * <p>{@link BrokerConfig} is what a broker is built from; this is how a process comes to hold one. It
  * is read from environment variables and nothing else — no configuration file, no working-directory
- * lookup, no path this process guesses at. Four variables, of which one is required:
+ * lookup, no path this process guesses at. Seventeen variables, of which one is required, and one rule
+ * names them: a setting's variable is {@code SHRIKE_} followed by the name {@link LogConfig} and
+ * {@link BrokerConfig} give the field in their javadoc, upper-cased with each dot an underscore, so
+ * {@code retention.ms} is read from {@code SHRIKE_RETENTION_MS}.
  *
  * <pre>
- * SHRIKE_DATA_DIRECTORY  required, no default: everything this broker stores lives under it
- * SHRIKE_PORT            the TCP port to listen on, {@value #DEFAULT_PORT} by default
- * SHRIKE_READY_FILE      the file written once the broker is listening,
- *                        &lt;dataDirectory&gt;/{@value #DEFAULT_READY_FILE_NAME} by default
- * SHRIKE_BIND_ADDRESS    the interface to listen on, the loopback address by default
+ * SHRIKE_DATA_DIRECTORY       required, no default: everything this broker stores lives under it
+ * SHRIKE_PORT                 the TCP port to listen on, {@value #DEFAULT_PORT} by default
+ * SHRIKE_READY_FILE           the file written once the broker is listening,
+ *                             &lt;dataDirectory&gt;/{@value #DEFAULT_READY_FILE_NAME} by default
+ * SHRIKE_BIND_ADDRESS         the interface to listen on, the loopback address by default
+ * SHRIKE_RETENTION_MS         retention.ms
+ * SHRIKE_RETENTION_BYTES      retention.bytes
+ * SHRIKE_FLUSH_MODE           flush.mode, written per-record or interval in whatever letters
+ * SHRIKE_FLUSH_INTERVAL_MS    flush.interval.ms
+ * SHRIKE_FLUSH_INTERVAL_BYTES flush.interval.bytes
+ * SHRIKE_SEGMENT_BYTES        segment.bytes
+ * SHRIKE_MAX_RECORD_BYTES     max.record.bytes
+ * SHRIKE_INDEX_INTERVAL_BYTES index.interval.bytes
+ * SHRIKE_MAX_FETCH_WAIT_MS    max.fetch.wait.ms
+ * SHRIKE_MAX_REQUEST_BYTES    max.request.bytes
+ * SHRIKE_FETCH_ZERO_COPY      fetch.zero.copy, written true or false in whatever letters
+ * SHRIKE_CONNECTION_CAP       connectionCap, which has no dotted name of its own
+ * SHRIKE_MAX_TOTAL_PARTITIONS maxTotalPartitions, which has no dotted name of its own
  * </pre>
  *
  * <p>A variable that is not set, or set to nothing at all, is one the default answers for — which is
- * what {@code docker run -e SHRIKE_PORT=} passes and what an operator means by it. The data directory
- * has no default because a default would be a path this process picked rather than one somebody chose,
- * and every other path here derives from it.
+ * what {@code docker run -e SHRIKE_PORT=} passes and what an operator means by it. Each of the
+ * thirteen settings below the first four defaults to what {@link LogConfig#defaults()} and
+ * {@link BrokerConfig#defaults(Path, int, Path)} give the field it sets, so a process that names none
+ * of them starts the broker every deployment before them started. The data directory has no default
+ * because a default would be a path this process picked rather than one somebody chose, and every
+ * other path here derives from it.
  *
  * <p>Every value is checked here, before a socket is opened or a log is recovered, and a value that
  * does not make sense raises an {@link IllegalArgumentException} whose message is one sentence naming
- * the variable to fix.
+ * the variable to fix. A value is never quietly traded for the default: what a variable says either
+ * starts this broker or stops it. What happens here is the conversion from text — a whole number, one
+ * of two spellings — while the bounds stay in the records that own them, where they run for every
+ * caller those records have. A refusal from one of them is caught here and rethrown with the variable
+ * that set the field in front of it, which is possible because one variable sets one field.
  *
  * @param config      the configuration the broker starts with
  * @param bindAddress the interface to listen on, which is the loopback address unless the environment
@@ -49,6 +76,66 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
 
     /** The interface to listen on. Setting it past loopback is the whole of the opt-in. */
     public static final String BIND_ADDRESS_VARIABLE = "SHRIKE_BIND_ADDRESS";
+
+    /** {@code retention.ms}, or {@link LogConfig#RETENTION_DISABLED} to keep every segment. */
+    public static final String RETENTION_MS_VARIABLE = "SHRIKE_RETENTION_MS";
+
+    /** {@code retention.bytes}, or {@link LogConfig#RETENTION_DISABLED} to keep every segment. */
+    public static final String RETENTION_BYTES_VARIABLE = "SHRIKE_RETENTION_BYTES";
+
+    /** {@code flush.mode}: {@code per-record} or {@code interval}, in whatever letters. */
+    public static final String FLUSH_MODE_VARIABLE = "SHRIKE_FLUSH_MODE";
+
+    /** {@code flush.interval.ms}. */
+    public static final String FLUSH_INTERVAL_MS_VARIABLE = "SHRIKE_FLUSH_INTERVAL_MS";
+
+    /** {@code flush.interval.bytes}. */
+    public static final String FLUSH_INTERVAL_BYTES_VARIABLE = "SHRIKE_FLUSH_INTERVAL_BYTES";
+
+    /** {@code segment.bytes}. */
+    public static final String SEGMENT_BYTES_VARIABLE = "SHRIKE_SEGMENT_BYTES";
+
+    /** {@code max.record.bytes}. */
+    public static final String MAX_RECORD_BYTES_VARIABLE = "SHRIKE_MAX_RECORD_BYTES";
+
+    /** {@code index.interval.bytes}. */
+    public static final String INDEX_INTERVAL_BYTES_VARIABLE = "SHRIKE_INDEX_INTERVAL_BYTES";
+
+    /** {@code max.fetch.wait.ms}. */
+    public static final String MAX_FETCH_WAIT_MS_VARIABLE = "SHRIKE_MAX_FETCH_WAIT_MS";
+
+    /** {@code max.request.bytes}. */
+    public static final String MAX_REQUEST_BYTES_VARIABLE = "SHRIKE_MAX_REQUEST_BYTES";
+
+    /** {@code fetch.zero.copy}: {@code true} or {@code false}, in whatever letters. */
+    public static final String FETCH_ZERO_COPY_VARIABLE = "SHRIKE_FETCH_ZERO_COPY";
+
+    /** The most connections served at once. */
+    public static final String CONNECTION_CAP_VARIABLE = "SHRIKE_CONNECTION_CAP";
+
+    /** The most partitions this broker will hold open across every topic. */
+    public static final String MAX_TOTAL_PARTITIONS_VARIABLE = "SHRIKE_MAX_TOTAL_PARTITIONS";
+
+    /**
+     * Which variable set the field a record refused, keyed by the name that record's own sentence
+     * begins with. Bounds are checked once, in {@link LogConfig} and {@link BrokerConfig}, for every
+     * caller they have; this table is what lets a refusal from there arrive here as a sentence naming
+     * the variable an operator edits. One variable sets one field, so which one that is never has to
+     * be guessed at, and the fields no bound can refuse are not in the table.
+     */
+    private static final Map<String, String> VARIABLE_BY_FIELD = Map.ofEntries(
+            Map.entry("port", PORT_VARIABLE),
+            Map.entry("retentionMs", RETENTION_MS_VARIABLE),
+            Map.entry("retentionBytes", RETENTION_BYTES_VARIABLE),
+            Map.entry("flushIntervalMs", FLUSH_INTERVAL_MS_VARIABLE),
+            Map.entry("flushIntervalBytes", FLUSH_INTERVAL_BYTES_VARIABLE),
+            Map.entry("segmentBytes", SEGMENT_BYTES_VARIABLE),
+            Map.entry("maxRecordBytes", MAX_RECORD_BYTES_VARIABLE),
+            Map.entry("indexIntervalBytes", INDEX_INTERVAL_BYTES_VARIABLE),
+            Map.entry("maxFetchWaitMs", MAX_FETCH_WAIT_MS_VARIABLE),
+            Map.entry("maxRequestBytes", MAX_REQUEST_BYTES_VARIABLE),
+            Map.entry("connectionCap", CONNECTION_CAP_VARIABLE),
+            Map.entry("maxTotalPartitions", MAX_TOTAL_PARTITIONS_VARIABLE));
 
     /**
      * The port a broker listens on when nothing names another: 9750. It is not a registered port and
@@ -80,9 +167,9 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
         Objects.requireNonNull(environment, "environment");
 
         if (!arguments.isEmpty()) {
-            throw new IllegalArgumentException("this broker takes no arguments and is configured by "
-                    + DATA_DIRECTORY_VARIABLE + ", " + PORT_VARIABLE + ", " + READY_FILE_VARIABLE + ", and "
-                    + BIND_ADDRESS_VARIABLE + ", but it was given " + arguments.size());
+            throw new IllegalArgumentException("this broker takes no arguments and is configured by the "
+                    + "environment, beginning with " + DATA_DIRECTORY_VARIABLE + ", but it was given "
+                    + arguments.size());
         }
 
         String namedDataDirectory = value(environment, DATA_DIRECTORY_VARIABLE)
@@ -97,7 +184,60 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
                 .map(BrokerLaunch::bindAddress)
                 .orElseGet(InetAddress::getLoopbackAddress);
 
-        return new BrokerLaunch(BrokerConfig.defaults(dataDirectory, port, readyFilePath), bindAddress);
+        return new BrokerLaunch(brokerConfig(environment, dataDirectory, port, readyFilePath), bindAddress);
+    }
+
+    /**
+     * The numbers this broker serves under, each from the variable that names it and otherwise from
+     * {@link BrokerConfig#defaults(Path, int, Path)}.
+     */
+    private static BrokerConfig brokerConfig(Map<String, String> environment, Path dataDirectory, int port,
+                                             Path readyFilePath) {
+        int maxRequestBytes = wholeNumber(environment, MAX_REQUEST_BYTES_VARIABLE,
+                RequestReader.DEFAULT_MAX_REQUEST_BYTES);
+        int maxFetchWaitMs = wholeNumber(environment, MAX_FETCH_WAIT_MS_VARIABLE,
+                BrokerConfig.DEFAULT_MAX_FETCH_WAIT_MILLIS);
+        boolean zeroCopyFetch = value(environment, FETCH_ZERO_COPY_VARIABLE)
+                .map(BrokerLaunch::zeroCopyFetch)
+                .orElse(BrokerConfig.DEFAULT_ZERO_COPY_FETCH);
+        int connectionCap = wholeNumber(environment, CONNECTION_CAP_VARIABLE, BrokerConfig.DEFAULT_CONNECTION_CAP);
+        int maxTotalPartitions = wholeNumber(environment, MAX_TOTAL_PARTITIONS_VARIABLE,
+                BrokerConfig.DEFAULT_MAX_TOTAL_PARTITIONS);
+        LogConfig logConfig = logConfig(environment);
+
+        try {
+            return new BrokerConfig(dataDirectory, port, maxRequestBytes, maxFetchWaitMs, zeroCopyFetch,
+                    connectionCap, maxTotalPartitions, readyFilePath, logConfig);
+        } catch (IllegalArgumentException refusal) {
+            throw refusalNamingTheVariable(refusal);
+        }
+    }
+
+    /**
+     * The sizes and policy every partition log opens with, each from the variable that names it and
+     * otherwise from {@link LogConfig#defaults()}.
+     */
+    private static LogConfig logConfig(Map<String, String> environment) {
+        int maxRecordBytes = wholeNumber(environment, MAX_RECORD_BYTES_VARIABLE, LogConfig.DEFAULT_MAX_RECORD_BYTES);
+        int segmentBytes = wholeNumber(environment, SEGMENT_BYTES_VARIABLE, LogConfig.DEFAULT_SEGMENT_BYTES);
+        int indexIntervalBytes = wholeNumber(environment, INDEX_INTERVAL_BYTES_VARIABLE,
+                LogConfig.DEFAULT_INDEX_INTERVAL_BYTES);
+        long retentionMs = wholeNumber(environment, RETENTION_MS_VARIABLE, LogConfig.DEFAULT_RETENTION_MS);
+        long retentionBytes = wholeNumber(environment, RETENTION_BYTES_VARIABLE, LogConfig.DEFAULT_RETENTION_BYTES);
+        FlushMode flushMode = value(environment, FLUSH_MODE_VARIABLE)
+                .map(BrokerLaunch::flushMode)
+                .orElse(LogConfig.DEFAULT_FLUSH_MODE);
+        long flushIntervalMs = wholeNumber(environment, FLUSH_INTERVAL_MS_VARIABLE,
+                LogConfig.DEFAULT_FLUSH_INTERVAL_MS);
+        long flushIntervalBytes = wholeNumber(environment, FLUSH_INTERVAL_BYTES_VARIABLE,
+                LogConfig.DEFAULT_FLUSH_INTERVAL_BYTES);
+
+        try {
+            return new LogConfig(maxRecordBytes, segmentBytes, indexIntervalBytes, retentionMs, retentionBytes,
+                    flushMode, flushIntervalMs, flushIntervalBytes);
+        } catch (IllegalArgumentException refusal) {
+            throw refusalNamingTheVariable(refusal);
+        }
     }
 
     /**
@@ -106,6 +246,86 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
      */
     private static Optional<String> value(Map<String, String> environment, String variable) {
         return Optional.ofNullable(environment.get(variable)).map(String::trim).filter(set -> !set.isEmpty());
+    }
+
+    /**
+     * @return the whole number the variable was set to, or {@code byDefault} when it was not set. Text
+     *         that is not a whole number the field can hold is refused in the words
+     *         {@link #PORT_VARIABLE} has always been refused in: the variable, and what it was given
+     */
+    private static int wholeNumber(Map<String, String> environment, String variable, int byDefault) {
+        Optional<String> named = value(environment, variable);
+        if (named.isEmpty()) {
+            return byDefault;
+        }
+        try {
+            return Integer.parseInt(named.get());
+        } catch (NumberFormatException notANumber) {
+            throw new IllegalArgumentException(variable + " must be a whole number from " + Integer.MIN_VALUE
+                    + " to " + Integer.MAX_VALUE + ", but was \"" + named.get() + "\"", notANumber);
+        }
+    }
+
+    /**
+     * @return the whole number the variable was set to, or {@code byDefault} when it was not set. The
+     *         same refusal as the smaller fields, in the range this one holds
+     */
+    private static long wholeNumber(Map<String, String> environment, String variable, long byDefault) {
+        Optional<String> named = value(environment, variable);
+        if (named.isEmpty()) {
+            return byDefault;
+        }
+        try {
+            return Long.parseLong(named.get());
+        } catch (NumberFormatException notANumber) {
+            throw new IllegalArgumentException(variable + " must be a whole number from " + Long.MIN_VALUE
+                    + " to " + Long.MAX_VALUE + ", but was \"" + named.get() + "\"", notANumber);
+        }
+    }
+
+    /**
+     * The two spellings {@link FlushMode} documents, read in whatever letters they were written in
+     * because an environment is typed by hand. A third spelling is a durability promise this build
+     * cannot keep, so it stops the broker rather than being rounded to one of these.
+     */
+    private static FlushMode flushMode(String named) {
+        return switch (named.toLowerCase(Locale.ROOT)) {
+            case "per-record" -> FlushMode.PER_RECORD;
+            case "interval" -> FlushMode.INTERVAL;
+            default -> throw new IllegalArgumentException(FLUSH_MODE_VARIABLE
+                    + " must be \"per-record\" or \"interval\", but was \"" + named + "\"");
+        };
+    }
+
+    /**
+     * {@code true} and {@code false} and nothing else. {@code Boolean.parseBoolean} is what is not
+     * called here: it answers {@code false} to every word that is not {@code true}, so a typo would
+     * turn a setting nobody meant to change into the path this broker does not take by default, and it
+     * would do it in silence.
+     */
+    private static boolean zeroCopyFetch(String named) {
+        return switch (named.toLowerCase(Locale.ROOT)) {
+            case "true" -> true;
+            case "false" -> false;
+            default -> throw new IllegalArgumentException(FETCH_ZERO_COPY_VARIABLE
+                    + " must be \"true\" or \"false\", but was \"" + named + "\"");
+        };
+    }
+
+    /**
+     * @return the record's own refusal with the variable that set the field in front of it, or that
+     *         refusal unchanged when it is about a field no variable here sets. The record's sentence
+     *         is kept whole behind the variable's name, because it is the half that says what was
+     *         expected while the variable is the half that says where to fix it
+     */
+    private static IllegalArgumentException refusalNamingTheVariable(IllegalArgumentException refusal) {
+        String sentence = String.valueOf(refusal.getMessage());
+        String variable = VARIABLE_BY_FIELD.get(sentence.split(" ", 2)[0]);
+        if (variable == null) {
+            return refusal;
+        }
+        return new IllegalArgumentException(variable + " was set to a value this broker cannot use: " + sentence,
+                refusal);
     }
 
     private static int port(String named) {

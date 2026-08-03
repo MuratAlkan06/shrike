@@ -2,7 +2,7 @@
 
 Shrike is a single-node, log-structured message broker written in Java 21. Producers append records to a segmented commit log on one machine's disk, consumers read them back by offset, and delivery is at-least-once: a record may be redelivered after a failure, and no record is silently dropped.
 
-Version 1.0.0 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a flush policy that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker. What a running broker can be told is four environment variables and no more, which [Configuration](#configuration) sets out; the [Non-goals](#non-goals) below are what this build does not do at all.
+Version 1.0.0 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a flush policy that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker. What a running broker can be told is seventeen environment variables and no more, one for each setting this README names, which [Configuration](#configuration) sets out; the [Non-goals](#non-goals) below are what this build does not do at all.
 
 ## Non-goals
 
@@ -31,9 +31,9 @@ mvn -B clean verify
 SHRIKE_DATA_DIRECTORY=/var/lib/shrike java -cp shrike-core/target/classes io.shrike.core.net.BrokerMain
 ```
 
-It listens on port 9750, binds the loopback interface, and writes `shrike.ready` — the port it bound and its pid — into the data directory. `SHRIKE_PORT`, `SHRIKE_READY_FILE`, and `SHRIKE_BIND_ADDRESS` are the other three variables, each of which has a default, and the last of them is the only way this broker comes to listen anywhere but loopback. Those four are the whole of what this entry point reads; everything else runs at its default, and [Configuration](#configuration) is the list of what that means.
+It listens on port 9750, binds the loopback interface, and writes `shrike.ready` — the port it bound and its pid — into the data directory. `SHRIKE_PORT`, `SHRIKE_READY_FILE`, and `SHRIKE_BIND_ADDRESS` are the other three variables that name where a broker lives, each of which has a default, and the last of them is the only way this broker comes to listen anywhere but loopback. Every other setting this README names is read from one variable of its own — retention, the flush policy, the sizes, the caps — and a variable nobody sets is a setting left at the default this build has always run. [Configuration](#configuration) is the list of them, with the rule that names them and the default each one runs at.
 
-**Or run it in a container.** The image is the same entry point reading the same four variables, with `SHRIKE_BIND_ADDRESS` set to `0.0.0.0` because a published port never lands on a container's loopback:
+**Or run it in a container.** The image is the same entry point reading the same variables, with `SHRIKE_BIND_ADDRESS` set to `0.0.0.0` because a published port never lands on a container's loopback:
 
 ```
 docker build -t shrike:1.0.0 .
@@ -71,7 +71,7 @@ It binds `127.0.0.1:8080`, and what those three answer with is under [Admin endp
 
 ## Configuration
 
-**The broker's shipped entry point reads four environment variables and nothing else.** `BrokerMain` builds a `BrokerLaunch` out of the environment — no configuration file, no command line, and an argument is refused rather than silently ignored — and hands the broker `BrokerConfig.defaults(dataDirectory, port, readyFilePath)`. The container image runs that same entry point, so it runs those same defaults.
+**The broker's shipped entry point reads seventeen environment variables and nothing else.** `BrokerMain` builds a `BrokerLaunch` out of the environment — no configuration file, no command line, and an argument is refused rather than silently ignored — and hands the broker the `BrokerConfig` those variables describe. The container image runs that same entry point, so it reads the same seventeen. **One rule names all of them: a setting's variable is `SHRIKE_` followed by the setting's own name in capitals, with each dot an underscore** — `retention.ms` is `SHRIKE_RETENTION_MS`, `flush.interval.bytes` is `SHRIKE_FLUSH_INTERVAL_BYTES`, and the two settings that have no dotted name are spelled the same way from their field names.
 
 | Variable | Default | What it names |
 |---|---|---|
@@ -79,24 +79,39 @@ It binds `127.0.0.1:8080`, and what those three answer with is under [Admin endp
 | `SHRIKE_PORT` | `9750` | the TCP port to listen on |
 | `SHRIKE_READY_FILE` | `<data dir>/shrike.ready` | the file written once the broker is listening, holding the port it bound and its pid |
 | `SHRIKE_BIND_ADDRESS` | the loopback address | the interface to listen on |
+| `SHRIKE_RETENTION_MS` | `-1`, which is off | how long a sealed segment is kept after the newest record in it, or `-1` to keep every segment |
+| `SHRIKE_RETENTION_BYTES` | `-1`, which is off | how many bytes of log files one partition may hold before its oldest sealed segments are deleted, or `-1` to keep every segment |
+| `SHRIKE_FLUSH_MODE` | `interval` | when records reach the device: `per-record` or `interval`, in whatever letters |
+| `SHRIKE_FLUSH_INTERVAL_MS` | `100` | how long records may sit unforced in `interval` mode |
+| `SHRIKE_FLUSH_INTERVAL_BYTES` | `1048576` (1 MiB) | how many bytes of records may be appended without a force in `interval` mode |
+| `SHRIKE_SEGMENT_BYTES` | `134217728` (128 MiB) | the size a segment may reach before the next record starts a new one |
+| `SHRIKE_MAX_RECORD_BYTES` | `1048576` (1 MiB) | the most bytes one record may occupy on disk, framing included |
+| `SHRIKE_INDEX_INTERVAL_BYTES` | `4096` | how many bytes of appended records go by between two entries of a segment's sparse index |
+| `SHRIKE_MAX_FETCH_WAIT_MS` | `30000` | the longest a fetch may be held open, whatever wait it asks for |
+| `SHRIKE_MAX_REQUEST_BYTES` | `4194304` (4 MiB) | the largest request frame this broker will read, and so the most one connection can make it hold |
+| `SHRIKE_FETCH_ZERO_COPY` | `true` | `true` to send a fetch's records out of the segment file, `false` to read them into memory first |
+| `SHRIKE_CONNECTION_CAP` | `64` | the most connections served at once |
+| `SHRIKE_MAX_TOTAL_PARTITIONS` | `1024` | the most partitions this broker will hold open across every topic |
 
-**Every other setting named in this README is a field of `LogConfig` or `BrokerConfig`, and the only way to give one a value today is to build that record in Java.** They are real settings — each is validated where its record is constructed, read on a live path, and exercised by the suite this build runs — but they are a library surface rather than an operator surface. An application that puts `shrike-core` on its classpath and calls `ShrikeBroker.start(config, timeSource)` with a configuration it assembled gets whatever it named; the quickstart's entry point and the image, which build no configuration of their own, get the right-hand column. Reading these out of the environment is not something this build does, and it is tracked in #30.
+**A value this broker cannot use stops it before it opens a socket, and nothing here ever falls back to a default.** A variable that is unset, or set to nothing at all — which is what `docker run -e SHRIKE_PORT=` passes — is one the default answers for; a variable that says something is either used or refused. The refusal is one sentence naming the variable, quoting what it was given, and saying what was expected, on standard error with exit code 2: `SHRIKE_SEGMENT_BYTES was set to a value this broker cannot use: segmentBytes must not exceed 1073741824, so that every byte position inside a segment fits an index entry's int32 field, but was 2147483647`. That sentence has two halves because the work does: text becomes a number, a spelling, or a `true`/`false` where the environment is read, while the bounds stay on the records below, checked once for every caller they have.
 
-| Setting | Field | Lives on | What the entry point and the image run |
+**Every setting above is a field of `LogConfig` or `BrokerConfig`, and building those records in Java is still the other way to set one.** They are a library surface as well as an operator surface: an application that puts `shrike-core` on its classpath and calls `ShrikeBroker.start(config, timeSource)` with a configuration it assembled gets whatever it named, and the quickstart's entry point and the image get what their environment says.
+
+| Setting | Variable | Field | Lives on |
 |---|---|---|---|
-| `retention.ms` | `retentionMs` | `LogConfig` | `-1`, which is off |
-| `retention.bytes` | `retentionBytes` | `LogConfig` | `-1`, which is off |
-| `flush.mode` | `flushMode` | `LogConfig` | `interval` |
-| `flush.interval.ms` | `flushIntervalMs` | `LogConfig` | 100 |
-| `flush.interval.bytes` | `flushIntervalBytes` | `LogConfig` | 1 MiB |
-| `segment.bytes` | `segmentBytes` | `LogConfig` | 128 MiB |
-| `max.record.bytes` | `maxRecordBytes` | `LogConfig` | 1 MiB |
-| `index.interval.bytes` | `indexIntervalBytes` | `LogConfig` | 4 KiB |
-| `max.fetch.wait.ms` | `maxFetchWaitMs` | `BrokerConfig` | 30 000 |
-| `max.request.bytes` | `maxRequestBytes` | `BrokerConfig` | 4 MiB |
-| `fetch.zero.copy` | `zeroCopyFetch` | `BrokerConfig` | on |
+| `retention.ms` | `SHRIKE_RETENTION_MS` | `retentionMs` | `LogConfig` |
+| `retention.bytes` | `SHRIKE_RETENTION_BYTES` | `retentionBytes` | `LogConfig` |
+| `flush.mode` | `SHRIKE_FLUSH_MODE` | `flushMode` | `LogConfig` |
+| `flush.interval.ms` | `SHRIKE_FLUSH_INTERVAL_MS` | `flushIntervalMs` | `LogConfig` |
+| `flush.interval.bytes` | `SHRIKE_FLUSH_INTERVAL_BYTES` | `flushIntervalBytes` | `LogConfig` |
+| `segment.bytes` | `SHRIKE_SEGMENT_BYTES` | `segmentBytes` | `LogConfig` |
+| `max.record.bytes` | `SHRIKE_MAX_RECORD_BYTES` | `maxRecordBytes` | `LogConfig` |
+| `index.interval.bytes` | `SHRIKE_INDEX_INTERVAL_BYTES` | `indexIntervalBytes` | `LogConfig` |
+| `max.fetch.wait.ms` | `SHRIKE_MAX_FETCH_WAIT_MS` | `maxFetchWaitMs` | `BrokerConfig` |
+| `max.request.bytes` | `SHRIKE_MAX_REQUEST_BYTES` | `maxRequestBytes` | `BrokerConfig` |
+| `fetch.zero.copy` | `SHRIKE_FETCH_ZERO_COPY` | `zeroCopyFetch` | `BrokerConfig` |
 
-The dotted names in the left-hand column are what the javadoc on those two records calls each field, and what the prose below calls them. They are not keys anything in this build parses, and writing one as `name=value` anywhere would not set it. Two more numbers sit on `BrokerConfig` beside them and are defaulted the same way: `connectionCap`, 64, and `maxTotalPartitions`, 1024.
+The dotted names in the left-hand column are what the javadoc on those two records calls each field, and what the prose below calls them; the middle column is each of those names under the rule above. Two more numbers sit on `BrokerConfig` beside them with no dotted name of their own, and the same rule reaches them from their fields: `connectionCap`, 64, from `SHRIKE_CONNECTION_CAP`, and `maxTotalPartitions`, 1024, from `SHRIKE_MAX_TOTAL_PARTITIONS`.
 
 `shrike-admin` has a settable surface of its own, because it is a Spring application: `server.address`, `server.port`, `shrike.broker.host`, and `shrike.broker.port` are set the way any Spring Boot property is, and they are described under [Admin endpoints](#admin-endpoints).
 
@@ -193,7 +208,7 @@ Earlier segments are not walked, because a segment is forced before it is sealed
 
 ## Retention
 
-**Retention deletes acknowledged records, on purpose, whenever a log is opened under a policy that asks for it.** That is what it is for, and it is worth saying in those words rather than in softer ones. Two `LogConfig` fields decide it, per partition log: `retention.ms` deletes a sealed segment once every record in it is that many milliseconds old, and `retention.bytes` deletes the oldest sealed segments until the partition's log files add up to no more than that many bytes. **Both default to −1, which is off, and off is what the entry point and the image run: a broker started either of those ways keeps every record it has ever stored.** Asking for retention takes an application that builds its own `LogConfig`, per [Configuration](#configuration); #30 tracks reaching these two from the entry point.
+**Retention deletes acknowledged records, on purpose, whenever a log is opened under a policy that asks for it.** That is what it is for, and it is worth saying in those words rather than in softer ones. Two `LogConfig` fields decide it, per partition log: `retention.ms` deletes a sealed segment once every record in it is that many milliseconds old, and `retention.bytes` deletes the oldest sealed segments until the partition's log files add up to no more than that many bytes. **Both default to −1, which is off, and off is what the entry point and the image run unless somebody says otherwise: a broker started with neither of them set keeps every record it has ever stored.** Asking for retention is `SHRIKE_RETENTION_MS` or `SHRIKE_RETENTION_BYTES` on the process, per [Configuration](#configuration), or an application that builds its own `LogConfig`.
 
 A segment's age is the largest record timestamp inside it — the timestamp the broker stamped when it appended the newest record it holds — and never a file's modification time, which a copy or a restore resets while the records do not change. Because the age comes from the newest record, no record is ever deleted inside its own window. Whole sealed segments only: the segment still taking appends is never deleted, however old it is and however large the partition has grown, so a partition can sit above `retention.bytes` by the size of that one segment.
 
@@ -309,7 +324,7 @@ The 400 sentence names the field the name arrived in — `topic` on a topic path
 
 The image holds a Temurin 21 JRE and one jar, runs as a user that is not root, and keeps everything under `/var/lib/shrike`, which is where its volume goes. The two commands that build it and start it are in the [quickstart](#quickstart) above.
 
-The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a host port onto the container's own interface and never onto its loopback. The bare broker's default is the loopback address and stays that way: the image opts in, inside a network namespace of its own, and the port it can be reached on is the one its operator published. `SHRIKE_DATA_DIRECTORY`, `SHRIKE_PORT`, and `SHRIKE_READY_FILE` are the other three variables, and `docker run -e` is how any of them changes. `docker stop` is a `SIGTERM`, which the broker answers by closing its logs. Its `HEALTHCHECK` opens a TCP connection to `SHRIKE_PORT` and closes it — no request, no api key, nothing appended — so `docker ps` says healthy when something is listening and says nothing about what it would answer.
+The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a host port onto the container's own interface and never onto its loopback. The bare broker's default is the loopback address and stays that way: the image opts in, inside a network namespace of its own, and the port it can be reached on is the one its operator published. `SHRIKE_DATA_DIRECTORY` and `SHRIKE_PORT` are the other two the image sets, `SHRIKE_READY_FILE` is left at its default inside the volume, and `docker run -e` is how any of them — or any other variable in [Configuration](#configuration), none of which this image sets — is given a value. `docker stop` is a `SIGTERM`, which the broker answers by closing its logs. Its `HEALTHCHECK` opens a TCP connection to `SHRIKE_PORT` and closes it — no request, no api key, nothing appended — so `docker ps` says healthy when something is listening and says nothing about what it would answer.
 
 That published port is an ordinary broker port, which the client code in the quickstart talks to unchanged. The admin facade is not in the image: it is an HTTP server of its own, and it runs beside the container.
 
@@ -434,3 +449,10 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A describe answered while retention is deleting segments from the same partition never reports a range running backwards or a partition with no segments, because the snapshot and the sweep take one lock | `PartitionDescribeRetentionRaceTest#describesOneInstantOfAPartitionRetentionIsDeletingSegmentsFrom` | 6 |
 | A describe taken after retention has moved a partition past a group's commit reports the offset it moved to, the high-water mark retention never touched, and only the bytes the segments that are left occupy | `BrokerDescribeTest#reportsTheOffsetRetentionMovedToBesideACommitThatFellBehindIt` | 6 |
 | A group whose unread records retention deleted still lags by the high-water mark minus its commit, because lag says how far behind a group is and not how much of that it can still read | `GroupLagTest#countsTheRecordsRetentionDeletedInTheLagOfAGroupThatFellBehindIt` | 6 |
+| A broker started with nothing named but its data directory holds exactly the configuration it held before any setting could come from the environment | `BrokerLaunchTest#runsTheDefaultsItAlwaysRanWhenNothingButTheDataDirectoryIsSet` | 1.1 |
+| Every setting this README documents is read from one environment variable of its own, and each value lands in the field that variable names | `BrokerLaunchTest#readsEverySettingFromTheVariableThatNamesIt` | 1.1 |
+| A setting that is not a whole number stops the start with a message naming the variable and quoting what it was given | `BrokerLaunchTest#refusesASettingThatIsNotAWholeNumberNamingTheVariableAndQuotingWhatItWasGiven` | 1.1 |
+| A setting outside the bounds its record holds stops the start naming the variable that set it, with the record's own sentence behind it, rather than falling back to a default | `BrokerLaunchTest#refusesASettingOutsideItsRangeNamingTheVariableThatSetItAndKeepingTheRecordsSentence` | 1.1 |
+| Either flush-mode spelling is taken in whatever letters it arrives in | `BrokerLaunchTest#takesEitherFlushModeSpellingInWhateverLettersItArrivesIn` | 1.1 |
+| A flush-mode spelling this build does not know stops the start and names the two spellings it takes | `BrokerLaunchTest#refusesAFlushModeSpellingThisBuildDoesNotKnowAndSaysWhichTwoItTakes` | 1.1 |
+| `fetch.zero.copy` set to a word that is neither true nor false stops the start rather than being read as false | `BrokerLaunchTest#refusesAZeroCopySettingThatIsNeitherTrueNorFalseRatherThanReadingItAsFalse` | 1.1 |
