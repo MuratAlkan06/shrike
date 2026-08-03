@@ -20,7 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * The whole thing, across four operating-system processes: a broker, two producers, and two
+ * The whole thing, across five operating-system processes: a broker, two producers, and two
  * consumers, none of them sharing a heap with the test or with each other.
  *
  * <p>Threads would have proved less. Every test in {@code shrike-core} starts a broker in the JVM
