@@ -66,11 +66,12 @@ import java.util.concurrent.locks.ReentrantLock;
  * not hold creates one, and nothing removes it once it is on the device, so the budget the store is
  * opened with is what keeps anything that can send a commit from filling this directory: a commit that
  * would create a group past it raises {@link TooManyGroupsException} instead, before anything is
- * written. A commit that creates a group and then fails to make it durable removes it again, so what
- * holds a place under the budget is a group with a file behind it and never a failure. A commit for a
- * group that is already here is never refused by the budget, including a group loaded from a directory
- * that already held more of them than the budget allows — that is a start, not a request, and it opens
- * with a WARN and every group it found.
+ * written. A commit that creates a group and fails before its file takes the group's name removes it
+ * again, so what holds a place under the budget is a group with a file behind it and never a failure —
+ * and a commit that fails after that name is on the device keeps both, because the file is there. A
+ * commit for a group that is already here is never refused by the budget, including a group loaded from
+ * a directory that already held more of them than the budget allows — that is a start, not a request,
+ * and it opens with a WARN and every group it found.
  */
 public final class GroupOffsetStore {
 
@@ -173,9 +174,13 @@ public final class GroupOffsetStore {
      *                                  all the groups it may. A group that is already here is never
      *                                  refused for it, and nothing is written when one is
      * @throws ShrikeIOException        if the commit cannot be made durable, in which case this store
-     *                                  holds what it held before the call: the offset goes back to what
-     *                                  it was, and a commit that had just created the group un-creates
-     *                                  it, so a failure never takes a place under the budget
+     *                                  holds whatever the device does. A failure before the file took the
+     *                                  group's name puts everything back: the offset goes to what it was,
+     *                                  and a commit that had just created the group un-creates it, so a
+     *                                  failure that wrote nothing takes no place under the budget. A
+     *                                  failure after it keeps the offset and the group, because the file
+     *                                  is there for the next start to read — and still throws, because
+     *                                  nothing confirmed the write was durable
      */
     public void commit(String groupId, String topic, int partition, long offset) {
         SafeName.require(groupId, "groupId");
@@ -194,9 +199,9 @@ public final class GroupOffsetStore {
                 // Asked and answered under the one lock every commit holds, which is what makes the
                 // budget exact: a group is created here and nowhere else, so two commits arriving at
                 // once cannot both find the last place free. Nothing has been written or changed yet
-                // when this throws, so a refused commit leaves the store exactly as it found it — and
-                // so does a commit that gets past here and then fails, which the rollback below undoes
-                // down to the group itself.
+                // when this throws, so a refused commit leaves the store exactly as it found it; a
+                // commit that gets past here and then fails leaves it holding what the device holds,
+                // which the rollback below is what decides.
                 if (offsetsByGroup.size() >= maxTotalGroups) {
                     throw new TooManyGroupsException(group, offsetsByGroup.size(), maxTotalGroups);
                 }
@@ -204,20 +209,27 @@ public final class GroupOffsetStore {
                 offsetsByGroup.put(group, offsets);
             }
             Long previousOffset = offsets.put(key, offset);
+            StepsTaken steps = new StepsTaken(observer);
             try {
-                DurableFile.replace(fileOf(group), render(offsets), observer);
+                DurableFile.replace(fileOf(group), render(offsets), steps);
             } catch (RuntimeException e) {
                 // The file is what this store is; memory that disagrees with it would answer the next
-                // read with an offset no restart could produce.
-                if (creatingTheGroup) {
-                    // A group whose first commit never reached the device is a group with no file
-                    // behind it, and leaving the entry would hold a place under the budget for the
-                    // life of the process. Anything that can make a write fail — a full disk is
-                    // enough — could take every place that way, one failed commit at a time, so this
-                    // undoes the creation as well as the offset.
-                    offsetsByGroup.remove(group);
-                } else {
-                    restore(offsets, key, previousOffset);
+                // read something no restart over this directory could produce. So what a failure rolls
+                // back is decided by the move and by nothing else: before it, the group's name has
+                // nothing behind it and the whole change goes; at it, <group>.offsets is a file every
+                // later reader finds, and the store keeps what that file holds even though the commit
+                // still fails, because the write was never confirmed durable.
+                if (!steps.hasMoved()) {
+                    if (creatingTheGroup) {
+                        // A group whose first commit never took its name on the device is a group with
+                        // no file behind it, and leaving the entry would hold a place under the budget
+                        // for the life of the process. Anything that can make a write fail — a full
+                        // disk is enough — could take every place that way, one failed commit at a
+                        // time, so this undoes the creation as well as the offset.
+                        offsetsByGroup.remove(group);
+                    } else {
+                        restore(offsets, key, previousOffset);
+                    }
                 }
                 throw e;
             }
@@ -512,6 +524,43 @@ public final class GroupOffsetStore {
             return committed;
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * How far one commit's write got, which is the only thing that says what a failure has to undo: the
+     * atomic move is what gives a file the group's name, so a failure before it left nothing behind that
+     * name and a failure after it left a file the next start will read.
+     *
+     * <p>It records the step before passing it on, and the order is the point: a step is reported once it
+     * has run, so an observer that throws is standing in for a device that failed <em>after</em> that step
+     * — and a move that ran is a move this store must not pretend away.
+     */
+    private static final class StepsTaken implements DurableFile.StepObserver {
+
+        private final DurableFile.StepObserver watching;
+
+        // confined to: the thread inside commit that made it, which holds lock for the whole write
+        private boolean hasMoved;
+
+        StepsTaken(DurableFile.StepObserver watching) {
+            this.watching = watching;
+        }
+
+        @Override
+        public void completed(DurableFile.Step step) {
+            if (step == DurableFile.Step.MOVED) {
+                hasMoved = true;
+            }
+            watching.completed(step);
+        }
+
+        /**
+         * @return whether the file has taken the group's name, so that what is on the device is what this
+         *         commit wrote rather than what was there before it
+         */
+        boolean hasMoved() {
+            return hasMoved;
         }
     }
 }

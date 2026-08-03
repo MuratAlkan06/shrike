@@ -19,6 +19,8 @@ import java.util.OptionalLong;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /**
  * Committed offsets: keyed by group, topic, and partition, written durably, and read back after a
@@ -331,35 +333,87 @@ class GroupOffsetStoreTest {
     }
 
     /**
-     * A group is created in memory before its file is written, and a write that never reaches the device
-     * has to take that creation back with it. A group with no file behind it answers nothing, is loaded
-     * by no restart, and would still hold a place under the budget for the life of the process — and who
-     * can cause one is what makes it a defect rather than an untidiness: a write fails when the disk is
-     * full, retention is off by default, and anything that can make writes fail could then take every
-     * place in the budget with commits that stored nothing.
+     * A group is created in memory before its file is written, and a write that stops before the move has
+     * to take that creation back with it. Nothing carries the group's name on the device until the move
+     * runs, so an entry left behind would be a group no restart could find, answering nothing and holding
+     * a place under the budget for the life of the process — and who can cause one is what makes it a
+     * defect rather than an untidiness: a write fails when the disk is full, retention is off by default,
+     * and anything that can make writes fail could then take every place in the budget with commits that
+     * stored nothing.
      *
      * <p>The failure is injected through the same seam that proves a commit is durable before it returns:
-     * the durable steps report themselves as they run, and this device refuses the first one.
+     * the durable steps report themselves as they run, and this device refuses after the one it is named
+     * for. Both steps before the move are injected, because what the rollback turns on is the move and
+     * not the number of steps that ran ahead of it.
      */
-    @Test
-    void forgetsAGroupWhoseCreatingCommitNeverBecameDurableAndKeepsItsBudgetSlot() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, TWO_GROUPS, new DeviceRefusingItsFirstWrite());
+    @ParameterizedTest(name = "failing after {0}")
+    @EnumSource(value = DurableFile.Step.class, names = {"WRITTEN", "FORCED"})
+    void forgetsAGroupWhoseCreatingCommitFailedBeforeItsFileWasMovedIntoPlace(DurableFile.Step lastStepTaken)
+            throws IOException {
+        Path groups = dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, TWO_GROUPS,
+                new DeviceFailingAfterOneStep(lastStepTaken));
 
         assertThrows(ShrikeIOException.class, () -> store.commit(GROUP, TOPIC, 0, 5L));
 
         assertEquals(List.of(), store.committedOffsets(GROUP),
-                "a commit that was never acknowledged did not create a group this store holds");
+                "a commit whose file never took the group's name did not create a group this store holds");
         assertEquals(OptionalLong.empty(), store.committedOffset(GROUP, TOPIC, 0));
-        assertFalse(Files.exists(dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME)
-                        .resolve(GROUP + GroupOffsetStore.FILE_SUFFIX)),
-                "and there is no file behind it, because the write it failed at is what would have made one");
+        assertFalse(Files.exists(groups.resolve(GROUP + GroupOffsetStore.FILE_SUFFIX)),
+                "and there is no file behind it, because the move that would have made one never ran");
         store.commit(OTHER_GROUP, TOPIC, 0, 3L);
         store.commit(THIRD_GROUP, TOPIC, 0, 1L);
         assertEquals(OptionalLong.of(3L), store.committedOffset(OTHER_GROUP, TOPIC, 0),
                 "both places under a budget of two were still free, so the failed commit burned neither");
         assertEquals(OptionalLong.of(1L), store.committedOffset(THIRD_GROUP, TOPIC, 0));
+        assertEquals(List.of(OTHER_GROUP + GroupOffsetStore.FILE_SUFFIX,
+                        GROUP + GroupOffsetStore.FILE_SUFFIX + ".tmp", THIRD_GROUP + GroupOffsetStore.FILE_SUFFIX),
+                fileNamesIn(groups),
+                "and the directory holds the two groups the store counts, beside the temporary file the failed"
+                        + " write left, which carries no group's name and is loaded as nothing");
         assertEquals(List.of(), GroupOffsetStore.open(dataDirectory, TWO_GROUPS).committedOffsets(GROUP),
-                "and a store reopened over that directory has never heard of the group either");
+                "so a store reopened over that directory has never heard of the group either");
+    }
+
+    /**
+     * The move is what puts a group on the device: from that instant the file carries the group's name,
+     * and every reader of the directory finds it — this store, and the next start alike. A commit that
+     * failed after the move still fails, because nothing confirmed the write was durable and the client
+     * must be told so; but the group it created is a group that exists, so the store keeps it and it
+     * keeps its place under the budget.
+     *
+     * <p>Dropping it would leave the store counting one group fewer than the directory holds, and the
+     * difference is what grows: each failure of this shape hands back a place that a later commit spends
+     * on a second file, so the group count on disk climbs past the budget and every start after it opens
+     * over more groups than it allows.
+     */
+    @ParameterizedTest(name = "failing after {0}")
+    @EnumSource(value = DurableFile.Step.class, names = {"MOVED", "DIRECTORY_FORCED"})
+    void keepsAGroupWhoseCreatingCommitMovedItsFileIntoPlaceAndThenFailed(DurableFile.Step lastStepTaken)
+            throws IOException {
+        Path groups = dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, TWO_GROUPS,
+                new DeviceFailingAfterOneStep(lastStepTaken));
+
+        assertThrows(ShrikeIOException.class, () -> store.commit(GROUP, TOPIC, 0, 5L));
+
+        assertEquals(GroupOffsetStore.VERSION_HEADER + "\n" + TOPIC + " 0 5\n",
+                Files.readString(groups.resolve(GROUP + GroupOffsetStore.FILE_SUFFIX), UTF_8),
+                "the move ran, so the group has a file under its own name whatever failed after it");
+        assertEquals(OptionalLong.of(5L), store.committedOffset(GROUP, TOPIC, 0),
+                "and the store holds what that file holds, because a store that forgot it would answer the"
+                        + " next reader something no restart over this directory could produce");
+        store.commit(OTHER_GROUP, TOPIC, 0, 3L);
+
+        assertThrows(TooManyGroupsException.class, () -> store.commit(THIRD_GROUP, TOPIC, 0, 1L),
+                "the group on the device holds the place it took, so two groups on disk is two groups spent");
+        assertEquals(List.of(OTHER_GROUP + GroupOffsetStore.FILE_SUFFIX, GROUP + GroupOffsetStore.FILE_SUFFIX),
+                fileNamesIn(groups),
+                "and the directory holds exactly the groups the budget counted, never one more than it");
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory, TWO_GROUPS);
+        assertEquals(OptionalLong.of(5L), reopened.committedOffset(GROUP, TOPIC, 0),
+                "a restart loads the file the failed commit left behind, which is why its place was kept");
+        assertEquals(OptionalLong.of(3L), reopened.committedOffset(OTHER_GROUP, TOPIC, 0));
     }
 
     /**
@@ -386,23 +440,30 @@ class GroupOffsetStoreTest {
     }
 
     /**
-     * A device that refuses the first write it is told about and takes every one after it, which is the
-     * nearest a test can stand to a disk that has filled up. {@link DurableFile} reports each step as it
-     * finishes, so a step that throws is a step that did not happen as far as the store above it is
-     * concerned.
+     * A device that takes every durable step up to and including the one it is named for, refuses once
+     * there, and takes everything after that — the nearest a test can stand to a disk that fills, or to a
+     * machine that stops, at a chosen point in the sequence. {@link DurableFile} reports each step as it
+     * finishes, so an exception thrown when it reports one stands for a failure that happened after that
+     * step ran and before the next one did.
      */
-    private static final class DeviceRefusingItsFirstWrite implements DurableFile.StepObserver {
+    private static final class DeviceFailingAfterOneStep implements DurableFile.StepObserver {
+
+        private final DurableFile.Step lastStepItTakes;
 
         // confined to: the test thread that commits through it
         private boolean hasRefused;
 
+        DeviceFailingAfterOneStep(DurableFile.Step lastStepItTakes) {
+            this.lastStepItTakes = lastStepItTakes;
+        }
+
         @Override
         public void completed(DurableFile.Step step) {
-            if (step != DurableFile.Step.WRITTEN || hasRefused) {
+            if (step != lastStepItTakes || hasRefused) {
                 return;
             }
             hasRefused = true;
-            throw new ShrikeIOException("the device this test injected refused the write",
+            throw new ShrikeIOException("the device this test injected refused after " + step,
                     new IOException("no space left on device"));
         }
     }
