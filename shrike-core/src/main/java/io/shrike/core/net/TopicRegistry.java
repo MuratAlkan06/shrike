@@ -15,6 +15,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -426,5 +427,23 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
                 // Dropped on purpose: see above.
             }
         }
+    }
+
+    /**
+     * Every topic this broker holds open, as a snapshot.
+     *
+     * <p>Ordered by name for the same reason {@link #currentPartitionCounts()} is: two brokers holding
+     * the same topics should answer the same question the same way, and a {@link ConcurrentHashMap}
+     * promises no order at all. The snapshot is taken without the create lock, exactly as
+     * {@link #stopServing()} and {@link #close()} walk the map: a create that lands mid-walk shows up
+     * in this answer or in the next one, and a topic that appears is one whose partitions are already
+     * open, because a create publishes its {@link Topic} only after every log behind it is.
+     *
+     * @return the open topics, by name
+     */
+    List<Topic> topics() {
+        List<Topic> topics = new ArrayList<>(topicsByFoldedName.values());
+        topics.sort(Comparator.comparing(Topic::name));
+        return topics;
     }
 }
