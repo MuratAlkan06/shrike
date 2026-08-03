@@ -56,6 +56,8 @@ Writing the offset into the frame costs eight bytes and buys self-description: a
 
 ## `offset` counts records, `position` counts bytes — and the names never blur
 
+**Refined in Slice 2.** The in-memory `positionsByOffset` list is gone; a segment's sparse index is what maps an offset to a position now, and the mapping is rebuilt from the log rather than held for the life of the process. The law itself is unchanged, and the last sentence of this entry is why the swap cost nothing.
+
 **Decision.** `offset` is always a logical record number and `position` (always spelled `positionBytes` on a variable) is always a byte location in a file. `Log.append` returns an offset; the in-memory `positionsByOffset` maps one to the other; `RecordLocation` carries both plus topic, partition, and file, and every storage error quotes it.
 
 **Alternative rejected.** Letting a reader address records by byte position, which is what the file actually needs.
