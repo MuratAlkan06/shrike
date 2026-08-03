@@ -23,20 +23,25 @@ import java.util.zip.CRC32C;
  *   <li>{@code attributes} is reserved and written as 0. A reader ignores its bits so a later slice
  *       can spend them without invalidating today's files.
  * </ul>
+ *
+ * <p>The same frames travel over the network: a fetch response carries a byte range of a partition's
+ * log verbatim, so the consumer that reads them back parses this layout too. That is why the parse
+ * and the few constants a parser needs are public, and why the parse itself knows nothing about
+ * files.
  */
-final class RecordFrame {
+public final class RecordFrame {
 
-    static final int LENGTH_FIELD_BYTES = Integer.BYTES;
+    public static final int LENGTH_FIELD_BYTES = Integer.BYTES;
     static final int CRC_FIELD_BYTES = Integer.BYTES;
 
     /** The value of {@code keyLen} for a record appended without a key. */
-    static final int NULL_KEY_LENGTH = -1;
+    public static final int NULL_KEY_LENGTH = -1;
 
     static final byte MAGIC = 0;
     static final byte ATTRIBUTES = 0;
 
     /** The smallest legal {@code length}: crc, magic, attributes, offset, timestamp, and both lengths. */
-    static final int MINIMUM_LENGTH_BYTES = CRC_FIELD_BYTES + Byte.BYTES + Byte.BYTES + Long.BYTES + Long.BYTES
+    public static final int MINIMUM_LENGTH_BYTES = CRC_FIELD_BYTES + Byte.BYTES + Byte.BYTES + Long.BYTES + Long.BYTES
             + Integer.BYTES + Integer.BYTES;
 
     /** Where a frame's {@code offset} field starts, counted from the frame's first byte. */
@@ -56,11 +61,16 @@ final class RecordFrame {
      * The bytes a record occupies on disk, framing included. Computed in long arithmetic so that a
      * hostile pair of lengths cannot overflow into a small positive number and slip past a bound.
      *
+     * <p>Public because the broker weighs every record of a produce request against
+     * {@code max.record.bytes} before it appends any of them: a request whose fifth record is too
+     * large must be refused whole rather than half-stored, and that is a question about a frame's
+     * size that only this class can answer.
+     *
      * @param keyLength   the key's length in bytes, or {@link #NULL_KEY_LENGTH} for no key
      * @param valueLength the value's length in bytes
      * @return the total frame size in bytes
      */
-    static long frameBytes(int keyLength, int valueLength) {
+    public static long frameBytes(int keyLength, int valueLength) {
         long keyBytes = keyLength == NULL_KEY_LENGTH ? 0L : keyLength;
         return (long) LENGTH_FIELD_BYTES + MINIMUM_LENGTH_BYTES + keyBytes + valueLength;
     }
@@ -101,8 +111,8 @@ final class RecordFrame {
     }
 
     /**
-     * Reads one record out of the bytes that follow the length field, verifying the checksum before
-     * trusting any field and bounds-checking every length before allocating for it.
+     * Reads one record out of the bytes that follow the length field and checks that the frame stores
+     * the offset the caller went looking for.
      *
      * @param body     every byte after the length field, positioned at 0 and limited to {@code length}
      * @param location where these bytes came from, quoted in any error
@@ -110,30 +120,60 @@ final class RecordFrame {
      * @throws CorruptRecordException if the checksum fails or a field contradicts the frame
      */
     static StoredRecord decode(ByteBuffer body, RecordLocation location) {
+        StoredRecord record;
+        try {
+            record = decodeBody(body);
+        } catch (MalformedFrameException e) {
+            throw new CorruptRecordException(location, e.getMessage());
+        }
+
+        if (record.offset() != location.offset()) {
+            throw new CorruptRecordException(location, "the frame stores offset " + record.offset()
+                    + ", not the offset that was read");
+        }
+        return record;
+    }
+
+    /**
+     * Reads one record out of the bytes that follow the length field, verifying the checksum before
+     * trusting any field and bounds-checking every declared length before allocating for it.
+     *
+     * <p>The offset returned is the one the frame stores. A caller that went looking for a particular
+     * offset is the one that compares them, because a frame that arrived over a socket answers to no
+     * offset the reader chose.
+     *
+     * @param body every byte after the length field, positioned at 0 and limited to {@code length}
+     * @return the decoded record, carrying the offset and timestamp the frame stores
+     * @throws MalformedFrameException if the checksum fails, the magic is not this build's, or a
+     *                                 declared length contradicts the frame
+     */
+    public static StoredRecord decodeBody(ByteBuffer body) {
+        if (body.remaining() < MINIMUM_LENGTH_BYTES) {
+            throw new MalformedFrameException("a frame body of " + body.remaining() + " bytes cannot hold the "
+                    + MINIMUM_LENGTH_BYTES + " a header needs");
+        }
+
         int storedChecksum = body.getInt();
         CRC32C checksum = new CRC32C();
         checksum.update(body.duplicate());
         int computedChecksum = (int) checksum.getValue();
         if (storedChecksum != computedChecksum) {
-            throw new CorruptRecordException(location, "crc32c mismatch: the frame stores 0x%08x but its bytes hash to 0x%08x"
+            throw new MalformedFrameException("crc32c mismatch: the frame stores 0x%08x but its bytes hash to 0x%08x"
                     .formatted(storedChecksum, computedChecksum));
         }
 
         byte magic = body.get();
         if (magic != MAGIC) {
-            throw new CorruptRecordException(location, "unknown frame magic " + magic + ", this build writes " + MAGIC);
+            throw new MalformedFrameException("unknown frame magic " + magic + ", this build writes " + MAGIC);
         }
         body.get(); // attributes: reserved, so its bits are stepped over rather than judged.
 
         long storedOffset = body.getLong();
-        if (storedOffset != location.offset()) {
-            throw new CorruptRecordException(location, "the frame stores offset " + storedOffset + ", not the offset that was read");
-        }
         long timestampMillis = body.getLong();
 
         int keyLength = body.getInt();
         if (keyLength < NULL_KEY_LENGTH || keyLength > body.remaining() - Integer.BYTES) {
-            throw new CorruptRecordException(location, "key length " + keyLength + " does not fit the frame");
+            throw new MalformedFrameException("key length " + keyLength + " does not fit the frame");
         }
         byte[] key = null;
         if (keyLength != NULL_KEY_LENGTH) {
@@ -143,7 +183,7 @@ final class RecordFrame {
 
         int valueLength = body.getInt();
         if (valueLength != body.remaining()) {
-            throw new CorruptRecordException(location, "value length " + valueLength + " does not match the " + body.remaining()
+            throw new MalformedFrameException("value length " + valueLength + " does not match the " + body.remaining()
                     + " bytes left in the frame");
         }
         byte[] value = new byte[valueLength];

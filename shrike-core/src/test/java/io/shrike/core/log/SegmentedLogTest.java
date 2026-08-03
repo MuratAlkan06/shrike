@@ -255,7 +255,24 @@ class SegmentedLogTest {
         IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
                 () -> SegmentedLog.open(dataDirectory, topic, PARTITION, FIXED_CLOCK));
 
-        assertTrue(refusal.getMessage().contains("topic must match"), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("[A-Za-z0-9._-]"), refusal.getMessage());
+    }
+
+    /**
+     * The log applies the same name rule the protocol applies, because there is one rule. A second copy
+     * here used to allow 249 characters where {@link SafeName} allows 200, and a looser second copy is a
+     * name that passes the check the broker makes and then names a file the broker refused to name.
+     */
+    @Test
+    void refusesATopicNameLongerThanTheOneNameRuleAllows() {
+        String tooLong = "a".repeat(SafeName.MAX_LENGTH_CHARS + 1);
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> SegmentedLog.open(dataDirectory, tooLong, PARTITION, FIXED_CLOCK));
+
+        assertTrue(refusal.getMessage().contains(String.valueOf(SafeName.MAX_LENGTH_CHARS)), refusal.getMessage());
+        assertTrue(SafeName.isValid("a".repeat(SafeName.MAX_LENGTH_CHARS)),
+                "and the longest name the rule does allow is a name the log takes");
     }
 
     private Path logFileOf(String topic, int partition) {

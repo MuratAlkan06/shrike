@@ -45,6 +45,34 @@ public interface Log extends Closeable {
     StoredRecord read(long offset);
 
     /**
+     * Reads a range of the log back as the bytes it holds, without decoding them.
+     *
+     * <p>This is what a fetch response carries: whole record frames, back to back, copied verbatim
+     * out of the segment file. Nothing is re-serialized on the way, so what a consumer receives is
+     * what is on disk, byte for byte.
+     *
+     * <p>The range starts at {@code fetchOffset} and stops at the first of: {@code limitOffset},
+     * {@code maxBytes}, or the end of the segment {@code fetchOffset} falls in. A range that stops at
+     * a segment boundary is a short answer rather than an error — the caller fetches again from where
+     * it got to. One exception to {@code maxBytes}: when the very first frame is larger than it, that
+     * frame is returned anyway, because the alternative is a consumer that can never move past a
+     * record it is allowed to store.
+     *
+     * @param fetchOffset the logical record number to start at; {@link #nextOffset()} is legal and
+     *                    yields no bytes
+     * @param limitOffset the exclusive logical record number to stop before, clamped to
+     *                    {@link #nextOffset()} so no answer can cross the high-water mark
+     * @param maxBytes    the most bytes to return, subject to the whole-frame rule above
+     * @return the frames in that range, back to back, and never a partial one
+     * @throws IllegalArgumentException  if {@code maxBytes} is negative
+     * @throws OffsetOutOfRangeException if {@code fetchOffset} is below the first readable offset or
+     *                                   past {@link #nextOffset()}
+     * @throws CorruptRecordException    if a frame in the range contradicts what the log knows
+     * @throws ShrikeIOException         if the read fails
+     */
+    byte[] readRange(long fetchOffset, long limitOffset, int maxBytes);
+
+    /**
      * @return the offset the next append will take, which is also the exclusive upper bound of the
      *         readable offsets: the high-water mark
      */

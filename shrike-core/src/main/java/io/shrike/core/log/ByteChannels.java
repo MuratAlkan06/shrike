@@ -9,24 +9,27 @@ import java.nio.channels.WritableByteChannel;
  * Whole-buffer transfers over NIO channels.
  *
  * <p>A single {@code channel.write(buffer)} is allowed to write fewer bytes than the buffer holds,
- * which would leave half a record frame on disk. Every frame written by this package therefore goes
- * through {@link #writeFully}, and a bare {@code channel.write} of a frame is a bug.
+ * which would leave half a record frame on disk — or half a response frame on a socket. Every frame
+ * this broker writes therefore goes through {@link #writeFully}, and a bare {@code channel.write} of
+ * a frame is a bug. It is public for that reason and no other: there is one such loop in this
+ * codebase, so the network layer writes its response frames with the same one the log writes its
+ * records with, rather than a second copy that could be more forgiving.
  */
-final class ByteChannels {
+public final class ByteChannels {
 
     private ByteChannels() {
     }
 
     /**
      * Writes every remaining byte of {@code buffer}, looping until the buffer is drained. The
-     * channel is assumed to be blocking, which is what a file channel is; a non-blocking channel
-     * that keeps accepting nothing would spin here.
+     * channel is assumed to be blocking, which is what a file channel is and what the broker's
+     * sockets are; a non-blocking channel that keeps accepting nothing would spin here.
      *
      * @param channel destination channel
      * @param buffer  source buffer, drained to its limit
      * @throws IOException if the channel fails mid-write
      */
-    static void writeFully(WritableByteChannel channel, ByteBuffer buffer) throws IOException {
+    public static void writeFully(WritableByteChannel channel, ByteBuffer buffer) throws IOException {
         while (buffer.hasRemaining()) {
             channel.write(buffer);
         }

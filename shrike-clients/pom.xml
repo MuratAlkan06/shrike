@@ -21,5 +21,37 @@
       <artifactId>shrike-core</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <!-- The *IT classes start real brokers, producers, and consumers as separate operating-system
+           processes, so they run in the integration-test phase against the built artifacts rather
+           than beside the unit tests. Surefire ignores an *IT by default; verify is what fails the
+           build when one does. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>run-integration-tests</id>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+        <configuration>
+          <!-- Without this the forked JVM's java.class.path is a manifest-only jar, and the tests
+               launch child JVMs with the classpath they were given. -->
+          <useManifestOnlyJar>false</useManifestOnlyJar>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
 </project>
