@@ -204,10 +204,6 @@ final class OffsetIndex implements Closeable {
         return true;
     }
 
-    int entryCount() {
-        return entryCount;
-    }
-
     /**
      * @return the bytes this index occupies on disk
      */

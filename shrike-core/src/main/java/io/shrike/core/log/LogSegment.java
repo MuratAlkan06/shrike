@@ -198,10 +198,6 @@ final class LogSegment implements Closeable {
         return sizeBytes == 0L;
     }
 
-    boolean isSealed() {
-        return sealed;
-    }
-
     /**
      * @param frameBytes the size of a frame about to be appended
      * @return whether the frame fits without pushing the segment past {@code segment.bytes}
