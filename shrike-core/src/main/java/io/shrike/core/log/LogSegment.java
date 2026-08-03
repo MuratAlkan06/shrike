@@ -249,32 +249,15 @@ final class LogSegment implements Closeable {
         try {
             while (positionBytes < sizeBytes) {
                 RecordLocation location = new RecordLocation(topic, partition, offset, positionBytes, logFile);
-
-                ByteBuffer prefix = ByteBuffer.allocate(RecordFrame.PREFIX_BYTES);
-                ByteChannels.readFully(channel, prefix, positionBytes);
-                if (prefix.hasRemaining()) {
-                    throw new CorruptRecordException(location, "the segment ends inside a frame header");
+                FrameHeader header = headerAt(positionBytes, location);
+                if (header.storedOffset() == offset) {
+                    return decodeFrameAt(positionBytes, header.lengthBytes(), location);
                 }
-                prefix.flip();
-
-                // Range-check before allocating: the length is the one field no checksum can vouch
-                // for, so a corrupt or hostile value must be refused rather than believed and sized to.
-                int lengthBytes = prefix.getInt(0);
-                int largestLengthBytes = config.maxRecordBytes() - RecordFrame.LENGTH_FIELD_BYTES;
-                if (lengthBytes < RecordFrame.MINIMUM_LENGTH_BYTES || lengthBytes > largestLengthBytes) {
-                    throw new CorruptRecordException(location, "frame length " + lengthBytes + " is outside ["
-                            + RecordFrame.MINIMUM_LENGTH_BYTES + ", " + largestLengthBytes + "]");
-                }
-
-                long storedOffset = prefix.getLong(RecordFrame.OFFSET_FIELD_POSITION_BYTES);
-                if (storedOffset == offset) {
-                    return decodeFrameAt(positionBytes, lengthBytes, location);
-                }
-                if (storedOffset > offset) {
-                    throw new CorruptRecordException(location, "the frame here stores offset " + storedOffset
+                if (header.storedOffset() > offset) {
+                    throw new CorruptRecordException(location, "the frame here stores offset " + header.storedOffset()
                             + ", which is past the offset that was asked for");
                 }
-                positionBytes += RecordFrame.LENGTH_FIELD_BYTES + (long) lengthBytes;
+                positionBytes += header.frameBytes();
             }
         } catch (IOException e) {
             throw new ShrikeIOException("cannot read offset " + offset + " near position " + positionBytes + " of "
@@ -283,6 +266,81 @@ final class LogSegment implements Closeable {
 
         throw new CorruptRecordException(new RecordLocation(topic, partition, offset, positionBytes, logFile),
                 "the segment ends before this offset was found");
+    }
+
+    /**
+     * Reads whole frames out of this segment verbatim, from {@code fetchOffset} up to but not
+     * including {@code limitOffset}, at most {@code maxBytes} of them, and never past the end of this
+     * segment. The bytes are not decoded: this is the range a fetch response carries, so what leaves
+     * here is what is on disk.
+     *
+     * <p>{@code maxBytes} yields to the whole-frame rule twice over. A frame that would cross the cap
+     * is left for the next fetch, and a first frame that is larger than the cap all by itself is
+     * returned regardless — a consumer that asked for less than one record still has to be able to
+     * move past it.
+     *
+     * @param fetchOffset the offset to start at, which this segment is known to cover
+     * @param limitOffset the exclusive offset to stop before, already clamped to the high-water mark
+     * @param maxBytes    the most bytes to return, subject to the whole-frame rule
+     * @return the frames in that range, back to back
+     * @throws CorruptRecordException if a frame contradicts the offset the walk expects
+     * @throws ShrikeIOException      if the read fails
+     */
+    byte[] readRange(long fetchOffset, long limitOffset, int maxBytes) {
+        long positionBytes = index.floorPositionBytes(fetchOffset);
+        long startPositionBytes = -1L;
+        long endPositionBytes = -1L;
+        try {
+            while (positionBytes < sizeBytes) {
+                RecordLocation location = new RecordLocation(topic, partition, fetchOffset, positionBytes, logFile);
+                FrameHeader header = headerAt(positionBytes, location);
+
+                if (startPositionBytes < 0) {
+                    if (header.storedOffset() > fetchOffset) {
+                        throw new CorruptRecordException(location, "the frame here stores offset "
+                                + header.storedOffset() + ", which is past the offset that was asked for");
+                    }
+                    if (header.storedOffset() < fetchOffset) {
+                        positionBytes += header.frameBytes();
+                        continue;
+                    }
+                    startPositionBytes = positionBytes;
+                    endPositionBytes = positionBytes;
+                }
+
+                // The frames say where the range must stop, rather than a count kept alongside them:
+                // a frame at or past the limit is one the caller has not been promised yet.
+                if (header.storedOffset() >= limitOffset) {
+                    break;
+                }
+                long rangeBytes = endPositionBytes - startPositionBytes;
+                if (rangeBytes > 0 && rangeBytes + header.frameBytes() > maxBytes) {
+                    break;
+                }
+                positionBytes += header.frameBytes();
+                endPositionBytes = positionBytes;
+            }
+
+            if (startPositionBytes < 0) {
+                throw new CorruptRecordException(
+                        new RecordLocation(topic, partition, fetchOffset, positionBytes, logFile),
+                        "the segment ends before this offset was found");
+            }
+
+            int rangeBytes = (int) (endPositionBytes - startPositionBytes);
+            ByteBuffer records = ByteBuffer.allocate(rangeBytes);
+            ByteChannels.readFully(channel, records, startPositionBytes);
+            if (records.hasRemaining()) {
+                throw new CorruptRecordException(
+                        new RecordLocation(topic, partition, fetchOffset, startPositionBytes, logFile),
+                        "the segment holds " + records.position() + " of the " + rangeBytes
+                                + " bytes its frames declare");
+            }
+            return records.array();
+        } catch (IOException e) {
+            throw new ShrikeIOException("cannot read the range from offset " + fetchOffset + " near position "
+                    + positionBytes + " of " + logFile, e);
+        }
     }
 
     /**
@@ -320,6 +378,49 @@ final class LogSegment implements Closeable {
         } catch (IOException e) {
             throw new ShrikeIOException("cannot close segment " + logFile, e);
         }
+    }
+
+    /**
+     * What a frame's fixed prefix says about it: how long it is, and which offset it stores. That is
+     * everything a walk stepping over frames needs, and it is deliberately less than a decode.
+     *
+     * @param lengthBytes  the frame's {@code length} field, already range-checked
+     * @param storedOffset the offset the frame carries
+     */
+    private record FrameHeader(int lengthBytes, long storedOffset) {
+
+        /** @return the bytes the whole frame occupies, length field included */
+        long frameBytes() {
+            return RecordFrame.LENGTH_FIELD_BYTES + (long) lengthBytes;
+        }
+    }
+
+    /**
+     * Reads the prefix of the frame at {@code positionBytes} and range-checks its length before
+     * anything is sized to it: the length is the one field no checksum can vouch for, so a corrupt or
+     * hostile value is refused rather than believed.
+     *
+     * @param positionBytes where the frame starts
+     * @param location      what to quote if the bytes are not a frame header
+     * @return what the prefix says
+     * @throws CorruptRecordException if the segment ends inside the header or the length is impossible
+     * @throws IOException            if the read fails
+     */
+    private FrameHeader headerAt(long positionBytes, RecordLocation location) throws IOException {
+        ByteBuffer prefix = ByteBuffer.allocate(RecordFrame.PREFIX_BYTES);
+        ByteChannels.readFully(channel, prefix, positionBytes);
+        if (prefix.hasRemaining()) {
+            throw new CorruptRecordException(location, "the segment ends inside a frame header");
+        }
+        prefix.flip();
+
+        int lengthBytes = prefix.getInt(0);
+        int largestLengthBytes = config.maxRecordBytes() - RecordFrame.LENGTH_FIELD_BYTES;
+        if (lengthBytes < RecordFrame.MINIMUM_LENGTH_BYTES || lengthBytes > largestLengthBytes) {
+            throw new CorruptRecordException(location, "frame length " + lengthBytes + " is outside ["
+                    + RecordFrame.MINIMUM_LENGTH_BYTES + ", " + largestLengthBytes + "]");
+        }
+        return new FrameHeader(lengthBytes, prefix.getLong(RecordFrame.OFFSET_FIELD_POSITION_BYTES));
     }
 
     private StoredRecord decodeFrameAt(long positionBytes, int lengthBytes, RecordLocation location)

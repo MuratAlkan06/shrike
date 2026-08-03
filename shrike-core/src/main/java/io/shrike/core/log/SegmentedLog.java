@@ -48,6 +48,9 @@ public final class SegmentedLog implements Log, LogStatistics {
 
     private static final long FIRST_OFFSET = 0L;
 
+    /** Shared because it is empty and never handed out for writing. */
+    private static final byte[] NO_RECORDS = new byte[0];
+
     private final String topic;
     private final int partition;
     private final Path directory;
@@ -178,6 +181,29 @@ public final class SegmentedLog implements Log, LogStatistics {
             throw new OffsetOutOfRangeException(topic, partition, offset, logStartOffset(), nextOffset());
         }
         return segmentHolding(offset).read(offset);
+    }
+
+    @Override
+    public byte[] readRange(long fetchOffset, long limitOffset, int maxBytes) {
+        if (maxBytes < 0) {
+            throw new IllegalArgumentException("maxBytes must not be negative, but was " + maxBytes);
+        }
+        // A fetch at the high-water mark is a question with an empty answer rather than a bad offset:
+        // it is where a caught-up consumer sits. One past it is out of range like any other.
+        if (fetchOffset < logStartOffset() || fetchOffset > nextOffset()) {
+            throw new OffsetOutOfRangeException(topic, partition, fetchOffset, logStartOffset(), nextOffset());
+        }
+        if (fetchOffset == nextOffset()) {
+            return NO_RECORDS;
+        }
+
+        // Clamped here rather than trusted: the high-water mark is the only bound that keeps a
+        // consumer from reading a record the broker has not finished acknowledging.
+        long endOffset = Math.min(limitOffset, nextOffset());
+        if (fetchOffset >= endOffset) {
+            return NO_RECORDS;
+        }
+        return segmentHolding(fetchOffset).readRange(fetchOffset, endOffset, maxBytes);
     }
 
     @Override

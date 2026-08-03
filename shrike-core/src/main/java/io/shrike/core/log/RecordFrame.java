@@ -61,11 +61,16 @@ public final class RecordFrame {
      * The bytes a record occupies on disk, framing included. Computed in long arithmetic so that a
      * hostile pair of lengths cannot overflow into a small positive number and slip past a bound.
      *
+     * <p>Public because the broker weighs every record of a produce request against
+     * {@code max.record.bytes} before it appends any of them: a request whose fifth record is too
+     * large must be refused whole rather than half-stored, and that is a question about a frame's
+     * size that only this class can answer.
+     *
      * @param keyLength   the key's length in bytes, or {@link #NULL_KEY_LENGTH} for no key
      * @param valueLength the value's length in bytes
      * @return the total frame size in bytes
      */
-    static long frameBytes(int keyLength, int valueLength) {
+    public static long frameBytes(int keyLength, int valueLength) {
         long keyBytes = keyLength == NULL_KEY_LENGTH ? 0L : keyLength;
         return (long) LENGTH_FIELD_BYTES + MINIMUM_LENGTH_BYTES + keyBytes + valueLength;
     }
