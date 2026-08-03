@@ -2,7 +2,7 @@
 
 Shrike is a single-node, log-structured message broker written in Java 21. Producers append records to a segmented commit log on one machine's disk, consumers read them back by offset, and delivery is at-least-once: a record may be redelivered after a failure, and no record is silently dropped.
 
-Status: Slice 3 — a TCP broker with a length-guarded wire protocol, long-polling fetch, durable group offsets, and a blocking client library.
+Status: Slice 4 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets, plus a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed.
 
 ## Non-goals
 
