@@ -81,10 +81,50 @@ class LogConfigTest {
     }
 
     @Test
+    void defaultsToFlushingOnWhicheverOfOneHundredMillisecondsAndOneMebibyteComesFirst() {
+        LogConfig defaults = LogConfig.defaults();
+        LogConfig sizesAndRetentionOnly = new LogConfig(LogConfig.DEFAULT_MAX_RECORD_BYTES,
+                LogConfig.DEFAULT_SEGMENT_BYTES, LogConfig.DEFAULT_INDEX_INTERVAL_BYTES,
+                LogConfig.RETENTION_DISABLED, LogConfig.RETENTION_DISABLED);
+
+        assertEquals(FlushMode.INTERVAL, defaults.flushMode(), "an fsync per record is a cost a deployment chooses");
+        assertFalse(defaults.forcesEveryRecord());
+        assertEquals(100L, defaults.flushIntervalMs());
+        assertEquals(1024L * 1024L, defaults.flushIntervalBytes());
+        assertEquals(defaults, sizesAndRetentionOnly, "so a caller that names no flush policy gets this one");
+    }
+
+    @Test
+    void refusesAFlushIntervalOfZeroBecausePerRecordIsWhatThatWouldMean() {
+        IllegalArgumentException byTime = assertThrows(IllegalArgumentException.class,
+                () -> flushingEvery(0L, LogConfig.DEFAULT_FLUSH_INTERVAL_BYTES));
+        IllegalArgumentException byVolume = assertThrows(IllegalArgumentException.class,
+                () -> flushingEvery(LogConfig.DEFAULT_FLUSH_INTERVAL_MS, 0L));
+
+        assertTrue(byTime.getMessage().contains("PER_RECORD"), byTime.getMessage());
+        assertTrue(byVolume.getMessage().contains("PER_RECORD"), byVolume.getMessage());
+    }
+
+    @Test
+    void forcesEveryRecordOnlyWhenTheModeSaysSo() {
+        LogConfig perRecord = new LogConfig(LogConfig.DEFAULT_MAX_RECORD_BYTES, LogConfig.DEFAULT_SEGMENT_BYTES,
+                LogConfig.DEFAULT_INDEX_INTERVAL_BYTES, LogConfig.RETENTION_DISABLED, LogConfig.RETENTION_DISABLED,
+                FlushMode.PER_RECORD, LogConfig.DEFAULT_FLUSH_INTERVAL_MS, LogConfig.DEFAULT_FLUSH_INTERVAL_BYTES);
+
+        assertTrue(perRecord.forcesEveryRecord());
+    }
+
+    @Test
     void refusesAnIndexIntervalOfZeroBytes() {
         IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
                 () -> new LogConfig(LogConfig.DEFAULT_MAX_RECORD_BYTES, LogConfig.DEFAULT_SEGMENT_BYTES, 0));
 
         assertTrue(refusal.getMessage().contains("indexIntervalBytes"), refusal.getMessage());
+    }
+
+    private static LogConfig flushingEvery(long flushIntervalMs, long flushIntervalBytes) {
+        return new LogConfig(LogConfig.DEFAULT_MAX_RECORD_BYTES, LogConfig.DEFAULT_SEGMENT_BYTES,
+                LogConfig.DEFAULT_INDEX_INTERVAL_BYTES, LogConfig.RETENTION_DISABLED, LogConfig.RETENTION_DISABLED,
+                FlushMode.INTERVAL, flushIntervalMs, flushIntervalBytes);
     }
 }

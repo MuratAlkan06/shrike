@@ -446,6 +446,29 @@ final class LogSegment implements Closeable {
     }
 
     /**
+     * Forces this segment's log file to the device, metadata included, which is what the flush policy
+     * asks for: {@link FlushMode#PER_RECORD} after every append, {@link FlushMode#INTERVAL} once one of
+     * its two bounds is reached.
+     *
+     * <p>The index is deliberately not forced with it. An index is derived data, and the tail segment's
+     * index is rebuilt from its log at every start, so forcing it would be a second fsync per flush
+     * buying a file that recovery is going to rewrite anyway. {@link #seal()} does force it, because a
+     * sealed segment's index is only checked at startup and never rebuilt unless that check fails.
+     *
+     * <p>{@code force(true)} rather than {@code force(false)}: the file's new length is metadata, and
+     * bytes the device has without a length that reaches them are bytes the next open cannot find.
+     *
+     * @throws ShrikeIOException if the file cannot be forced
+     */
+    void force() {
+        try {
+            channel.force(true);
+        } catch (IOException e) {
+            throw new ShrikeIOException("cannot force segment " + logFile, e);
+        }
+    }
+
+    /**
      * Forces the log file, then the index file, and only then treats the pair as immutable. Called by
      * the roll that moves the writer to the next segment; calling it twice is harmless.
      *

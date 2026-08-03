@@ -130,6 +130,25 @@ public interface Log extends Closeable {
     int deleteRetiredSegments(long nowMillis);
 
     /**
+     * Forces the records this log has not yet put on the device, when the configured flush policy says
+     * the time bound has been reached.
+     *
+     * <p>This is the time half of {@code flush.mode}, and it is deliberately a synchronous method a
+     * caller invokes at a moment of its choosing rather than a schedule the log keeps for itself: the
+     * broker's {@code shrike-flush} thread is what asks, and a test asks by hand. The volume half —
+     * {@code flush.interval.bytes} — is decided by the append that crosses the bound, because that is
+     * the only moment at which the bound can be observed being crossed.
+     *
+     * <p>In {@link FlushMode#PER_RECORD} there is never anything unforced to find, so this does
+     * nothing.
+     *
+     * @param nowMillis the epoch millisecond the interval is measured against, from the caller's clock
+     * @return whether anything was forced
+     * @throws ShrikeIOException if the force fails
+     */
+    boolean flushIfDue(long nowMillis);
+
+    /**
      * Closes the log's file. Implementations state in their own documentation what closing means for
      * durability.
      *

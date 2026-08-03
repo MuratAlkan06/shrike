@@ -129,9 +129,17 @@ final class Partition implements Closeable {
      * <p>The frame sizes are all checked before the first append, so a request carrying one record too
      * large is refused whole rather than half-stored.
      *
-     * <p>Durability: the records are handed to the operating system and nothing is forced. That is the
-     * same promise {@code SegmentedLog.append} makes and the same one this broker makes today; a flush
-     * mode that can promise more is a later slice.
+     * <p>Durability depends on {@code flush.mode}, and this method is where it is decided, because the
+     * force happens inside the append and therefore before the answer this returns can be written.
+     * Under {@link io.shrike.core.log.FlushMode#PER_RECORD} a produce is acknowledged only after
+     * {@code force()}, so an acknowledged record survives an operating-system or power failure. Under
+     * {@link io.shrike.core.log.FlushMode#INTERVAL}, the default, acknowledged records survive a
+     * process crash (they are in the page cache), but up to one flush interval of acknowledged records
+     * can be lost on an operating-system or power failure, after which recovery truncates the torn
+     * tail.
+     *
+     * <p>That is a separate question from delivery, which is at-least-once in either mode: a flush mode
+     * says what a failure of the machine may cost, not what a failure of a consumer may cost.
      *
      * @param records the records to append, at least one
      * @return the offset the first record was appended at; the rest follow it in order
@@ -309,6 +317,32 @@ final class Partition implements Closeable {
         lock.lock();
         try {
             return log.deleteRetiredSegments(nowMillis);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Forces this partition's unforced records when {@code flush.interval.ms} says it is time, under
+     * the same lock a produce and a fetch hold.
+     *
+     * <p>Taking the lock is the deliberate part. What decides whether a flush is due — how many bytes
+     * are unforced, when the interval was last measured from, which segment is active — is the log's
+     * own state, and this lock is the only guard it has; forcing outside it would mean a second answer
+     * to who may touch that state, and a second proof that {@link #close()} cannot close the channel
+     * underneath {@code shrike-flush}. What it costs is that an fsync serializes with the appends and
+     * the reads of this one partition, which is what a single-writer log already asks of every caller.
+     * It does not delay a waiting fetch: {@link Condition#await(long, TimeUnit)} releases this lock, so
+     * a long poll holds nothing while it waits.
+     *
+     * @param nowMillis the epoch millisecond the interval is measured against
+     * @return whether anything was forced
+     * @throws io.shrike.core.log.ShrikeIOException if the force fails
+     */
+    boolean flushIfDue(long nowMillis) {
+        lock.lock();
+        try {
+            return log.flushIfDue(nowMillis);
         } finally {
             lock.unlock();
         }

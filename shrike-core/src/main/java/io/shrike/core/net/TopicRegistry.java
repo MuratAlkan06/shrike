@@ -2,6 +2,7 @@ package io.shrike.core.net;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import io.shrike.core.flush.LogFlush;
 import io.shrike.core.log.DurableFile;
 import io.shrike.core.log.SafeName;
 import io.shrike.core.log.ShrikeIOException;
@@ -56,7 +57,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link BrokerConfig#maxTotalPartitions()}, counted across every topic, because each one costs a
  * directory and two open file handles for as long as the broker runs.
  */
-final class TopicRegistry implements Closeable, SegmentDeletion {
+final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
 
     /** The file listing every topic, directly under the data directory. */
     static final String FILE_NAME = "topics";
@@ -208,6 +209,32 @@ final class TopicRegistry implements Closeable, SegmentDeletion {
                     LOGGER.log(System.Logger.Level.WARNING, "retention could not trim topic=" + topic.name()
                             + " partition=" + partition.partition() + ", so it was left as it is and the next"
                             + " sweep will try again", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * Forces the records every partition has not put on the device yet, where the flush interval says
+     * it is time. This is what one pass of {@code shrike-flush} does, and it is the only thing that
+     * package knows about this one.
+     *
+     * <p>A partition that cannot be forced is a WARN and the pass goes on to the next one, for the same
+     * reason a partition that cannot be trimmed is: one failing partition must not leave every other
+     * one unforced, and the next pass tries again a flush interval later.
+     *
+     * @param nowMillis the epoch millisecond the flush interval is measured against
+     */
+    @Override
+    public void flushIfDue(long nowMillis) {
+        for (Topic topic : topicsByFoldedName.values()) {
+            for (Partition partition : topic.partitions()) {
+                try {
+                    partition.flushIfDue(nowMillis);
+                } catch (ShrikeIOException e) {
+                    LOGGER.log(System.Logger.Level.WARNING, "the flush interval could not force topic="
+                            + topic.name() + " partition=" + partition.partition() + ", so its records are still"
+                            + " only with the operating system and the next pass will try again", e);
                 }
             }
         }
