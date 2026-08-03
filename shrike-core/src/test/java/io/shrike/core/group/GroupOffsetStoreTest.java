@@ -331,6 +331,38 @@ class GroupOffsetStoreTest {
     }
 
     /**
+     * A group is created in memory before its file is written, and a write that never reaches the device
+     * has to take that creation back with it. A group with no file behind it answers nothing, is loaded
+     * by no restart, and would still hold a place under the budget for the life of the process — and who
+     * can cause one is what makes it a defect rather than an untidiness: a write fails when the disk is
+     * full, retention is off by default, and anything that can make writes fail could then take every
+     * place in the budget with commits that stored nothing.
+     *
+     * <p>The failure is injected through the same seam that proves a commit is durable before it returns:
+     * the durable steps report themselves as they run, and this device refuses the first one.
+     */
+    @Test
+    void forgetsAGroupWhoseCreatingCommitNeverBecameDurableAndKeepsItsBudgetSlot() {
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, TWO_GROUPS, new DeviceRefusingItsFirstWrite());
+
+        assertThrows(ShrikeIOException.class, () -> store.commit(GROUP, TOPIC, 0, 5L));
+
+        assertEquals(List.of(), store.committedOffsets(GROUP),
+                "a commit that was never acknowledged did not create a group this store holds");
+        assertEquals(OptionalLong.empty(), store.committedOffset(GROUP, TOPIC, 0));
+        assertFalse(Files.exists(dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME)
+                        .resolve(GROUP + GroupOffsetStore.FILE_SUFFIX)),
+                "and there is no file behind it, because the write it failed at is what would have made one");
+        store.commit(OTHER_GROUP, TOPIC, 0, 3L);
+        store.commit(THIRD_GROUP, TOPIC, 0, 1L);
+        assertEquals(OptionalLong.of(3L), store.committedOffset(OTHER_GROUP, TOPIC, 0),
+                "both places under a budget of two were still free, so the failed commit burned neither");
+        assertEquals(OptionalLong.of(1L), store.committedOffset(THIRD_GROUP, TOPIC, 0));
+        assertEquals(List.of(), GroupOffsetStore.open(dataDirectory, TWO_GROUPS).committedOffsets(GROUP),
+                "and a store reopened over that directory has never heard of the group either");
+    }
+
+    /**
      * @param groups the groups directory
      * @param group  the group whose file to write, under the name this build stores it under
      * @param offset the next offset to read that file records for partition 0 of {@link #TOPIC}
@@ -350,6 +382,28 @@ class GroupOffsetStoreTest {
     private static List<String> fileNamesIn(Path directory) throws IOException {
         try (Stream<Path> entries = Files.list(directory)) {
             return entries.map(entry -> entry.getFileName().toString()).sorted().toList();
+        }
+    }
+
+    /**
+     * A device that refuses the first write it is told about and takes every one after it, which is the
+     * nearest a test can stand to a disk that has filled up. {@link DurableFile} reports each step as it
+     * finishes, so a step that throws is a step that did not happen as far as the store above it is
+     * concerned.
+     */
+    private static final class DeviceRefusingItsFirstWrite implements DurableFile.StepObserver {
+
+        // confined to: the test thread that commits through it
+        private boolean hasRefused;
+
+        @Override
+        public void completed(DurableFile.Step step) {
+            if (step != DurableFile.Step.WRITTEN || hasRefused) {
+                return;
+            }
+            hasRefused = true;
+            throw new ShrikeIOException("the device this test injected refused the write",
+                    new IOException("no space left on device"));
         }
     }
 }

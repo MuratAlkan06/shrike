@@ -63,9 +63,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * trust — so it fails the open, naming both files and the repair.
  *
  * <p><strong>How many groups there may be is budgeted.</strong> A commit naming a group this store does
- * not hold creates one, and nothing ever removes it, so the budget the store is opened with is what
- * keeps anything that can send a commit from filling this directory: a commit that would create a group
- * past it raises {@link TooManyGroupsException} instead, before anything is written. A commit for a
+ * not hold creates one, and nothing removes it once it is on the device, so the budget the store is
+ * opened with is what keeps anything that can send a commit from filling this directory: a commit that
+ * would create a group past it raises {@link TooManyGroupsException} instead, before anything is
+ * written. A commit that creates a group and then fails to make it durable removes it again, so what
+ * holds a place under the budget is a group with a file behind it and never a failure. A commit for a
  * group that is already here is never refused by the budget, including a group loaded from a directory
  * that already held more of them than the budget allows — that is a start, not a request, and it opens
  * with a WARN and every group it found.
@@ -170,7 +172,10 @@ public final class GroupOffsetStore {
      * @throws TooManyGroupsException   if this commit would create a group and the broker already holds
      *                                  all the groups it may. A group that is already here is never
      *                                  refused for it, and nothing is written when one is
-     * @throws ShrikeIOException        if the commit cannot be made durable
+     * @throws ShrikeIOException        if the commit cannot be made durable, in which case this store
+     *                                  holds what it held before the call: the offset goes back to what
+     *                                  it was, and a commit that had just created the group un-creates
+     *                                  it, so a failure never takes a place under the budget
      */
     public void commit(String groupId, String topic, int partition, long offset) {
         SafeName.require(groupId, "groupId");
@@ -184,11 +189,14 @@ public final class GroupOffsetStore {
         lock.lock();
         try {
             Map<TopicPartition, Long> offsets = offsetsByGroup.get(group);
-            if (offsets == null) {
+            boolean creatingTheGroup = offsets == null;
+            if (creatingTheGroup) {
                 // Asked and answered under the one lock every commit holds, which is what makes the
                 // budget exact: a group is created here and nowhere else, so two commits arriving at
                 // once cannot both find the last place free. Nothing has been written or changed yet
-                // when this throws, so a refused commit leaves the store exactly as it found it.
+                // when this throws, so a refused commit leaves the store exactly as it found it — and
+                // so does a commit that gets past here and then fails, which the rollback below undoes
+                // down to the group itself.
                 if (offsetsByGroup.size() >= maxTotalGroups) {
                     throw new TooManyGroupsException(group, offsetsByGroup.size(), maxTotalGroups);
                 }
@@ -201,7 +209,16 @@ public final class GroupOffsetStore {
             } catch (RuntimeException e) {
                 // The file is what this store is; memory that disagrees with it would answer the next
                 // read with an offset no restart could produce.
-                restore(offsets, key, previousOffset);
+                if (creatingTheGroup) {
+                    // A group whose first commit never reached the device is a group with no file
+                    // behind it, and leaving the entry would hold a place under the budget for the
+                    // life of the process. Anything that can make a write fail — a full disk is
+                    // enough — could take every place that way, one failed commit at a time, so this
+                    // undoes the creation as well as the offset.
+                    offsetsByGroup.remove(group);
+                } else {
+                    restore(offsets, key, previousOffset);
+                }
                 throw e;
             }
         } finally {
