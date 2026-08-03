@@ -2,7 +2,7 @@
 
 Shrike is a single-node, log-structured message broker written in Java 21. Producers append records to a segmented commit log on one machine's disk, consumers read them back by offset, and delivery is at-least-once: a record may be redelivered after a failure, and no record is silently dropped.
 
-Status: Slice 4 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets, plus a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed.
+Status: Slice 5 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets, plus a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed. This slice added retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, a `flush.mode` that is either per-record or interval, and JMH benchmarks of what the last two cost on one machine.
 
 ## Non-goals
 
@@ -99,6 +99,46 @@ A deletion is announced rather than silent. It is asked for by configuration, it
 
 This is a different thing from the delivery semantics above, and neither weakens the other. At-least-once is about what a failure may do to a record — redeliver it, never silently drop it. Retention is about what an operator has asked the broker to stop storing after a stated age or size, which is neither a failure nor silent. With retention off, which is the default, the two never meet at all.
 
+## Benchmarks
+
+Two things this slice added are worth a number rather than an adjective: what `flush.mode` costs an append, and what sending a fetch's records out of the segment file costs against reading them into memory first. Both are JMH benchmarks under `shrike-core/src/test/java/io/shrike/core/bench/`, they are compiled by every build and run by none of it, and one command runs them:
+
+```
+mvn -pl shrike-core -P bench test-compile exec:exec
+```
+
+**Everything below is a measurement of one machine at one commit.** The harness is commit `b5a3614`, the machine is an Apple M4 Pro with 14 cores and 48 GiB of memory running macOS 15.6.1, and the JVM is the one the toolchain selects:
+
+```
+openjdk version "21.0.7" 2025-04-15 LTS
+OpenJDK Runtime Environment Temurin-21.0.7+6 (build 21.0.7+6-LTS)
+OpenJDK 64-Bit Server VM Temurin-21.0.7+6 (build 21.0.7+6-LTS, mixed mode, sharing)
+```
+
+Every benchmark ran on one thread, in 2 forks of 3 one-second warmup iterations and 5 one-second measurement iterations, with no JVM arguments of its own. The suite takes about a minute and a half. The raw JMH output is committed exactly as it was written, and it is what the rows below are read from: [`docs/bench/slice-5-flush-and-fetch.json`](docs/bench/slice-5-flush-and-fetch.json).
+
+**What a flush mode costs an append.** One `SegmentedLog.append` of a 162-byte frame — a 128-byte value and no key — on a log opened with the defaults apart from the mode. The ± is JMH's own 99.9% confidence interval over the ten measured iterations.
+
+| `flush.mode` | Appends per second | p50, closed-loop service time | p99, closed-loop service time | Samples |
+|---|---|---|---|---|
+| `per-record` | 247.5 ± 1.4 | 4.00 ms | 11.99 ms | 2 406 |
+| `interval`, 100 ms / 1 MiB | 495 333 ± 165 128 | 0.96 µs | 7.66 µs | 297 453 |
+
+**Both percentile columns are closed-loop service time, and that phrase is load-bearing.** The harness issues the next append only once the previous one has returned, so nothing ever queues behind anything: these are the times the log took, not the times a client would have waited under an arrival rate the broker does not control. A percentile measured this way understates latency under open load, which is why it is written into the column heading rather than left to be assumed.
+
+The confidence interval on the second row is wide, and that is the measurement rather than noise around it: in that mode the append that crosses `flush.interval.bytes` forces where it stands, and a roll forces and seals a whole 128 MiB segment, so a run that is mostly page-cache writes has rare long appends in it. They are in the same run's tail: p99.9 is 33 µs, p99.99 is 5.3 ms, and the slowest of 297 453 samples was 87 ms.
+
+**What serving a fetch out of the file costs.** One fetch of the same 1 MiB range — 991 frames, 1 048 478 bytes — of the same pre-built log, sent into a connected pair of loopback `SocketChannel`s with a thread reading the other end and discarding it. The two rows are the two calls `fetch.zero.copy` selects between and nothing else.
+
+| Path | Fetches per second | Bytes per second |
+|---|---|---|
+| `FileChannel.transferTo` out of the segment file | 2 530.8 ± 75.6 | 2 530 MiB/s |
+| read into a buffer, then one `writeFully` | 2 253.0 ± 71.7 | 2 253 MiB/s |
+
+Both rows include loopback TCP and the thread draining it. That is deliberate: a transfer differs from a read-then-write only when the destination is a socket, so a sink that was not one would have compared the buffered path with itself. Neither row is a measurement of a disk, of a network, or of any machine other than this one.
+
+**A footnote about what `per-record` was measured under, and it is not a small one.** On macOS, `FileChannel.force()` issues `fsync(2)` rather than `fcntl(F_FULLFSYNC)` (JDK-8080589), so it does not push the drive's cache out to the media. The `per-record` numbers above are therefore weaker-durability numbers than the same benchmark on Linux would produce, and they are measurements of this machine rather than claims about what any other machine does.
+
 ## Claims
 
 A claim may only be added in the same commit as the test that proves it. CI checks that every Evidence cell below points at something that exists.
@@ -187,3 +227,6 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A torn tail written under interval mode, with nothing forced, is truncated to the last whole record at startup, and the recovered log takes the offset after it | `SegmentedLogFlushTest#truncatesATornTailWrittenUnderTheIntervalFlushMode` | 5 |
 | The flush interval runs on a thread named shrike-flush, repeatedly, and closing it ends that thread | `FlushSweepTest#flushesOnItsOwnNamedThreadUntilItIsClosed` | 5 |
 | A log opened without naming a flush policy forces on whichever of 100 milliseconds and 1 MiB comes first | `LogConfigTest#defaultsToFlushingOnWhicheverOfOneHundredMillisecondsAndOneMebibyteComesFirst` | 5 |
+| On the machine, the JVM, and the harness commit named under Benchmarks, appending a 162-byte frame measured 247.5 ± 1.4 appends a second under `flush.mode=per-record` and 495 333 ± 165 128 under `interval` | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
+| On that same machine, commit, and JVM, the closed-loop p99 service time of one append measured 11.99 ms under `per-record` over 2 406 samples and 7.66 µs under `interval` over 297 453 | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
+| On that same machine, commit, and JVM, serving one 1 MiB range into a loopback socket measured 2 530.8 ± 75.6 fetches a second through `FileChannel.transferTo` and 2 253.0 ± 71.7 through a buffered read | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
