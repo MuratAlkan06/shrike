@@ -56,6 +56,8 @@ Writing the offset into the frame costs eight bytes and buys self-description: a
 
 ## `offset` counts records, `position` counts bytes — and the names never blur
 
+**Refined in Slice 2.** The in-memory `positionsByOffset` list is gone; a segment's sparse index is what maps an offset to a position now, and the mapping is rebuilt from the log rather than held for the life of the process. The law itself is unchanged, and the last sentence of this entry is why the swap cost nothing.
+
 **Decision.** `offset` is always a logical record number and `position` (always spelled `positionBytes` on a variable) is always a byte location in a file. `Log.append` returns an offset; the in-memory `positionsByOffset` maps one to the other; `RecordLocation` carries both plus topic, partition, and file, and every storage error quotes it.
 
 **Alternative rejected.** Letting a reader address records by byte position, which is what the file actually needs.
@@ -72,6 +74,8 @@ Writing the offset into the frame costs eight bytes and buys self-description: a
 
 ## The log refuses to reopen a file it did not create
 
+**Superseded by Slice 2.** Recovery arrived, so reopening no longer refuses: see "Reopening a log recovers it, because Slice 2 can read a file it did not write". The entry is kept because the reasoning it records is why recovery had to exist before reopening was allowed.
+
 **Decision.** `SingleFileLog.open` creates the log file with `CREATE_NEW`. An existing file fails the open with a `ShrikeIOException` that says a recovery scan is a later slice. The offset-to-position map is held in memory only.
 
 **Alternative rejected.** Opening an existing file and appending to the end of it.
@@ -80,8 +84,50 @@ Writing the offset into the frame costs eight bytes and buys self-description: a
 
 ## Durability in this slice: appends reach the operating system, `close` forces the file
 
+**Refined in Slice 2.** Sealing a segment forces it, so a log now has two force points rather than one: the roll that seals a segment, and `close()` for the segment still taking records. What an `append` promises has not changed — see "Segments roll on size, and a segment is sealed only after it is forced".
+
 **Decision.** `append` writes the frame through `writeFully` and returns once the operating system has the bytes. Nothing is forced to the device until `close()`, which calls `force(true)` before closing the channel. The README claims ordering and integrity, not survival of a power cut.
 
 **Alternative rejected.** Forcing on every append, which would let the log claim durability today.
 
 **Why.** An fsync per record is a policy decision with a large cost, and the policy — per record, per interval, or never — is a configured flush mode in a later slice. Choosing one now would either pick the slow default for everyone or leave the claim vague. Forcing at `close()` is the one point where the cost is paid once and the promise is exact, so it is the only durability sentence this slice makes.
+
+## Segments roll on size, and a segment is sealed only after it is forced
+
+**Decision.** A partition is a sequence of segment files named after the offset of their first record: `00000000000000000000.log` beside `00000000000000000000.index`, then whatever base offset comes next. Appending to a **non-empty** active segment rolls it when the record would push it *past* `segment.bytes`; a record that fills the segment to the byte does not roll it, and the record that would have overflowed becomes the first record of a new segment whose base offset is that record's own offset. An empty active segment accepts any record `max.record.bytes` allows, even a frame larger than `segment.bytes`, because a record no segment would take could never be stored at all. Rolling seals the segment it leaves behind, in this order: force the log file, force the index file, and only then treat the pair as immutable.
+
+**Alternative rejected.** Rolling when a segment *reaches* `segment.bytes` and marking segments sealed without forcing them, leaving the fsync to the operating system's own schedule.
+
+**Why.** The order of those three steps is the whole point, and it buys the recovery algorithm. Because a sealed segment was on the device before the writer moved on, a crash can only tear the segment that was being written, so startup reads one file frame by frame instead of all of them — a partition with a thousand segments costs the same to recover as a partition with one. Sealing without forcing would make that reasoning false: any segment could then hold a half-written frame, and honest recovery would have to walk every byte the broker had ever stored. Rolling on "would exceed" rather than "would reach" keeps `segment.bytes` a bound the files respect rather than one they cross by a frame, and the empty-segment exception is what keeps the bound from turning into a record the log refuses to store.
+
+## The offset index is derived data, so nothing trusts it
+
+**Decision.** Each segment carries a sparse index of fixed 8-byte big-endian entries, `relativeOffset:int32 | position:int32`, holding one entry per `index.interval.bytes` of appended records. Offsets are stored relative to the segment's base offset and positions as int32, which the 1 GiB cap on `segment.bytes` and `max.record.bytes` keeps safe. A lookup finds the segment whose base offset is the greatest one at or below the target, binary-searches that segment's entries for the greatest relative offset at or below it, and walks frames from there comparing each frame's stored offset with the one asked for — a walk bounded by the index interval. An index that is missing, whose size is not a whole number of entries, or whose entries do not climb or point inside the log is emptied and rebuilt by scanning the log. The rule that decides which record earns an entry is one method, `indexIfDue`, called both by `append` and by the scan that rebuilds, so it reads nothing but the bytes of the log.
+
+**Alternative rejected.** A dense index — one entry per record, which is what Slice 1's in-memory `positionsByOffset` list was — and treating a damaged index as a reason to fail startup.
+
+**Why.** A dense index costs 8 bytes of memory or disk per record forever and buys a lookup that is already cheap: with a 4 KiB interval, the walk after a binary search reads at most a few kilobytes. More importantly, an index restates what the log already says, so making it authoritative would create a second copy of the truth that can disagree with the first. Deriving it means a corrupt index is an inconvenience rather than data loss, and it means the code has one honest answer to "what if the index is wrong": delete it and read the log. Because the entry rule lives in exactly one method, an index grown record by record and an index rebuilt in one pass are the same file, which is what lets recovery rewrite an index without changing anything a reader can see. An index with no entries at all still yields correct reads — a lookup that finds no entry starts at the first byte of the segment — which is the strongest way to say the index is not load-bearing.
+
+## Recovery walks the tail segment, cuts off what is torn, and logs where
+
+**Decision.** Opening a partition directory sorts its segments by base offset. Every segment but the last is sealed, so it gets a cheap check of its index only — the file exists, its size is a whole number of entries, no entry points past the end of the log — and is rebuilt only when that fails; its log file is not read. The last segment is walked frame by frame from its first byte, applying the checks a read applies: the length field must be in range, the CRC32C must match, the magic must be this build's, and the frame's own offset must be the one the walk expects. The first frame that fails, or that the file ends inside, ends the log: the channel is truncated to the byte after the last whole frame, the tail's index is rebuilt from the same walk, a WARN names the topic, partition, byte position, and file, and the next offset becomes the base offset plus the number of frames that survived. A zero-byte tail segment is a valid empty segment; fewer than four trailing bytes cannot even hold a length field, so they are cut off; a run of trailing zeros fails the length range check and is cut off too. Damage inside a sealed segment is not repaired: startup does not look, the damaged record fails with a `CorruptRecordException` when it is read, and the records before and after it still read.
+
+**Alternative rejected.** Walking every segment at startup, and refusing to start when the tail is torn so that a human decides what to do.
+
+**Why.** Walking every segment would make startup cost grow with everything ever stored, and it would be redundant work: the sealing order already proves the earlier segments are whole. Refusing to start is the option that sounds safe and is not — a broker that will not come up after a power cut is down, and the torn tail is by definition made of records no producer was ever told about, so cutting them off loses nothing that was acknowledged. The WARN with the byte position is what keeps that honest: the truncation is a fact in the log file, not a silent repair. Recovery is idempotent because the walk depends only on the bytes on disk: a second restart with no writes in between truncates nothing, writes the same index entries, and leaves every file the size it already was, which is asserted rather than assumed. Leaving sealed damage in place is the same honesty in the other direction: the broker reports the record it cannot vouch for instead of quietly deleting the healthy records that follow it.
+
+## Reopening a log recovers it, because Slice 2 can read a file it did not write
+
+**Decision.** `SegmentedLog.open` creates a partition directory and its first segment when there is nothing there, and recovers what is there when there is. This replaces Slice 1's refusal to reopen an existing log file. The in-memory offset-to-position map is gone: a reopened log finds its records through the segment index instead.
+
+**Alternative rejected.** Keeping the refusal for existing files and adding a separate explicit "recover this directory" entry point that a caller has to remember to call first.
+
+**Why.** Slice 1 refused because appending after a record it had never checked would have meant trusting a file it had not read, and it said so in the exception. That reason is now satisfied rather than argued with: opening reads the tail and proves its last frame before it appends a byte after it. A separate recovery step would leave two ways to open a log, one of them wrong, and the wrong one would be the shorter one to type. Recovery is not an operation on a log — it is what opening one means. Dropping the in-memory map is what makes the size of a partition a disk question rather than a heap question, which is the same reason the index exists.
+
+## The log's sizes live in one record next to the log
+
+**Decision.** `LogConfig` is a record of `maxRecordBytes`, `segmentBytes`, and `indexIntervalBytes`, validated in its compact constructor, with a `defaults()` factory holding 1 MiB, 128 MiB, and 4 KiB. `segmentBytes` and `maxRecordBytes` are both capped at 1 GiB. It lives in `io.shrike.core.log` beside the log it configures, and it holds no flush or retention setting, because neither behavior exists yet.
+
+**Alternative rejected.** Putting it in `io.shrike.core.config` as the start of a broker-wide configuration type, and keeping `open(...)` overloads that take one `int` per setting.
+
+**Why.** Three `int` parameters in an `open` call are three chances to swap two numbers that the compiler cannot tell apart; a record names them at the call site and validates them once, so a log that holds a config holds one that already makes sense. Validation belongs there rather than in `open` because the smallest legal `maxRecordBytes` is a fact about the frame layout, and keeping the check in the log package is what lets `RecordFrame` stay package-private instead of publishing frame constants to satisfy a config type in another package. The 1 GiB cap is not a taste preference: an index entry stores a byte position in an int32, and the cap is what makes that field safe by construction rather than by hope. Settings for behavior that does not exist are left out, because a knob with no code behind it is a promise the README cannot make.

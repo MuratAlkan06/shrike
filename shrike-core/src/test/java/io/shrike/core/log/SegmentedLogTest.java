@@ -20,7 +20,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-class SingleFileLogTest {
+class SegmentedLogTest {
 
     private static final String TOPIC = "orders";
     private static final int PARTITION = 0;
@@ -50,7 +50,7 @@ class SingleFileLogTest {
     void roundTripsARecordWithNullKeyEmptyKeyOrEmptyValue(String shape, byte[] key, byte[] value) {
         ProducedRecord record = new ProducedRecord(key, value);
 
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             long offset = log.append(record);
             StoredRecord stored = log.read(offset);
 
@@ -66,19 +66,21 @@ class SingleFileLogTest {
     void writesTheLogFileUnderTopicAndPartitionInsideTheInjectedDataDirectory() {
         int otherThanPartitionZero = 3;
 
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, otherThanPartitionZero, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, otherThanPartitionZero, FIXED_CLOCK)) {
             log.append(new ProducedRecord(null, "payload".getBytes(UTF_8)));
 
             assertEquals(TOPIC, log.topic());
             assertEquals(otherThanPartitionZero, log.partition());
             assertTrue(Files.isRegularFile(logFileOf(TOPIC, otherThanPartitionZero)),
                     "the log file must be <dataDir>/<topic>-<partition>/00000000000000000000.log");
+            assertTrue(Files.isRegularFile(indexFileOf(TOPIC, otherThanPartitionZero)),
+                    "each segment's index sits beside its log under the same base offset");
         }
     }
 
     @Test
     void assignsSequentialOffsetsStartingAtZero() {
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             long first = log.append(new ProducedRecord(null, "first".getBytes(UTF_8)));
             long second = log.append(new ProducedRecord(null, "second".getBytes(UTF_8)));
             long third = log.append(new ProducedRecord(null, "third".getBytes(UTF_8)));
@@ -92,7 +94,7 @@ class SingleFileLogTest {
 
     @Test
     void readsBackTheFirstAndTheLastRecordOfTheLog() {
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             log.append(new ProducedRecord(null, "first".getBytes(UTF_8)));
             log.append(new ProducedRecord(null, "middle".getBytes(UTF_8)));
             long lastOffset = log.append(new ProducedRecord(null, "last".getBytes(UTF_8)));
@@ -105,7 +107,7 @@ class SingleFileLogTest {
     @ParameterizedTest
     @ValueSource(longs = {Long.MIN_VALUE, -1L, 3L, 4L, Long.MAX_VALUE})
     void refusesReadsOutsideTheReadableOffsetRange(long unreadableOffset) {
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             log.append(new ProducedRecord(null, "first".getBytes(UTF_8)));
             log.append(new ProducedRecord(null, "second".getBytes(UTF_8)));
             log.append(new ProducedRecord(null, "third".getBytes(UTF_8)));
@@ -122,7 +124,7 @@ class SingleFileLogTest {
 
     @Test
     void refusesEveryReadFromAnEmptyLog() {
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             OffsetOutOfRangeException refusal = assertThrows(OffsetOutOfRangeException.class, () -> log.read(0L));
 
             assertEquals(0L, log.nextOffset());
@@ -136,7 +138,7 @@ class SingleFileLogTest {
         AtomicLong tickMillis = new AtomicLong();
         TimeSource tickingClock = () -> tickMillis.addAndGet(1_000L);
 
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, tickingClock)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, tickingClock)) {
             log.append(new ProducedRecord(null, "first".getBytes(UTF_8)));
             log.append(new ProducedRecord(null, "second".getBytes(UTF_8)));
 
@@ -147,28 +149,28 @@ class SingleFileLogTest {
 
     @Test
     void storesARecordThatFillsMaxRecordBytesExactly() throws IOException {
-        byte[] value = new byte[SingleFileLog.DEFAULT_MAX_RECORD_BYTES - FRAMING_BYTES_WITHOUT_KEY];
+        byte[] value = new byte[LogConfig.DEFAULT_MAX_RECORD_BYTES - FRAMING_BYTES_WITHOUT_KEY];
         value[value.length - 1] = 'z';
 
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             long offset = log.append(new ProducedRecord(null, value));
 
             assertArrayEquals(value, log.read(offset).value());
-            assertEquals(SingleFileLog.DEFAULT_MAX_RECORD_BYTES, Files.size(logFileOf(TOPIC, PARTITION)),
+            assertEquals(LogConfig.DEFAULT_MAX_RECORD_BYTES, Files.size(logFileOf(TOPIC, PARTITION)),
                     "a record of exactly max.record.bytes fills the file to exactly that many bytes");
         }
     }
 
     @Test
     void refusesARecordOneByteOverMaxRecordBytes() {
-        byte[] value = new byte[SingleFileLog.DEFAULT_MAX_RECORD_BYTES - FRAMING_BYTES_WITHOUT_KEY + 1];
+        byte[] value = new byte[LogConfig.DEFAULT_MAX_RECORD_BYTES - FRAMING_BYTES_WITHOUT_KEY + 1];
 
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             RecordTooLargeException refusal =
                     assertThrows(RecordTooLargeException.class, () -> log.append(new ProducedRecord(null, value)));
 
-            assertEquals(SingleFileLog.DEFAULT_MAX_RECORD_BYTES + 1L, refusal.recordBytes());
-            assertEquals(SingleFileLog.DEFAULT_MAX_RECORD_BYTES, refusal.maxRecordBytes());
+            assertEquals(LogConfig.DEFAULT_MAX_RECORD_BYTES + 1L, refusal.recordBytes());
+            assertEquals(LogConfig.DEFAULT_MAX_RECORD_BYTES, refusal.maxRecordBytes());
             assertEquals(0L, log.nextOffset(), "a refused append must not consume an offset");
         }
     }
@@ -177,8 +179,10 @@ class SingleFileLogTest {
     void enforcesTheConfiguredMaxRecordBytesRatherThanTheDefault() {
         int maxRecordBytes = 64;
         byte[] value = new byte[maxRecordBytes - FRAMING_BYTES_WITHOUT_KEY + 1];
+        LogConfig config = new LogConfig(maxRecordBytes, LogConfig.DEFAULT_SEGMENT_BYTES,
+                LogConfig.DEFAULT_INDEX_INTERVAL_BYTES);
 
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK, maxRecordBytes)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK, config)) {
             RecordTooLargeException refusal =
                     assertThrows(RecordTooLargeException.class, () -> log.append(new ProducedRecord(null, value)));
 
@@ -188,7 +192,7 @@ class SingleFileLogTest {
 
     @Test
     void refusesToAppendANullValueBecauseCompactionIsANonGoal() {
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             NullPointerException refusal =
                     assertThrows(NullPointerException.class, () -> log.append(new ProducedRecord(null, null)));
 
@@ -202,7 +206,7 @@ class SingleFileLogTest {
         Path logFile = logFileOf(TOPIC, PARTITION);
         long positionOfSecondRecord = FRAMING_BYTES_WITHOUT_KEY + "first".length();
 
-        try (Log log = SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
             log.append(new ProducedRecord(null, "first".getBytes(UTF_8)));
             log.append(new ProducedRecord(null, "second".getBytes(UTF_8)));
             flipLastBitOnDisk(logFile);
@@ -222,27 +226,44 @@ class SingleFileLogTest {
         }
     }
 
+    /**
+     * Slice 1 refused to reopen a log file it had not created, because appending after a record it had
+     * never read would have meant trusting a file it had not checked. Slice 2 checks it: reopening
+     * recovers the log and carries on from its last record.
+     */
     @Test
-    void refusesToOpenALogFileThatAlreadyExists() {
-        SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK).close();
+    void reopensAnExistingLogAndAppendsAfterItsLastRecord() {
+        try (Log log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+            log.append(new ProducedRecord(null, "before the restart".getBytes(UTF_8)));
+            log.append(new ProducedRecord(null, "also before the restart".getBytes(UTF_8)));
+        }
 
-        ShrikeIOException refusal = assertThrows(ShrikeIOException.class,
-                () -> SingleFileLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK));
+        try (Log reopened = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+            long offsetAfterRestart = reopened.append(new ProducedRecord(null, "after the restart".getBytes(UTF_8)));
 
-        assertTrue(refusal.getMessage().contains("recovery scan"), refusal.getMessage());
+            assertEquals(2L, offsetAfterRestart, "a reopened log appends after the last record it recovered");
+            assertEquals(3L, reopened.nextOffset());
+            assertArrayEquals("before the restart".getBytes(UTF_8), reopened.read(0L).value());
+            assertArrayEquals("also before the restart".getBytes(UTF_8), reopened.read(1L).value());
+            assertArrayEquals("after the restart".getBytes(UTF_8), reopened.read(2L).value());
+        }
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"", ".", "..", "../escapes", "nested/topic", "with space"})
     void refusesTopicNamesThatWouldNameSomethingOtherThanOneDirectory(String topic) {
         IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
-                () -> SingleFileLog.open(dataDirectory, topic, PARTITION, FIXED_CLOCK));
+                () -> SegmentedLog.open(dataDirectory, topic, PARTITION, FIXED_CLOCK));
 
         assertTrue(refusal.getMessage().contains("topic must match"), refusal.getMessage());
     }
 
     private Path logFileOf(String topic, int partition) {
         return dataDirectory.resolve(topic + "-" + partition).resolve("00000000000000000000.log");
+    }
+
+    private Path indexFileOf(String topic, int partition) {
+        return dataDirectory.resolve(topic + "-" + partition).resolve("00000000000000000000.index");
     }
 
     private static void flipLastBitOnDisk(Path logFile) throws IOException {
