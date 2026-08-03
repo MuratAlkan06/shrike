@@ -35,21 +35,31 @@ class GroupOffsetStoreTest {
     private static final String SAME_GROUP_CAPITALISED = "Readers";
 
     private static final String OTHER_GROUP = "auditors";
+
+    /** A third group, for the tests that fill a budget of two and then ask for one more. */
+    private static final String THIRD_GROUP = "watchers";
+
     private static final String TOPIC = "orders";
     private static final String OTHER_TOPIC = "events";
+
+    /** Roomier than any test that is not about the budget will ever fill. */
+    private static final int GROUP_BUDGET = 8;
+
+    /** The budget of the tests that are about it: two commits fill it, and the third is refused. */
+    private static final int TWO_GROUPS = 2;
 
     @TempDir
     Path dataDirectory;
 
     @Test
     void readsBackEveryCommittedOffsetAfterTheStoreIsReopened() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
         store.commit(GROUP, TOPIC, 0, 5L);
         store.commit(GROUP, TOPIC, 1, 12L);
         store.commit(GROUP, OTHER_TOPIC, 0, 1L);
         store.commit(OTHER_GROUP, TOPIC, 0, 3L);
 
-        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
 
         assertEquals(OptionalLong.of(5L), reopened.committedOffset(GROUP, TOPIC, 0));
         assertEquals(OptionalLong.of(12L), reopened.committedOffset(GROUP, TOPIC, 1),
@@ -63,11 +73,11 @@ class GroupOffsetStoreTest {
 
     @Test
     void replacesTheOffsetOfAKeyThatIsCommittedAgain() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
         store.commit(GROUP, TOPIC, 0, 5L);
         store.commit(GROUP, TOPIC, 0, 9L);
 
-        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
 
         assertEquals(OptionalLong.of(9L), store.committedOffset(GROUP, TOPIC, 0));
         assertEquals(OptionalLong.of(9L), reopened.committedOffset(GROUP, TOPIC, 0));
@@ -82,7 +92,7 @@ class GroupOffsetStoreTest {
     @Test
     void returnsFromACommitOnlyAfterTheFileIsWrittenForcedMovedAndItsDirectoryForced() throws IOException {
         List<DurableFile.Step> steps = new ArrayList<>();
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, steps::add);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET, steps::add);
 
         store.commit(GROUP, TOPIC, 0, 5L);
 
@@ -98,7 +108,7 @@ class GroupOffsetStoreTest {
 
     @Test
     void createsItsDirectoryUnderTheInjectedDataDirectory() {
-        GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
 
         assertTrue(Files.isDirectory(dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME)),
                 "every path is derived from the data directory that was injected");
@@ -109,7 +119,8 @@ class GroupOffsetStoreTest {
         Path groups = Files.createDirectories(dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME));
         Files.writeString(groups.resolve(GROUP + GroupOffsetStore.FILE_SUFFIX), "not a header at all\n", UTF_8);
 
-        ShrikeIOException refused = assertThrows(ShrikeIOException.class, () -> GroupOffsetStore.open(dataDirectory));
+        ShrikeIOException refused = assertThrows(ShrikeIOException.class,
+                () -> GroupOffsetStore.open(dataDirectory, GROUP_BUDGET));
 
         assertTrue(refused.getMessage().contains(GroupOffsetStore.VERSION_HEADER),
                 "committed offsets are not something to guess at: an unreadable file fails the start");
@@ -124,11 +135,11 @@ class GroupOffsetStoreTest {
      */
     @Test
     void keepsOneSetOfCommittedOffsetsForGroupIdsThatDifferOnlyInCase() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
         store.commit(GROUP, TOPIC, 0, 5L);
         store.commit(GROUP.toUpperCase(Locale.ROOT), TOPIC, 1, 7L);
 
-        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
 
         assertEquals(OptionalLong.of(5L), reopened.committedOffset(GROUP, TOPIC, 0),
                 "the second casing committed a second partition, it did not replace the file of the first");
@@ -143,11 +154,11 @@ class GroupOffsetStoreTest {
      */
     @Test
     void keepsOneCommittedOffsetForTopicNamesThatDifferOnlyInCase() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
         store.commit(GROUP, TOPIC, 0, 5L);
         store.commit(GROUP, TOPIC.toUpperCase(Locale.ROOT), 0, 9L);
 
-        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
 
         assertEquals(OptionalLong.of(9L), reopened.committedOffset(GROUP, TOPIC, 0),
                 "the second commit replaced the first rather than becoming a second key");
@@ -169,7 +180,7 @@ class GroupOffsetStoreTest {
         Files.writeString(groups.resolve(SAME_GROUP_CAPITALISED + GroupOffsetStore.FILE_SUFFIX),
                 GroupOffsetStore.VERSION_HEADER + "\n" + TOPIC + " 0 5\n", UTF_8);
 
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
 
         assertEquals(List.of(GROUP + GroupOffsetStore.FILE_SUFFIX), fileNamesIn(groups),
                 "the name the directory lists is the folded one, and it is the only file there");
@@ -180,7 +191,7 @@ class GroupOffsetStoreTest {
 
         assertEquals(List.of(GROUP + GroupOffsetStore.FILE_SUFFIX), fileNamesIn(groups),
                 "a commit after the rename writes that same file rather than a second one beside it");
-        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
         assertEquals(OptionalLong.of(5L), reopened.committedOffset(GROUP, TOPIC, 0),
                 "and the next start opens rather than refusing, with everything that was committed");
         assertEquals(OptionalLong.of(7L), reopened.committedOffset(GROUP, TOPIC, 1));
@@ -202,14 +213,15 @@ class GroupOffsetStoreTest {
         assumeTrue(Files.readString(folded, UTF_8).endsWith("0 5\n"),
                 "this filesystem folds file names, so one group can never have two files on it");
 
-        ShrikeIOException refused = assertThrows(ShrikeIOException.class, () -> GroupOffsetStore.open(dataDirectory));
+        ShrikeIOException refused = assertThrows(ShrikeIOException.class,
+                () -> GroupOffsetStore.open(dataDirectory, GROUP_BUDGET));
 
         assertTrue(refused.getMessage().contains("differ only in case"), refused.getMessage());
     }
 
     @Test
     void enumeratesOneGroupsCommittedOffsetsInTopicThenPartitionOrder() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
         store.commit(GROUP, TOPIC, 1, 12L);
         store.commit(GROUP, OTHER_TOPIC, 0, 1L);
         store.commit(GROUP, TOPIC, 0, 5L);
@@ -224,7 +236,7 @@ class GroupOffsetStoreTest {
 
     @Test
     void enumeratesNoCommittedOffsetsForAGroupThatHasNeverCommitted() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
         store.commit(GROUP, TOPIC, 0, 5L);
 
         List<CommittedOffset> neverSeen = store.committedOffsets("nobody");
@@ -235,7 +247,7 @@ class GroupOffsetStoreTest {
 
     @Test
     void enumeratesTheOffsetsOfAGroupIdSpelledInAnotherCasing() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
         store.commit(GROUP, TOPIC, 0, 5L);
 
         List<CommittedOffset> committed = store.committedOffsets(SAME_GROUP_CAPITALISED);
@@ -246,12 +258,87 @@ class GroupOffsetStoreTest {
 
     @Test
     void refusesANegativeOffsetAndAnUnsafeName() {
-        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, GROUP_BUDGET);
 
         assertThrows(IllegalArgumentException.class, () -> store.commit(GROUP, TOPIC, 0, -1L));
         assertThrows(IllegalArgumentException.class, () -> store.commit("../escape", TOPIC, 0, 1L));
         assertThrows(IllegalArgumentException.class, () -> store.commit(GROUP, "../escape", 0, 1L));
         assertThrows(IllegalArgumentException.class, () -> store.commit(GROUP, TOPIC, -1, 1L));
+    }
+
+    /**
+     * A commit is the only thing that creates a group, and nothing removes one, so the budget is what
+     * stands between a directory and anything that can send commits. The refusal names all three
+     * numbers a reader of it needs: which group was asked for, how many are held, and how many may be.
+     */
+    @Test
+    void refusesTheCommitThatWouldCreateAGroupPastTheBudgetAndWritesNothingForIt() throws IOException {
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, TWO_GROUPS);
+        store.commit(GROUP, TOPIC, 0, 5L);
+        store.commit(OTHER_GROUP, TOPIC, 0, 3L);
+
+        TooManyGroupsException refused = assertThrows(TooManyGroupsException.class,
+                () -> store.commit(THIRD_GROUP, TOPIC, 0, 1L));
+
+        assertTrue(refused.getMessage().contains(THIRD_GROUP), refused.getMessage());
+        assertTrue(refused.getMessage().contains("already holds 2 of the 2"),
+                "the count held and the budget are both in the sentence: " + refused.getMessage());
+        assertEquals(List.of(OTHER_GROUP + GroupOffsetStore.FILE_SUFFIX, GROUP + GroupOffsetStore.FILE_SUFFIX),
+                fileNamesIn(dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME)),
+                "the refusal comes before anything is written, so the directory holds only the groups it held");
+        assertEquals(List.of(), GroupOffsetStore.open(dataDirectory, TWO_GROUPS).committedOffsets(THIRD_GROUP),
+                "and a store reopened over that directory has never heard of the group that was refused");
+    }
+
+    @Test
+    void commitsAgainForAGroupItAlreadyHoldsWhenTheBudgetIsFull() {
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, TWO_GROUPS);
+        store.commit(GROUP, TOPIC, 0, 5L);
+        store.commit(OTHER_GROUP, TOPIC, 0, 3L);
+
+        store.commit(GROUP, OTHER_TOPIC, 1, 9L);
+
+        assertEquals(OptionalLong.of(9L), store.committedOffset(GROUP, OTHER_TOPIC, 1),
+                "the budget counts groups, so a group that is already one of them commits whatever it says");
+        assertEquals(OptionalLong.of(9L),
+                GroupOffsetStore.open(dataDirectory, TWO_GROUPS).committedOffset(GROUP, OTHER_TOPIC, 1),
+                "and that commit is on the device like any other");
+    }
+
+    /**
+     * A budget somebody lowered is not a reason to strand committed offsets: every file in the directory
+     * was written under the budget of the day, so all of them load and go on committing, and it is the
+     * next group that pays. The same call the partition budget makes about a registry it opens over.
+     */
+    @Test
+    void loadsEveryGroupFileWhenTheDirectoryHoldsMoreThanTheBudgetAndRefusesTheNextNewGroup() throws IOException {
+        Path groups = Files.createDirectories(dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME));
+        writeGroupFile(groups, GROUP, 5L);
+        writeGroupFile(groups, OTHER_GROUP, 3L);
+        writeGroupFile(groups, THIRD_GROUP, 1L);
+
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory, TWO_GROUPS);
+
+        assertEquals(OptionalLong.of(5L), store.committedOffset(GROUP, TOPIC, 0),
+                "a broker that would not open these would be one a lowered number had turned into an outage");
+        assertEquals(OptionalLong.of(3L), store.committedOffset(OTHER_GROUP, TOPIC, 0));
+        assertEquals(OptionalLong.of(1L), store.committedOffset(THIRD_GROUP, TOPIC, 0));
+        store.commit(THIRD_GROUP, TOPIC, 0, 4L);
+        assertEquals(OptionalLong.of(4L), store.committedOffset(THIRD_GROUP, TOPIC, 0),
+                "and every one of them still commits, budget or no budget");
+        assertThrows(TooManyGroupsException.class, () -> store.commit("newcomers", TOPIC, 0, 1L),
+                "what the budget stops is the group after them");
+    }
+
+    /**
+     * @param groups the groups directory
+     * @param group  the group whose file to write, under the name this build stores it under
+     * @param offset the next offset to read that file records for partition 0 of {@link #TOPIC}
+     * @throws IOException if it cannot be written
+     */
+    private static void writeGroupFile(Path groups, String group, long offset) throws IOException {
+        Files.writeString(groups.resolve(group + GroupOffsetStore.FILE_SUFFIX),
+                GroupOffsetStore.VERSION_HEADER + "\n" + TOPIC + " 0 " + offset + "\n", UTF_8);
     }
 
     /**

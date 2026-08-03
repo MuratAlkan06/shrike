@@ -99,14 +99,15 @@ class BrokerLaunchTest {
                 Map.entry(BrokerLaunch.READ_TIMEOUT_MS_VARIABLE, "7500"),
                 Map.entry(BrokerLaunch.FETCH_ZERO_COPY_VARIABLE, "False"),
                 Map.entry(BrokerLaunch.CONNECTION_CAP_VARIABLE, "8"),
-                Map.entry(BrokerLaunch.MAX_TOTAL_PARTITIONS_VARIABLE, "32"));
+                Map.entry(BrokerLaunch.MAX_TOTAL_PARTITIONS_VARIABLE, "32"),
+                Map.entry(BrokerLaunch.MAX_TOTAL_GROUPS_VARIABLE, "16"));
 
         BrokerConfig config = BrokerLaunch.from(NO_ARGUMENTS, environment).config();
 
         Path dataDirectory = Path.of(DATA_DIRECTORY);
         LogConfig namedLogConfig = new LogConfig(524_288, 67_108_864, 8192, 86_400_000L, 1_073_741_824L,
                 FlushMode.PER_RECORD, 250L, 2_097_152L);
-        assertEquals(new BrokerConfig(dataDirectory, 9750, 1_048_576, 5_000, false, 8, 7_500, 32,
+        assertEquals(new BrokerConfig(dataDirectory, 9750, 1_048_576, 5_000, false, 8, 7_500, 32, 16,
                         dataDirectory.resolve("shrike.ready"), namedLogConfig), config,
                 "every value the environment named reached the one field its variable names");
         assertFalse(config.zeroCopyFetch(), "a fetch's records are read into memory because a variable said so");

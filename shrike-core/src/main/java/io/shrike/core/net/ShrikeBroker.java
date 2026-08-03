@@ -256,7 +256,7 @@ public final class ShrikeBroker implements AutoCloseable {
         TopicRegistry topics = TopicRegistry.open(config, timeSource);
         ShrikeBroker broker;
         try {
-            GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory);
+            GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory, config.maxTotalGroups());
             ServerSocketChannel serverChannel = bind(config, bindAddress);
             broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, timeSource,
                     boundPort(serverChannel));

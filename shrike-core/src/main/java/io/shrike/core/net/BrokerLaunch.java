@@ -17,7 +17,7 @@ import java.util.Optional;
  *
  * <p>{@link BrokerConfig} is what a broker is built from; this is how a process comes to hold one. It
  * is read from environment variables and nothing else — no configuration file, no working-directory
- * lookup, no path this process guesses at. Eighteen variables, of which one is required, and one rule
+ * lookup, no path this process guesses at. Nineteen variables, of which one is required, and one rule
  * names them: a setting's variable is {@code SHRIKE_} followed by the name {@link LogConfig} and
  * {@link BrokerConfig} give the field in their javadoc, upper-cased with each dot an underscore, so
  * {@code retention.ms} is read from {@code SHRIKE_RETENTION_MS}.
@@ -42,11 +42,12 @@ import java.util.Optional;
  * SHRIKE_FETCH_ZERO_COPY      fetch.zero.copy, written true or false in whatever letters
  * SHRIKE_CONNECTION_CAP       connectionCap, which has no dotted name of its own
  * SHRIKE_MAX_TOTAL_PARTITIONS maxTotalPartitions, which has no dotted name of its own
+ * SHRIKE_MAX_TOTAL_GROUPS     maxTotalGroups, which has no dotted name of its own
  * </pre>
  *
  * <p>A variable that is not set, or set to nothing at all, is one the default answers for — which is
  * what {@code docker run -e SHRIKE_PORT=} passes and what an operator means by it. Each of the
- * fourteen settings below the first four defaults to what {@link LogConfig#defaults()} and
+ * fifteen settings below the first four defaults to what {@link LogConfig#defaults()} and
  * {@link BrokerConfig#defaults(Path, int, Path)} give the field it sets, so a process that names none
  * of them starts the broker every deployment before them started. The data directory has no default
  * because a default would be a path this process picked rather than one somebody chose, and every
@@ -120,6 +121,9 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
     /** The most partitions this broker will hold open across every topic. */
     public static final String MAX_TOTAL_PARTITIONS_VARIABLE = "SHRIKE_MAX_TOTAL_PARTITIONS";
 
+    /** The most consumer groups this broker will hold committed offsets for. */
+    public static final String MAX_TOTAL_GROUPS_VARIABLE = "SHRIKE_MAX_TOTAL_GROUPS";
+
     /**
      * Which variable set the field a record refused, keyed by the name that record's own sentence
      * begins with. Bounds are checked once, in {@link LogConfig} and {@link BrokerConfig}, for every
@@ -140,7 +144,8 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             Map.entry("maxRequestBytes", MAX_REQUEST_BYTES_VARIABLE),
             Map.entry("readTimeoutMs", READ_TIMEOUT_MS_VARIABLE),
             Map.entry("connectionCap", CONNECTION_CAP_VARIABLE),
-            Map.entry("maxTotalPartitions", MAX_TOTAL_PARTITIONS_VARIABLE));
+            Map.entry("maxTotalPartitions", MAX_TOTAL_PARTITIONS_VARIABLE),
+            Map.entry("maxTotalGroups", MAX_TOTAL_GROUPS_VARIABLE));
 
     /**
      * The port a broker listens on when nothing names another: 9750. It is not a registered port and
@@ -210,11 +215,13 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
                 BrokerConfig.DEFAULT_READ_TIMEOUT_MILLIS);
         int maxTotalPartitions = wholeNumber(environment, MAX_TOTAL_PARTITIONS_VARIABLE,
                 BrokerConfig.DEFAULT_MAX_TOTAL_PARTITIONS);
+        int maxTotalGroups = wholeNumber(environment, MAX_TOTAL_GROUPS_VARIABLE,
+                BrokerConfig.DEFAULT_MAX_TOTAL_GROUPS);
         LogConfig logConfig = logConfig(environment);
 
         try {
             return new BrokerConfig(dataDirectory, port, maxRequestBytes, maxFetchWaitMs, zeroCopyFetch,
-                    connectionCap, readTimeoutMs, maxTotalPartitions, readyFilePath, logConfig);
+                    connectionCap, readTimeoutMs, maxTotalPartitions, maxTotalGroups, readyFilePath, logConfig);
         } catch (IllegalArgumentException refusal) {
             throw refusalNamingTheVariable(refusal);
         }

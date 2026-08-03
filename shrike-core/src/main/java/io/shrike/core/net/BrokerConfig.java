@@ -45,13 +45,18 @@ import java.util.Objects;
  *                          costs a directory and two open file handles for as long as the broker runs,
  *                          so a create that would pass this number is refused rather than answered with
  *                          a process out of file descriptors
+ * @param maxTotalGroups    the most consumer groups this broker will hold committed offsets for. A
+ *                          commit is what creates a group, and the group it creates costs a file and a
+ *                          resident map entry that outlive the connection that asked for it, so a commit
+ *                          that would create one past this number is refused rather than leaving a
+ *                          directory anybody with a socket can fill
  * @param readyFilePath     the file written once the broker is listening, holding the port it bound and
  *                          the process it runs in
  * @param logConfig         the record, segment, and index sizes every partition log opens with
  */
 public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, int maxFetchWaitMs,
                            boolean zeroCopyFetch, int connectionCap, int readTimeoutMs, int maxTotalPartitions,
-                           Path readyFilePath, LogConfig logConfig) {
+                           int maxTotalGroups, Path readyFilePath, LogConfig logConfig) {
 
     /** Ask the operating system for a free port, and read back which one it gave. */
     public static final int EPHEMERAL_PORT = 0;
@@ -96,6 +101,17 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
     public static final int DEFAULT_MAX_TOTAL_PARTITIONS = 1024;
 
     /**
+     * A thousand and twenty-four consumer groups — the same number as the partition budget, on purpose:
+     * both are "how many of these may one broker for one machine and a handful of clients accumulate",
+     * and one number is one thing for an operator to raise. A group is cheaper than a partition, since
+     * it costs a file and a map entry rather than two open file handles, but its cost is permanent in a
+     * way a partition's is not: nothing deletes a group, so a broker that has held a group for a minute
+     * holds it for as long as its data directory lives, and every one of them is read back at every
+     * start. A commit is the only thing that creates one, and a commit needs no more than a socket.
+     */
+    public static final int DEFAULT_MAX_TOTAL_GROUPS = 1024;
+
+    /**
      * On. A fetch response is already the log's own bytes rather than a re-encoding of its records, so
      * sending them out of the file they are in is what the format was chosen for. The buffered path is
      * kept beside it, one setting away, because a broker with no way back to the code it had before is
@@ -129,6 +145,9 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
         if (maxTotalPartitions < 1) {
             throw new IllegalArgumentException("maxTotalPartitions must be at least 1, but was " + maxTotalPartitions);
         }
+        if (maxTotalGroups < 1) {
+            throw new IllegalArgumentException("maxTotalGroups must be at least 1, but was " + maxTotalGroups);
+        }
     }
 
     /**
@@ -136,7 +155,7 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
      * request bound, a fetch wait capped at {@value #DEFAULT_MAX_FETCH_WAIT_MILLIS}ms, fetches served
      * out of the segment file, {@value #DEFAULT_CONNECTION_CAP} connections, a read bound of
      * {@value #DEFAULT_READ_TIMEOUT_MILLIS}ms, {@value #DEFAULT_MAX_TOTAL_PARTITIONS} partitions across
-     * every topic, and {@link LogConfig#defaults()}.
+     * every topic, {@value #DEFAULT_MAX_TOTAL_GROUPS} consumer groups, and {@link LogConfig#defaults()}.
      *
      * @param dataDirectory the directory every path is derived from
      * @param port          the port to listen on, or {@value #EPHEMERAL_PORT}
@@ -146,6 +165,7 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
     public static BrokerConfig defaults(Path dataDirectory, int port, Path readyFilePath) {
         return new BrokerConfig(dataDirectory, port, RequestReader.DEFAULT_MAX_REQUEST_BYTES,
                 DEFAULT_MAX_FETCH_WAIT_MILLIS, DEFAULT_ZERO_COPY_FETCH, DEFAULT_CONNECTION_CAP,
-                DEFAULT_READ_TIMEOUT_MILLIS, DEFAULT_MAX_TOTAL_PARTITIONS, readyFilePath, LogConfig.defaults());
+                DEFAULT_READ_TIMEOUT_MILLIS, DEFAULT_MAX_TOTAL_PARTITIONS, DEFAULT_MAX_TOTAL_GROUPS, readyFilePath,
+                LogConfig.defaults());
     }
 }

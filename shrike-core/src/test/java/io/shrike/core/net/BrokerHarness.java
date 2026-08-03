@@ -42,7 +42,8 @@ final class BrokerHarness {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
                 defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), connectionCap, defaults.readTimeoutMs(),
-                defaults.maxTotalPartitions(), defaults.readyFilePath(), LogConfig.defaults());
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(),
+                LogConfig.defaults());
     }
 
     /**
@@ -54,7 +55,8 @@ final class BrokerHarness {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
                 defaults.maxFetchWaitMs(), true, defaults.connectionCap(), defaults.readTimeoutMs(),
-                defaults.maxTotalPartitions(), defaults.readyFilePath(), defaults.logConfig());
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(),
+                defaults.logConfig());
     }
 
     /**
@@ -66,7 +68,8 @@ final class BrokerHarness {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
                 defaults.maxFetchWaitMs(), false, defaults.connectionCap(), defaults.readTimeoutMs(),
-                defaults.maxTotalPartitions(), defaults.readyFilePath(), defaults.logConfig());
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(),
+                defaults.logConfig());
     }
 
     /**
@@ -79,7 +82,21 @@ final class BrokerHarness {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
                 defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), defaults.connectionCap(), defaults.readTimeoutMs(),
-                maxTotalPartitions, defaults.readyFilePath(), LogConfig.defaults());
+                maxTotalPartitions, defaults.maxTotalGroups(), defaults.readyFilePath(), LogConfig.defaults());
+    }
+
+    /**
+     * @param dataDirectory  the test's temporary directory
+     * @param maxTotalGroups the group budget this broker enforces
+     * @return the same configuration with a budget a test can fill with a handful of commits rather
+     *         than with a thousand of them
+     */
+    static BrokerConfig configWithGroupBudget(Path dataDirectory, int maxTotalGroups) {
+        BrokerConfig defaults = config(dataDirectory);
+        return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
+                defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), defaults.connectionCap(),
+                defaults.readTimeoutMs(), defaults.maxTotalPartitions(), maxTotalGroups, defaults.readyFilePath(),
+                LogConfig.defaults());
     }
 
     /**
@@ -92,7 +109,7 @@ final class BrokerHarness {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
                 defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), defaults.connectionCap(), defaults.readTimeoutMs(),
-                defaults.maxTotalPartitions(), defaults.readyFilePath(), logConfig);
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(), logConfig);
     }
 
     /**
@@ -106,7 +123,8 @@ final class BrokerHarness {
         BrokerConfig defaults = config(dataDirectory);
         return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
                 defaults.maxFetchWaitMs(), defaults.zeroCopyFetch(), connectionCap, readTimeoutMs,
-                defaults.maxTotalPartitions(), defaults.readyFilePath(), LogConfig.defaults());
+                defaults.maxTotalPartitions(), defaults.maxTotalGroups(), defaults.readyFilePath(),
+                LogConfig.defaults());
     }
 
     /**
