@@ -21,10 +21,56 @@
       <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- The benchmark harness, and test-scoped like every other dependency this module is allowed:
+         the benchmarks live under src/test/java, nothing in src/main names JMH, and the enforcer
+         rule below is what keeps that true rather than this comment. -->
+    <dependency>
+      <groupId>org.openjdk.jmh</groupId>
+      <artifactId>jmh-core</artifactId>
+      <version>${jmh.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
     <plugins>
+      <!-- JMH generates a runner class and a BenchmarkList entry per @Benchmark method, and it does
+           it from an annotation processor. The path is configured on the test compilation alone —
+           this plugin has one `annotationProcessorPaths` parameter per mojo rather than a test-only
+           one, so scoping it to the `default-testCompile` execution is what keeps the processor away
+           from src/main. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>default-testCompile</id>
+            <configuration>
+              <annotationProcessorPaths>
+                <path>
+                  <groupId>org.openjdk.jmh</groupId>
+                  <artifactId>jmh-generator-annprocess</artifactId>
+                  <version>${jmh.version}</version>
+                </path>
+              </annotationProcessorPaths>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- The generated JMH runners are named `<benchmark>_jmhTest`, which surefire's default
+           `**/*Test.java` include matches. Excluding the bench package keeps the unit-test run to
+           the tests, and it is why `mvn verify` compiles the benchmarks without running one. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <excludes>
+            <exclude>**/bench/**</exclude>
+          </excludes>
+        </configuration>
+      </plugin>
+
       <!-- Declared here, not in the reactor, so the ban applies to core alone
            and leaves clients and admin free to depend on core. -->
       <plugin>
@@ -54,4 +100,44 @@
       </plugin>
     </plugins>
   </build>
+
+  <!-- The benchmarks are compiled by every build and run by none of it. `mvn verify` — which is what
+       CI runs — never activates this profile, so a benchmark cannot make the build slow or flaky,
+       and it still cannot rot: it is test-compiled like every other class under src/test/java.
+       Running the suite is one command, and it is the command the README documents. -->
+  <profiles>
+    <profile>
+      <id>bench</id>
+      <properties>
+        <!-- Where the raw JMH result lands. It is committed as it was written, because a number in
+             the README is worth what the file behind it is worth. -->
+        <bench.results.file>${project.basedir}/../docs/bench/slice-5-flush-and-fetch.json</bench.results.file>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <configuration>
+              <!-- `java` rather than a path, so the jdk toolchain this reactor already requires is
+                   what runs the harness — the same JDK 21 the tests run on, rather than whichever
+                   JVM happened to launch Maven. JMH's forks inherit it from there, and the JSON
+                   records which JVM it was. -->
+              <executable>java</executable>
+              <classpathScope>test</classpathScope>
+              <arguments>
+                <argument>-classpath</argument>
+                <classpath/>
+                <argument>org.openjdk.jmh.Main</argument>
+                <argument>-rf</argument>
+                <argument>json</argument>
+                <argument>-rff</argument>
+                <argument>${bench.results.file}</argument>
+              </arguments>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

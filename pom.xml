@@ -24,6 +24,8 @@
     <jdk.toolchain.version>21</jdk.toolchain.version>
     <jdk.toolchain.vendor>temurin</jdk.toolchain.vendor>
 
+    <exec-maven-plugin.version>3.6.3</exec-maven-plugin.version>
+    <jmh.version>1.37</jmh.version>
     <junit.version>5.14.4</junit.version>
     <maven-compiler-plugin.version>3.15.0</maven-compiler-plugin.version>
     <maven-enforcer-plugin.version>3.6.3</maven-enforcer-plugin.version>
@@ -47,6 +49,14 @@
   <build>
     <pluginManagement>
       <plugins>
+        <!-- Runs the JMH benchmark harness out of shrike-core's `bench` profile. Pinned here with
+             every other plugin version so that the profile carries a configuration and not a
+             version. -->
+        <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>exec-maven-plugin</artifactId>
+          <version>${exec-maven-plugin.version}</version>
+        </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
