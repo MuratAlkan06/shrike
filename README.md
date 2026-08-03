@@ -2,7 +2,7 @@
 
 Shrike is a single-node, log-structured message broker written in Java 21. Producers append records to a segmented commit log on one machine's disk, consumers read them back by offset, and delivery is at-least-once: a record may be redelivered after a failure, and no record is silently dropped.
 
-Status: Slice 6 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a `flush.mode` that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker.
+Version 1.0.0 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a flush policy that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker. What a running broker can be told is four environment variables and no more, which [Configuration](#configuration) sets out; the [Non-goals](#non-goals) below are what this build does not do at all.
 
 ## Non-goals
 
@@ -36,8 +36,8 @@ It listens on port 9750, binds the loopback interface, and writes `shrike.ready`
 **Or run it in a container.** The image is the same entry point reading the same four variables, with `SHRIKE_BIND_ADDRESS` set to `0.0.0.0` because a published port never lands on a container's loopback:
 
 ```
-docker build -t shrike:0.1.0 .
-docker run -d --name shrike -p 127.0.0.1:9750:9750 -v shrike-data:/var/lib/shrike shrike:0.1.0
+docker build -t shrike:1.0.0 .
+docker run -d --name shrike -p 127.0.0.1:9750:9750 -v shrike-data:/var/lib/shrike shrike:1.0.0
 ```
 
 **The address in front of that port is not decoration.** The unqualified `-p 9750:9750` publishes on every interface the host has, and this broker has no authentication, so that form hands an unauthenticated broker to whatever can reach the machine. It is also not something a host firewall necessarily catches: on Linux, Docker publishes a port by writing DNAT rules that are traversed before the `INPUT` chain, so a firewall written as `INPUT` rules is a firewall the published port goes around. `127.0.0.1:9750:9750` publishes to the host's loopback and nowhere else, which is what the rest of this quickstart connects to.
@@ -61,7 +61,7 @@ try (ShrikeConsumer consumer = ShrikeConsumer.open(config)) {
 **Read it back over HTTP.** The admin facade is not in the image. It runs beside the broker and already points at `127.0.0.1:9750`:
 
 ```
-java -jar shrike-admin/target/shrike-admin-0.1.0-SNAPSHOT.jar
+java -jar shrike-admin/target/shrike-admin-1.0.0.jar
 curl -s localhost:8080/api/v1/topics
 curl -s localhost:8080/api/v1/topics/orders
 curl -s localhost:8080/api/v1/groups/billing/lag
