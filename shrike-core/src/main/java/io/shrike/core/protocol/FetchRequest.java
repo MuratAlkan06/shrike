@@ -1,5 +1,7 @@
 package io.shrike.core.protocol;
 
+import io.shrike.core.log.SafeName;
+
 /**
  * Read records from one partition, starting at an offset.
  *

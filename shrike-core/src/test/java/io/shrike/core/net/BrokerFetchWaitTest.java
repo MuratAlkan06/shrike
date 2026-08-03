@@ -51,6 +51,12 @@ class BrokerFetchWaitTest {
     private static final int PLENTY_OF_BYTES = 64 * 1024;
     private static final int ANSWER_IMMEDIATELY_MS = 0;
 
+    /** Fewer bytes than one record's frame occupies, so it is also the most this fetch can be served. */
+    private static final int FEWER_BYTES_THAN_ONE_RECORD = 32;
+
+    /** What the wire format lets a client ask for, and what this broker will not do. */
+    private static final int MORE_THAN_THIS_BROKER_WILL_DO = Integer.MAX_VALUE;
+
     @TempDir
     Path dataDirectory;
 
@@ -126,6 +132,33 @@ class BrokerFetchWaitTest {
                 "the answer carries at least the minBytes it waited for");
         assertEquals(List.of("first", "second"), valuesIn(response));
         assertEquals(2L, response.highWaterMark());
+    }
+
+    /**
+     * Causality, not duration: a fetch asking for more bytes than it could ever be served, for longer
+     * than this broker will ever hold one open, is answered the moment enough records to fill it land.
+     * Without the clamps its predicate is unsatisfiable and its deadline is about twenty-five days, so
+     * the record below arrives and the fetch keeps waiting until this test's bounded await gives up.
+     */
+    @Test
+    void answersAFetchAskingForMoreBytesThanItCanBeServedAsSoonAsItCanBeFilled() throws Exception {
+        String value = "landed for a fetch that asked for more than it could be given";
+        CountDownLatch waiterRegistered = new CountDownLatch(1);
+        broker.partition(TOPIC, PARTITION).orElseThrow().onWaiterRegistered(waiterRegistered::countDown);
+
+        Future<ResponseDecoding> fetch = fetchThread.submit(() -> {
+            try (WireClient client = WireClient.connectTo(broker)) {
+                return client.call(13, new FetchRequest(TOPIC, PARTITION, 0L, FEWER_BYTES_THAN_ONE_RECORD,
+                        MORE_THAN_THIS_BROKER_WILL_DO, MORE_THAN_THIS_BROKER_WILL_DO));
+            }
+        });
+        Await.latch(waiterRegistered, "the fetch to register as a waiter");
+        produce(value);
+
+        ResponseDecoding answer = Await.value(fetch, "the fetch whose minBytes was more than it could be served");
+        FetchResponse response = (FetchResponse) assertInstanceOf(ResponseDecoding.Answered.class, answer).response();
+        assertEquals(1L, response.highWaterMark());
+        assertEquals(List.of(value), valuesIn(response), "and it is answered with the record, not with nothing");
     }
 
     /**

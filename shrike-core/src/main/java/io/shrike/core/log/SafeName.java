@@ -1,9 +1,13 @@
-package io.shrike.core.protocol;
+package io.shrike.core.log;
+
+import java.util.Locale;
 
 /**
  * The rule for a name that arrives over the network and becomes part of a path on disk. A topic name
  * and a group id both go through it, and there is exactly one of it, because a second copy is a
- * second chance to be more generous than the first.
+ * second chance to be more generous than the first. It lives in this package because this is where a
+ * name turns into a path — {@code SegmentedLog} resolves a partition directory out of one — and a rule
+ * about paths belongs beside the code that makes them.
  *
  * <p>A name is 1 to {@link #MAX_LENGTH_CHARS} characters of {@code [A-Za-z0-9._-]}, and is neither
  * {@code "."} nor {@code ".."}. That leaves no separator, no {@code NUL}, no drive letter, and no
@@ -11,6 +15,8 @@ package io.shrike.core.protocol;
  * against. The check runs on the decoded string rather than on the bytes: every legal character is
  * one ASCII byte, and any byte sequence that is not legal UTF-8 decodes to a replacement character
  * that the character set refuses.
+ *
+ * <p>Two names that differ only in case are one name here: see {@link #fold(String)}.
  */
 public final class SafeName {
 
@@ -51,6 +57,23 @@ public final class SafeName {
             throw new IllegalArgumentException(field + " must be 1 to " + MAX_LENGTH_CHARS
                     + " characters of [A-Za-z0-9._-] and neither \".\" nor \"..\", but was " + quote(name));
         }
+    }
+
+    /**
+     * Folds a name to the identity it is stored and looked up under.
+     *
+     * <p>A name becomes a path — {@code <topic>-<partition>/} for a partition, {@code <groupId>.offsets}
+     * for a group — and a path on APFS or on Windows does not tell two casings apart. So identity here
+     * is at most as fine-grained as the filesystem's: {@code orders} and {@code Orders} are one topic
+     * everywhere, on every filesystem, rather than two topics that share one directory on some of them.
+     * Every legal character is ASCII, and {@link Locale#ROOT} is what keeps the fold from depending on
+     * the machine's locale.
+     *
+     * @param name a name that has already passed {@link #isValid(String)}
+     * @return the identity two names that differ only in case share
+     */
+    public static String fold(String name) {
+        return name.toLowerCase(Locale.ROOT);
     }
 
     private static boolean isAllowed(char character) {

@@ -9,7 +9,6 @@ import io.shrike.core.log.SegmentedLog;
 import io.shrike.core.protocol.FetchResponse;
 import io.shrike.core.time.TimeSource;
 import java.io.Closeable;
-import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -33,13 +32,24 @@ import java.util.concurrent.locks.ReentrantLock;
  * cannot hold the lock until the fetch has released it inside {@link Condition#await(long, TimeUnit)}.
  * The wait is bounded by an absolute deadline computed once, the predicate is re-checked on every
  * wakeup, and nothing anywhere sleeps or polls.
+ *
+ * <p>What a fetch asks for is clamped to what this broker can answer with, in both directions: its
+ * {@code maxWaitMs} to {@link BrokerConfig#maxFetchWaitMs()}, and its {@code minBytes} to the most
+ * bytes a fetch can ever be served. See {@link #clampedWaitMs(int, int)} and
+ * {@link #clampedMinBytes(int, int)}.
  */
 final class Partition implements Closeable {
+
+    /** No high-water mark has been read yet, so the first pass through a fetch always reads records. */
+    private static final long NOTHING_READ_YET = -1L;
 
     private final String topic;
     private final int partition;
     private final LogConfig logConfig;
     private final int maxFetchBytes;
+
+    /** The longest this partition will hold a fetch open, whatever the request asked for. */
+    private final int maxFetchWaitMs;
 
     /** The clock a fetch's deadline is measured on, injected like every other clock in this broker. */
     private final TimeSource timeSource;
@@ -71,12 +81,14 @@ final class Partition implements Closeable {
     private Runnable waiterRegistered = () -> {
     };
 
-    private Partition(String topic, int partition, LogConfig logConfig, int maxFetchBytes, TimeSource timeSource,
-                      Log log) {
+    private Partition(String topic, int partition, BrokerConfig config, TimeSource timeSource, Log log) {
         this.topic = topic;
         this.partition = partition;
-        this.logConfig = logConfig;
-        this.maxFetchBytes = maxFetchBytes;
+        this.logConfig = config.logConfig();
+        // The most bytes one fetch may be answered with is max.request.bytes: the one number that says
+        // how much memory one connection may make this broker hold, whichever way the bytes travel.
+        this.maxFetchBytes = config.maxRequestBytes();
+        this.maxFetchWaitMs = config.maxFetchWaitMs();
         this.timeSource = timeSource;
         this.log = log;
     }
@@ -84,19 +96,16 @@ final class Partition implements Closeable {
     /**
      * Opens one partition's log, recovering it when it is already on disk.
      *
-     * @param dataDirectory the directory every path is derived from
-     * @param topic         the topic this partition belongs to
-     * @param partition     the partition number within that topic
-     * @param timeSource    the clock that stamps appended records
-     * @param logConfig     the record, segment, and index sizes to open the log with
-     * @param maxFetchBytes the most bytes of records one fetch may be answered with, whatever it asks
-     *                      for; a single frame larger than this is still served whole
+     * @param config     where things live and how much of them there may be; this partition takes its
+     *                   data directory, its log sizes, and the two bounds a fetch is clamped to from it
+     * @param topic      the topic this partition belongs to
+     * @param partition  the partition number within that topic
+     * @param timeSource the clock that stamps appended records
      * @return the open partition
      */
-    static Partition open(Path dataDirectory, String topic, int partition, TimeSource timeSource, LogConfig logConfig,
-                          int maxFetchBytes) {
-        Log log = SegmentedLog.open(dataDirectory, topic, partition, timeSource, logConfig);
-        return new Partition(topic, partition, logConfig, maxFetchBytes, timeSource, log);
+    static Partition open(BrokerConfig config, String topic, int partition, TimeSource timeSource) {
+        Log log = SegmentedLog.open(config.dataDirectory(), topic, partition, timeSource, config.logConfig());
+        return new Partition(topic, partition, config, timeSource, log);
     }
 
     String topic() {
@@ -153,12 +162,20 @@ final class Partition implements Closeable {
      * answer is what there is — often nothing at all — with the current high-water mark and no error,
      * because "there is nothing new yet" is an answer rather than a failure.
      *
+     * <p>Both of the caller's numbers are clamped before any of that: the wait to the broker's own
+     * {@code maxFetchWaitMs}, and {@code minBytes} to the most this fetch could ever be served, so the
+     * predicate is one that records can actually satisfy. A wakeup that finds the high-water mark where
+     * it left it re-waits without reading the log again — the bytes readable from a fixed offset cannot
+     * have changed if the mark has not moved, and re-reading them would cost every waiter a full read
+     * for every append anybody makes.
+     *
      * @param fetchOffset the offset to read from; the high-water mark itself is legal and answers
      *                    empty
      * @param maxBytes    the most bytes of records the caller wants, capped by the broker's own bound
-     * @param maxWaitMs   how long the broker may hold this request open; 0 answers immediately
-     * @param minBytes    how many bytes are worth answering before that wait is up; 0 answers
-     *                    immediately
+     * @param maxWaitMs   how long the broker may hold this request open, capped by the broker's own
+     *                    bound; 0 answers immediately
+     * @param minBytes    how many bytes are worth answering before that wait is up, capped by what can
+     *                    be served; 0 answers immediately
      * @return the records and the high-water mark they were read against
      * @throws io.shrike.core.log.OffsetOutOfRangeException if {@code fetchOffset} is outside the range
      *                                                      the partition can serve
@@ -167,18 +184,25 @@ final class Partition implements Closeable {
      */
     FetchResponse fetch(long fetchOffset, int maxBytes, int maxWaitMs, int minBytes) {
         int servedMaxBytes = Math.min(maxBytes, maxFetchBytes);
+        int servedMinBytes = clampedMinBytes(minBytes, servedMaxBytes);
+        int servedMaxWaitMs = clampedWaitMs(maxWaitMs, maxFetchWaitMs);
 
         lock.lock();
         try {
             // Absolute, and computed once: every wait below is for what is left of this instant, so a
             // wakeup that proves nothing cannot hand the caller another full maxWaitMs.
-            long deadlineMillis = timeSource.currentTimeMillis() + maxWaitMs;
+            long deadlineMillis = timeSource.currentTimeMillis() + servedMaxWaitMs;
+            long lastReadHighWaterMark = NOTHING_READ_YET;
             while (true) {
                 long highWaterMark = log.nextOffset();
-                byte[] records = log.readRange(fetchOffset, highWaterMark, servedMaxBytes);
                 long remainingMillis = deadlineMillis - timeSource.currentTimeMillis();
-                if (records.length >= minBytes || remainingMillis <= 0 || stopped) {
-                    return new FetchResponse(highWaterMark, records);
+                boolean answerNow = remainingMillis <= 0 || stopped;
+                if (answerNow || highWaterMark != lastReadHighWaterMark) {
+                    byte[] records = log.readRange(fetchOffset, highWaterMark, servedMaxBytes);
+                    if (answerNow || records.length >= servedMinBytes) {
+                        return new FetchResponse(highWaterMark, records);
+                    }
+                    lastReadHighWaterMark = highWaterMark;
                 }
 
                 waiterRegistered.run();
@@ -255,6 +279,37 @@ final class Partition implements Closeable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * How long a fetch may actually be held open.
+     *
+     * <p>The wire format carries {@code maxWaitMs} as an int32, so a client may ask for a wait of
+     * nearly twenty-five days, and a broker that took it at its word would hand out a connection slot
+     * and a platform thread for that long. The request is a preference; the bound is the broker's.
+     *
+     * @param requestedMaxWaitMs what the request asked for, which is never negative
+     * @param maxFetchWaitMs     what this broker allows
+     * @return the smaller of the two
+     */
+    static int clampedWaitMs(int requestedMaxWaitMs, int maxFetchWaitMs) {
+        return Math.min(requestedMaxWaitMs, maxFetchWaitMs);
+    }
+
+    /**
+     * How many bytes are actually worth waiting for.
+     *
+     * <p>A fetch is served at most {@code min(maxBytes, max.request.bytes)} bytes of records, so a
+     * {@code minBytes} above that is a predicate no append could ever satisfy: the fetch would sleep out
+     * its whole deadline with the records it asked for already on disk and already readable. Clamping it
+     * to what can be served turns "wait for more than exists" into "wait until you can be filled".
+     *
+     * @param requestedMinBytes what the request asked for, which is never negative
+     * @param servedMaxBytes    the most bytes this fetch can be answered with
+     * @return the smaller of the two
+     */
+    static int clampedMinBytes(int requestedMinBytes, int servedMaxBytes) {
+        return Math.min(requestedMinBytes, servedMaxBytes);
     }
 
     private void refuseIfTooLarge(ProducedRecord record) {

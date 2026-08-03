@@ -3,8 +3,8 @@ package io.shrike.core.group;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.shrike.core.log.DurableFile;
+import io.shrike.core.log.SafeName;
 import io.shrike.core.log.ShrikeIOException;
-import io.shrike.core.protocol.SafeName;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.DirectoryStream;
@@ -44,6 +44,14 @@ import java.util.concurrent.locks.ReentrantLock;
  * produces and fetches, and one lock is a guard that can be named in a sentence; a lock per group,
  * created as group files appear, would be a second thing to get right for a contention that does not
  * exist yet.
+ *
+ * <p><strong>Names are folded.</strong> A group id is a file name and a topic is a directory name, and
+ * a file name does not tell two casings apart on every filesystem, so both go through
+ * {@link SafeName#fold(String)} before they are used as an identity or as a path. Group {@code readers}
+ * and group {@code Readers} are one group with one file, rather than two groups whose files are the
+ * same file on APFS and two files on ext4 — which is what would let one group's whole set of committed
+ * offsets be overwritten by another's. A directory holding two files that fold together was written by
+ * something other than this build, and it fails the open rather than picking one.
  */
 public final class GroupOffsetStore {
 
@@ -65,9 +73,10 @@ public final class GroupOffsetStore {
     private final ReentrantLock lock = new ReentrantLock();
 
     /**
-     * Every group's committed offsets, by group id and then by topic partition. A {@link TreeMap}
-     * inside, so a rewritten file lists its keys in one order and two brokers that stored the same
-     * commits write the same bytes.
+     * Every group's committed offsets, by the fold of its group id and then by topic partition — whose
+     * topic is folded too, so that a commit and a fetch of the same topic agree about which key they
+     * mean whatever casing each of them spelled it in. A {@link TreeMap} inside, so a rewritten file
+     * lists its keys in one order and two brokers that stored the same commits write the same bytes.
      */
     // guarded by: lock
     private final Map<String, Map<TopicPartition, Long>> offsetsByGroup = new HashMap<>();
@@ -120,8 +129,8 @@ public final class GroupOffsetStore {
      * <p>Returns only after the group's file has been written, forced, moved into place, and its
      * directory forced. A caller may tell the client the commit is stored the moment this returns.
      *
-     * @param groupId   the group committing
-     * @param topic     the topic the offset belongs to
+     * @param groupId   the group committing, folded to its identity before it is stored
+     * @param topic     the topic the offset belongs to, folded the same way
      * @param partition the partition of that topic
      * @param offset    the next offset that group should read
      * @throws IllegalArgumentException if a name is not a {@link SafeName}, if the partition is
@@ -134,16 +143,19 @@ public final class GroupOffsetStore {
         requireNotNegative(partition, "partition");
         requireNotNegative(offset, "offset");
 
+        String group = SafeName.fold(groupId);
+        TopicPartition key = new TopicPartition(SafeName.fold(topic), partition);
+
         lock.lock();
         try {
-            Map<TopicPartition, Long> offsets = offsetsByGroup.computeIfAbsent(groupId, id -> new TreeMap<>());
-            Long previousOffset = offsets.put(new TopicPartition(topic, partition), offset);
+            Map<TopicPartition, Long> offsets = offsetsByGroup.computeIfAbsent(group, id -> new TreeMap<>());
+            Long previousOffset = offsets.put(key, offset);
             try {
-                DurableFile.replace(fileOf(groupId), render(offsets), observer);
+                DurableFile.replace(fileOf(group), render(offsets), observer);
             } catch (RuntimeException e) {
                 // The file is what this store is; memory that disagrees with it would answer the next
                 // read with an offset no restart could produce.
-                restore(offsets, new TopicPartition(topic, partition), previousOffset);
+                restore(offsets, key, previousOffset);
                 throw e;
             }
         } finally {
@@ -164,11 +176,11 @@ public final class GroupOffsetStore {
 
         lock.lock();
         try {
-            Map<TopicPartition, Long> offsets = offsetsByGroup.get(groupId);
+            Map<TopicPartition, Long> offsets = offsetsByGroup.get(SafeName.fold(groupId));
             if (offsets == null) {
                 return OptionalLong.empty();
             }
-            Long offset = offsets.get(new TopicPartition(topic, partition));
+            Long offset = offsets.get(new TopicPartition(SafeName.fold(topic), partition));
             return offset == null ? OptionalLong.empty() : OptionalLong.of(offset);
         } finally {
             lock.unlock();
@@ -183,8 +195,12 @@ public final class GroupOffsetStore {
         }
     }
 
-    private Path fileOf(String groupId) {
-        return groupsDirectory.resolve(groupId + FILE_SUFFIX);
+    /**
+     * @param group a group id that has already been folded, which is what keeps one group to one file
+     * @return that group's file
+     */
+    private Path fileOf(String group) {
+        return groupsDirectory.resolve(group + FILE_SUFFIX);
     }
 
     /**
@@ -205,10 +221,16 @@ public final class GroupOffsetStore {
      * Reads every group file in the directory. A file whose name is not a {@link SafeName} followed by
      * {@link #FILE_SUFFIX} is not one this store wrote, so it is left alone rather than parsed.
      *
+     * <p>Two files whose group ids fold together fail the open. This build writes one file per folded
+     * id, so a pair like that came from something else, and there is no way to tell which of them a
+     * group's next read should trust — the wrong guess silently redelivers or silently skips records.
+     *
      * @throws IOException       if the directory cannot be listed
-     * @throws ShrikeIOException if a file that is ours cannot be read or does not parse
+     * @throws ShrikeIOException if a file that is ours cannot be read, does not parse, or shares a
+     *                           folded group id with another
      */
     private void loadEveryGroup() throws IOException {
+        Map<String, String> fileNamesByGroup = new HashMap<>();
         try (DirectoryStream<Path> entries = Files.newDirectoryStream(groupsDirectory)) {
             for (Path entry : entries) {
                 String fileName = entry.getFileName().toString();
@@ -219,7 +241,15 @@ public final class GroupOffsetStore {
                 if (!SafeName.isValid(groupId)) {
                     continue;
                 }
-                offsetsByGroup.put(groupId, parse(entry, groupId));
+                String group = SafeName.fold(groupId);
+                String sameGroup = fileNamesByGroup.put(group, fileName);
+                if (sameGroup != null) {
+                    throw new ShrikeIOException("the committed offsets in " + groupsDirectory + " name one group twice:"
+                            + " " + sameGroup + " and " + fileName + " differ only in case, and a group id is"
+                            + " case-insensitive because the file it names is",
+                            new IOException("two group files, one group"));
+                }
+                offsetsByGroup.put(group, parse(entry, group));
             }
         }
     }
@@ -280,7 +310,13 @@ public final class GroupOffsetStore {
             throw unreadable(file, groupId, lineNumber, "partition " + partition + " and offset " + offset
                     + " must both be zero or higher");
         }
-        offsets.put(new TopicPartition(fields[0], partition), offset);
+        TopicPartition key = new TopicPartition(SafeName.fold(fields[0]), partition);
+        if (offsets.containsKey(key)) {
+            throw unreadable(file, groupId, lineNumber, "topic \"" + fields[0] + "\" is listed twice for partition "
+                    + partition + " under names that differ only in case, and this build cannot tell which offset is"
+                    + " the current one");
+        }
+        offsets.put(key, offset);
     }
 
     private static ShrikeIOException unreadable(Path file, String groupId, int lineNumber, String detail) {

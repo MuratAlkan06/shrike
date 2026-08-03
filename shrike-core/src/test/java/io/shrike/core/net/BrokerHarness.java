@@ -40,8 +40,22 @@ final class BrokerHarness {
      */
     static BrokerConfig config(Path dataDirectory, int connectionCap) {
         BrokerConfig defaults = config(dataDirectory);
-        return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(), connectionCap,
-                defaults.readyFilePath(), LogConfig.defaults());
+        return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
+                defaults.maxFetchWaitMs(), connectionCap, defaults.maxTotalPartitions(), defaults.readyFilePath(),
+                LogConfig.defaults());
+    }
+
+    /**
+     * @param dataDirectory      the test's temporary directory
+     * @param maxTotalPartitions the partition budget this broker enforces
+     * @return the same configuration with a budget a test can reach without creating a thousand
+     *         partitions
+     */
+    static BrokerConfig configWithPartitionBudget(Path dataDirectory, int maxTotalPartitions) {
+        BrokerConfig defaults = config(dataDirectory);
+        return new BrokerConfig(defaults.dataDirectory(), defaults.port(), defaults.maxRequestBytes(),
+                defaults.maxFetchWaitMs(), defaults.connectionCap(), maxTotalPartitions, defaults.readyFilePath(),
+                LogConfig.defaults());
     }
 
     /**

@@ -10,7 +10,7 @@ import java.util.Optional;
  * <p>The number of partitions is the size of the list and cannot be anything else, which is how this
  * type says that a topic's partition count never changes after it is created.
  *
- * @param name       the topic name, already checked as a {@link io.shrike.core.protocol.SafeName}
+ * @param name       the topic name, already checked as a {@link io.shrike.core.log.SafeName}
  * @param partitions partition 0 first, one entry per partition
  */
 record Topic(String name, List<Partition> partitions) {

@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -55,7 +56,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p><strong>Binding.</strong> The listener binds the loopback interface. This build has no
  * authentication and no transport security, so the port it listens on is a port anything that can
  * reach it may write to; a bind address belongs in the same slice as whatever makes exposing it
- * defensible.
+ * defensible. There is no server-side read or idle timeout either — {@code SO_TIMEOUT} does not bound
+ * a {@code SocketChannel} read — so a connection that opens and then says nothing holds its slot until
+ * it is closed. The loopback bind and {@link BrokerConfig#connectionCap()} are what bound that today,
+ * and a reaper rides with the slice that makes the bind address configurable.
  */
 public final class ShrikeBroker implements AutoCloseable {
 
@@ -70,12 +74,13 @@ public final class ShrikeBroker implements AutoCloseable {
     private static final long STOP_TIMEOUT_MILLIS = 10_000L;
 
     /**
-     * How many accepts may fail in a row before the acceptor gives up. An accept that fails for a
+     * How long the acceptor waits on the stop signal after an accept fails. An accept that fails for a
      * reason other than the socket closing — the process is out of file descriptors, say — would
-     * otherwise fail again immediately, and a loop that logs as fast as it can is worse than a broker
-     * that stops taking new connections and says so.
+     * otherwise fail again immediately, and a loop that logs as fast as it can is its own outage. This
+     * is not a sleep for coordination: it is a bounded wait whose predicate is "this broker is
+     * stopping", so a shutdown during a backoff ends the acceptor at once rather than after it.
      */
-    private static final int ACCEPT_FAILURE_LIMIT = 16;
+    private static final long ACCEPT_BACKOFF_MILLIS = 100L;
 
     private final BrokerConfig config;
     private final ServerSocketChannel serverChannel;
@@ -89,6 +94,13 @@ public final class ShrikeBroker implements AutoCloseable {
      * rather than a volatile field because stopping must happen once even if two threads ask for it.
      */
     private final AtomicBoolean stopping = new AtomicBoolean();
+
+    /**
+     * Counted down once, by {@link #close()}, immediately after {@link #stopping} is set. It is what a
+     * backing-off acceptor waits on, so the wait ends the moment the predicate it is about becomes true
+     * instead of when its timeout runs out.
+     */
+    private final CountDownLatch stopSignal = new CountDownLatch(1);
 
     /**
      * The connections being served, and the thread serving each. The acceptor is the only thread that
@@ -145,8 +157,7 @@ public final class ShrikeBroker implements AutoCloseable {
             throw new ShrikeIOException("cannot create the data directory " + dataDirectory, e);
         }
 
-        TopicRegistry topics = TopicRegistry.open(dataDirectory, timeSource, config.logConfig(),
-                config.maxRequestBytes());
+        TopicRegistry topics = TopicRegistry.open(config, timeSource);
         ShrikeBroker broker;
         try {
             GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory);
@@ -189,6 +200,7 @@ public final class ShrikeBroker implements AutoCloseable {
         if (!stopping.compareAndSet(false, true)) {
             return;
         }
+        stopSignal.countDown();
 
         closeQuietly(serverChannel, "the listening socket");
         joinBounded(acceptor, STOP_TIMEOUT_MILLIS);
@@ -246,28 +258,48 @@ public final class ShrikeBroker implements AutoCloseable {
     /**
      * The one thing {@code shrike-acceptor} does. It never reads a byte and never waits on a
      * connection: a socket it accepts is either handed to a thread of its own or closed on the spot.
+     *
+     * <p>An accept that fails while this broker is running is treated as the transient thing it usually
+     * is — the process is out of file descriptors, a connection was reset between the kernel's queue and
+     * this call — so the acceptor backs off and tries again rather than counting failures towards a
+     * number that ends it. Exhausting descriptors is a condition that clears on its own as connections
+     * close, and an acceptor that had given up would turn it into an outage that lasts until somebody
+     * restarts the broker. The loop ends when the broker is stopping, and only then.
      */
     private void acceptConnections() {
-        int consecutiveFailures = 0;
+        long consecutiveFailures = 0L;
         while (!stopping.get()) {
             SocketChannel socket;
             try {
                 socket = serverChannel.accept();
-                consecutiveFailures = 0;
+                consecutiveFailures = 0L;
             } catch (ClosedChannelException e) {
                 return;
             } catch (IOException e) {
-                consecutiveFailures++;
-                if (consecutiveFailures >= ACCEPT_FAILURE_LIMIT) {
-                    LOGGER.log(System.Logger.Level.ERROR, ACCEPTOR_THREAD_NAME + " gave up after "
-                            + consecutiveFailures + " accepts in a row failed; this broker serves the connections it"
-                            + " has and takes no more", e);
+                if (stopping.get()) {
                     return;
                 }
-                LOGGER.log(System.Logger.Level.WARNING, ACCEPTOR_THREAD_NAME + " could not accept a connection", e);
+                consecutiveFailures++;
+                LOGGER.log(System.Logger.Level.WARNING, ACCEPTOR_THREAD_NAME + " could not accept a connection ("
+                        + consecutiveFailures + " in a row), so it waits " + ACCEPT_BACKOFF_MILLIS
+                        + "ms and accepts again", e);
+                awaitStopFor(ACCEPT_BACKOFF_MILLIS);
                 continue;
             }
             serveOrClose(socket);
+        }
+    }
+
+    /**
+     * Waits for this broker to start stopping, for at most {@code timeoutMillis}. The predicate is the
+     * stop signal itself, so this returns immediately once {@link #close()} has begun.
+     */
+    private void awaitStopFor(long timeoutMillis) {
+        try {
+            stopSignal.await(timeoutMillis, MILLISECONDS);
+        } catch (InterruptedException e) {
+            // Somebody wants this thread to stop waiting. Stop waiting, and leave the flag for them.
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -308,8 +340,39 @@ public final class ShrikeBroker implements AutoCloseable {
                 openConnectionCount.decrementAndGet();
             }
         }, name);
+
+        // Registered before the check, not after it, and that order is the whole guard. close() sets
+        // stopping before it walks this map, so a close that walked the map without seeing this entry
+        // had not set stopping yet when it walked — and then this read sees it. One of the two closes
+        // the connection, and neither can leave it open with nobody left to close it.
         openConnections.put(connection, thread);
-        thread.start();
+        if (stopping.get()) {
+            abandon(connection);
+            return;
+        }
+
+        try {
+            thread.start();
+        } catch (Throwable e) {
+            // A thread that could not start is the pressure case this unwinding exists for: out of
+            // native threads, the moment a slot and a socket are worth most. The reservation and the
+            // map entry are given back here rather than in the thread body that will never run.
+            LOGGER.log(System.Logger.Level.WARNING, name + " could not be started, so it was closed", e);
+            abandon(connection);
+            throw e;
+        }
+    }
+
+    /**
+     * Gives back everything {@link #serveOrClose(SocketChannel)} took for a connection that will not be
+     * served: its map entry, its place under the cap, and its socket. It runs at most once per
+     * connection, because the thread that would otherwise give those back either never started or is
+     * not going to.
+     */
+    private void abandon(Connection connection) {
+        openConnections.remove(connection);
+        openConnectionCount.decrementAndGet();
+        connection.close();
     }
 
     /**

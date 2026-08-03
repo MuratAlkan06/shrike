@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.shrike.core.log.DurableFile;
 import io.shrike.core.log.ShrikeIOException;
@@ -13,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.OptionalLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -106,6 +108,65 @@ class GroupOffsetStoreTest {
 
         assertTrue(refused.getMessage().contains(GroupOffsetStore.VERSION_HEADER),
                 "committed offsets are not something to guess at: an unreadable file fails the start");
+    }
+
+    /**
+     * A group id is a file name, so two ids that differ only in case are one group here — the way they
+     * are one file on APFS and on Windows. If they were two groups, the second one's whole-file rewrite
+     * would replace the first one's committed offsets with its own on any filesystem that folds case.
+     *
+     * <p>Nothing here asks the filesystem anything: the store is asked what it holds.
+     */
+    @Test
+    void keepsOneSetOfCommittedOffsetsForGroupIdsThatDifferOnlyInCase() {
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        store.commit(GROUP, TOPIC, 0, 5L);
+        store.commit(GROUP.toUpperCase(Locale.ROOT), TOPIC, 1, 7L);
+
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory);
+
+        assertEquals(OptionalLong.of(5L), reopened.committedOffset(GROUP, TOPIC, 0),
+                "the second casing committed a second partition, it did not replace the file of the first");
+        assertEquals(OptionalLong.of(7L), reopened.committedOffset(GROUP, TOPIC, 1));
+        assertEquals(OptionalLong.of(5L), reopened.committedOffset("ReAdErS", TOPIC, 0),
+                "and every casing asks about the same group");
+    }
+
+    /**
+     * A topic name is folded for the same reason a group id is: the broker holds one topic per folded
+     * name, so a commit and the fetch that follows it must agree about which key they mean.
+     */
+    @Test
+    void keepsOneCommittedOffsetForTopicNamesThatDifferOnlyInCase() {
+        GroupOffsetStore store = GroupOffsetStore.open(dataDirectory);
+        store.commit(GROUP, TOPIC, 0, 5L);
+        store.commit(GROUP, TOPIC.toUpperCase(Locale.ROOT), 0, 9L);
+
+        GroupOffsetStore reopened = GroupOffsetStore.open(dataDirectory);
+
+        assertEquals(OptionalLong.of(9L), reopened.committedOffset(GROUP, TOPIC, 0),
+                "the second commit replaced the first rather than becoming a second key");
+    }
+
+    /**
+     * Two files that name one group are state this build never writes and cannot act on, so the open
+     * says so instead of picking one. The pair can only exist on a filesystem that keeps two casings
+     * apart, which is why the test asks whether it got two files before asserting anything — and asserts
+     * only the refusal, never what the directory did.
+     */
+    @Test
+    void refusesToOpenTwoGroupFilesThatDifferOnlyInCase() throws IOException {
+        Path groups = Files.createDirectories(dataDirectory.resolve(GroupOffsetStore.DIRECTORY_NAME));
+        Path folded = groups.resolve(GROUP + GroupOffsetStore.FILE_SUFFIX);
+        Path shouted = groups.resolve(GROUP.toUpperCase(Locale.ROOT) + GroupOffsetStore.FILE_SUFFIX);
+        Files.writeString(folded, GroupOffsetStore.VERSION_HEADER + "\n" + TOPIC + " 0 5\n", UTF_8);
+        Files.writeString(shouted, GroupOffsetStore.VERSION_HEADER + "\n" + TOPIC + " 0 9\n", UTF_8);
+        assumeTrue(Files.readString(folded, UTF_8).endsWith("0 5\n"),
+                "this filesystem folds file names, so one group can never have two files on it");
+
+        ShrikeIOException refused = assertThrows(ShrikeIOException.class, () -> GroupOffsetStore.open(dataDirectory));
+
+        assertTrue(refused.getMessage().contains("differ only in case"), refused.getMessage());
     }
 
     @Test

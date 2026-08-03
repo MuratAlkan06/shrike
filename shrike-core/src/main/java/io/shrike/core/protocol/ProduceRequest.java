@@ -1,6 +1,7 @@
 package io.shrike.core.protocol;
 
 import io.shrike.core.log.ProducedRecord;
+import io.shrike.core.log.SafeName;
 import java.util.List;
 import java.util.Objects;
 

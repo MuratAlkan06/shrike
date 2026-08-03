@@ -1,5 +1,7 @@
 package io.shrike.core.protocol;
 
+import io.shrike.core.log.SafeName;
+
 /**
  * Create a topic with a fixed number of partitions.
  *

@@ -40,9 +40,6 @@ import java.util.regex.Pattern;
  */
 public final class SegmentedLog implements Log, LogStatistics {
 
-    /** Topics name a directory under the data directory, so their characters are restricted. */
-    private static final Pattern LEGAL_TOPIC = Pattern.compile("[a-zA-Z0-9._-]{1,249}");
-
     /** The name of a segment's log file: its base offset, zero-padded to 20 digits. */
     private static final Pattern SEGMENT_LOG_FILE_NAME = Pattern.compile("(\\d{20})\\.log");
 
@@ -98,8 +95,9 @@ public final class SegmentedLog implements Log, LogStatistics {
      * @param timeSource    the clock that stamps appended records
      * @param config        the record, segment, and index sizes to open with
      * @return the open, recovered log
-     * @throws IllegalArgumentException if the topic could name something other than one directory, or
-     *                                  if the partition is negative
+     * @throws IllegalArgumentException if the topic is not a {@link SafeName}, so that it could name
+     *                                  something other than one directory, or if the partition is
+     *                                  negative
      * @throws ShrikeIOException        if the directory or its segments cannot be opened
      */
     public static SegmentedLog open(Path dataDirectory, String topic, int partition, TimeSource timeSource,
@@ -108,10 +106,10 @@ public final class SegmentedLog implements Log, LogStatistics {
         Objects.requireNonNull(topic, "topic");
         Objects.requireNonNull(timeSource, "timeSource");
         Objects.requireNonNull(config, "config");
-        if (!LEGAL_TOPIC.matcher(topic).matches() || ".".equals(topic) || "..".equals(topic)) {
-            throw new IllegalArgumentException("topic must match " + LEGAL_TOPIC.pattern()
-                    + " so that it names one directory inside the data directory, but was: " + topic);
-        }
+        // The one name rule, the same one the protocol applies: a topic names a directory inside the
+        // data directory, and a second, looser copy of that rule here would be a second chance to be
+        // more generous than the check a request already passed.
+        SafeName.require(topic, "topic");
         if (partition < 0) {
             throw new IllegalArgumentException("partition must not be negative, but was " + partition);
         }

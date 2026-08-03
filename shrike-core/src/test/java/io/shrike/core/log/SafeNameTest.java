@@ -1,4 +1,4 @@
-package io.shrike.core.protocol;
+package io.shrike.core.log;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;

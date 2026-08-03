@@ -1,5 +1,7 @@
 package io.shrike.core.protocol;
 
+import io.shrike.core.log.SafeName;
+
 /**
  * Store one group's committed offset for one partition.
  *

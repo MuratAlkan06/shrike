@@ -24,7 +24,7 @@ import java.util.Optional;
  * block for as long as its caller asked without a socket loop having to know it did.
  *
  * <p>Every topic name and group id that reaches this class has already been through
- * {@link io.shrike.core.protocol.SafeName}, so quoting one in a message cannot forge a log line and
+ * {@link io.shrike.core.log.SafeName}, so quoting one in a message cannot forge a log line and
  * cannot name a path outside the data directory.
  *
  * <p>The error codes are chosen once, here:
@@ -40,9 +40,10 @@ import java.util.Optional;
  *       {@code max.record.bytes}. Checked for every record of a request before any of them is
  *       appended, so a request with one oversized record stores none of them.
  *   <li>{@link ErrorCode#INVALID_REQUEST} — a negative offset to commit, which the wire format allows
- *       and this broker does not.
+ *       and this broker does not, or a create that would push this broker past the partitions it may
+ *       hold open.
  *   <li>{@link ErrorCode#TOPIC_ALREADY_EXISTS} — a repeat create, whatever partition count it asks
- *       for.
+ *       for, including one whose name differs from an existing topic's only in case.
  * </ul>
  *
  * <p>Anything else that goes wrong is not answered here: it leaves as an exception, and the connection
@@ -130,6 +131,8 @@ final class RequestDispatcher {
             return new Answer.Served(new CreateTopicResponse());
         } catch (TopicAlreadyExistsException e) {
             return new Answer.Refused(ErrorCode.TOPIC_ALREADY_EXISTS, e.getMessage());
+        } catch (TooManyPartitionsException e) {
+            return new Answer.Refused(ErrorCode.INVALID_REQUEST, e.getMessage());
         }
     }
 
