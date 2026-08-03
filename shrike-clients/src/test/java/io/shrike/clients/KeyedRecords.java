@@ -1,5 +1,7 @@
 package io.shrike.clients;
 
+import java.util.zip.CRC32C;
+
 /**
  * The records the process flow sends, named by the index they were sent under.
  *
@@ -36,5 +38,17 @@ final class KeyedRecords {
      */
     static int partitionOf(int index, int partitionCount) {
         return index % partitionCount;
+    }
+
+    /**
+     * @param value a record's payload
+     * @return the CRC32C of those bytes, in hex. It is what a producer process and a consumer process
+     *         each write down about a record they handled, so a test can tell that the bytes one
+     *         processed are the bytes the other sent without either of them quoting the payload
+     */
+    static String checksumOf(byte[] value) {
+        CRC32C checksum = new CRC32C();
+        checksum.update(value, 0, value.length);
+        return "%08x".formatted((int) checksum.getValue());
     }
 }

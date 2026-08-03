@@ -1,12 +1,14 @@
 package io.shrike.clients;
 
 import io.shrike.core.log.MalformedFrameException;
+import io.shrike.core.log.StoredRecord;
 import io.shrike.core.protocol.CommitOffsetRequest;
 import io.shrike.core.protocol.CommitOffsetResponse;
 import io.shrike.core.protocol.FetchRequest;
 import io.shrike.core.protocol.FetchResponse;
 import io.shrike.core.protocol.WireRecords;
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -16,8 +18,12 @@ import java.util.Objects;
  * and a consumer owns the connection it was built with.
  *
  * <p>There is no group membership and no rebalancing in this build. A consumer names the partition it
- * reads and the group it commits under, and deciding which consumer reads which partition is the
- * caller's business.
+ * reads and the group it commits under; which partitions a member of a group reads is decided by
+ * arithmetic on this side of the wire, in {@link GroupAssignment}, and the broker is told nothing
+ * about it.
+ *
+ * <p>{@link #processThenCommit} is how a group makes progress at-least-once: records are handed to a
+ * {@link RecordHandler} and the offset is committed only after that handler has returned.
  */
 public final class ShrikeConsumer implements AutoCloseable {
 
@@ -103,6 +109,56 @@ public final class ShrikeConsumer implements AutoCloseable {
      */
     public void commitOffset(String groupId, String topic, int partition, long offset) {
         connection.call(new CommitOffsetRequest(groupId, topic, partition, offset), CommitOffsetResponse.class);
+    }
+
+    /**
+     * Hands records to a handler and commits where to read next only once that handler has returned.
+     *
+     * <p><strong>The order is the promise.</strong> The handler runs first and the commit follows it,
+     * so a member that dies in between has committed nothing for those records and its replacement
+     * reads them again. That is at-least-once delivery: duplicates are possible, and no record is lost.
+     * A handler that throws is not caught here — the exception reaches the caller with nothing
+     * committed, which is the same position a crash would have left the group in.
+     *
+     * <p>The records are usually the ones {@link #fetch} just answered with, or a leading part of them:
+     * handing over fewer than were fetched is how a caller commits every so many records rather than
+     * once per fetch. Records that were never handed over are simply read again next time, because the
+     * offset committed is one past the last record in this call.
+     *
+     * <p>Nothing is committed for an empty list. There is nothing to process, so there is no progress
+     * to store, and rewriting the group's file with the number it already holds is a durable write
+     * bought for nothing.
+     *
+     * @param groupId     the consumer group committing
+     * @param topic       the topic these records came from
+     * @param partition   the partition of that topic
+     * @param fetchOffset the offset these records were read from, which is what is returned when there
+     *                    are none
+     * @param records     the records to process, in ascending offset order, possibly none
+     * @param handler     what processes them
+     * @return the offset to read next, which is what was committed
+     * @throws BrokerErrorException if the broker refused the commit; the handler has already run
+     */
+    public long processThenCommit(String groupId, String topic, int partition, long fetchOffset,
+                                  List<StoredRecord> records, RecordHandler handler) {
+        Objects.requireNonNull(groupId, "groupId");
+        Objects.requireNonNull(topic, "topic");
+        Objects.requireNonNull(records, "records");
+        Objects.requireNonNull(handler, "handler");
+        if (fetchOffset < 0) {
+            throw new IllegalArgumentException("fetchOffset must not be negative, but was " + fetchOffset);
+        }
+        if (records.isEmpty()) {
+            return fetchOffset;
+        }
+
+        handler.process(partition, records);
+
+        // A committed offset is the next offset to read, which is one past the last record processed —
+        // the same number FetchedRecords#nextOffset answers with.
+        long nextOffset = records.get(records.size() - 1).offset() + 1;
+        commitOffset(groupId, topic, partition, nextOffset);
+        return nextOffset;
     }
 
     /**

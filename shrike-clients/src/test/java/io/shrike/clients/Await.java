@@ -9,8 +9,10 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.function.Supplier;
 
 /**
  * Bounded waits for tests that have to wait on another operating-system process, so that a test which
@@ -56,6 +58,53 @@ final class Await {
         }
         return fail("the broker did not write " + readyFilePath + " within " + TIMEOUT_SECONDS + "s. Its output"
                 + " was:\n" + broker.output());
+    }
+
+    /**
+     * Waits for a line to appear in a file another process is appending to.
+     *
+     * <p>It is how a test follows another process by what that process has already forced to the
+     * device rather than by how long it has been running: the line is there, so the work behind it is
+     * done, whatever the machine's load was. Nothing here asserts how long that took.
+     *
+     * @param file        the file that process is appending to, which need not exist yet
+     * @param line        the line to wait for, matched whole
+     * @param writer      the process writing it, so a process that died is a failure now rather than at
+     *                    the deadline
+     * @param diagnostics what to print when the wait gives up — the state a reader would need to tell
+     *                    what happened instead
+     */
+    static void lineInFile(Path file, String line, JavaProcess writer, Supplier<String> diagnostics) {
+        long deadlineNanos = System.nanoTime() + SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadlineNanos) {
+            if (!writer.isAlive()) {
+                fail(writer.name() + " ended with exit code " + writer.exitCode() + " before it wrote \"" + line
+                        + "\" to " + file + ". Its output was:\n" + writer.output() + "\n" + diagnostics.get());
+                return;
+            }
+            if (linesOf(file).contains(line)) {
+                return;
+            }
+            pause();
+        }
+        fail("\"" + line + "\" did not appear in " + file + " within " + TIMEOUT_SECONDS + "s. The output of "
+                + writer.name() + " was:\n" + writer.output() + "\n" + diagnostics.get());
+    }
+
+    /**
+     * @param file a file another process is appending to
+     * @return its lines, or none when it is not there yet. A file being appended to may end mid-line,
+     *         which costs nothing here: a partial line matches no whole line, so the next look sees it
+     */
+    private static List<String> linesOf(Path file) {
+        if (!Files.exists(file)) {
+            return List.of();
+        }
+        try {
+            return Files.readAllLines(file);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot read " + file, e);
+        }
     }
 
     /**
