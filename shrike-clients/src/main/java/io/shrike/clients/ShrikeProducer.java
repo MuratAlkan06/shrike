@@ -41,15 +41,19 @@ public final class ShrikeProducer implements AutoCloseable {
     }
 
     /**
-     * Appends one record to the end of one partition.
+     * Appends one record to the end of the partition the caller names.
+     *
+     * <p>The partition the caller names is the partition the record goes to, whatever its key would
+     * have routed to: naming one is how a caller that already knows where a record belongs says so.
+     * {@link #send(String, PartitionRouter, byte[], byte[])} is the other half of that rule.
      *
      * @param topic     the topic to append to
-     * @param partition the partition of that topic; which partition a key belongs to is the caller's
-     *                  decision, because this build has no partitioner and no rebalancing
+     * @param partition the partition of that topic
      * @param key       the record key, or {@code null} for a record with no key. An empty array is a
      *                  key of zero bytes and stays distinct from {@code null} on disk
      * @param value     the payload, which is never {@code null}
-     * @return the offset the record was appended at
+     * @return the offset the record was appended at, which is the only half of its name the caller
+     *         does not already hold
      * @throws BrokerErrorException if the broker refused the append — an unknown topic or partition,
      *                              or a record larger than it will store
      */
@@ -58,6 +62,28 @@ public final class ShrikeProducer implements AutoCloseable {
 
         ProduceRequest request = new ProduceRequest(topic, partition, List.of(new ProducedRecord(key, value)));
         return connection.call(request, ProduceResponse.class).baseOffset();
+    }
+
+    /**
+     * Appends one record to the partition a {@link PartitionRouter} picks for it: the partition its key
+     * hashes to, or the next partition in turn when it has no key.
+     *
+     * <p>Routing happens here rather than on the broker — the produce request on the wire carries an
+     * explicit partition either way, and this is the client deciding which one to put in it.
+     *
+     * @param topic      the topic to append to
+     * @param partitions the router deciding which partition this record belongs to
+     * @param key        the record key, or {@code null} for a record with no key
+     * @param value      the payload, which is never {@code null}
+     * @return the partition the record was routed to and the offset it was appended at
+     * @throws BrokerErrorException if the broker refused the append — an unknown topic or partition,
+     *                              or a record larger than it will store
+     */
+    public SentRecord send(String topic, PartitionRouter partitions, byte[] key, byte[] value) {
+        Objects.requireNonNull(partitions, "partitions");
+
+        int partition = partitions.partitionFor(key);
+        return new SentRecord(partition, send(topic, partition, key, value));
     }
 
     /**
