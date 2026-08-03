@@ -67,13 +67,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * been forced and atomically moved into place. None of this is a statement about delivery, which is
  * at-least-once whichever mode this broker runs in.
  *
- * <p><strong>Binding.</strong> The listener binds the loopback interface. This build has no
- * authentication and no transport security, so the port it listens on is a port anything that can
- * reach it may write to; a bind address belongs in the same slice as whatever makes exposing it
- * defensible. There is no server-side read or idle timeout either — {@code SO_TIMEOUT} does not bound
- * a {@code SocketChannel} read — so a connection that opens and then says nothing holds its slot until
- * it is closed. The loopback bind and {@link BrokerConfig#connectionCap()} are what bound that today,
- * and a reaper rides with the slice that makes the bind address configurable.
+ * <p><strong>Binding.</strong> {@link #start(BrokerConfig, TimeSource)} binds the loopback interface,
+ * and {@link #start(BrokerConfig, TimeSource, InetAddress)} binds the address it is handed — the only
+ * way this broker comes to listen anywhere else. This build has no authentication and no transport
+ * security, so a port it listens on past loopback is a port anything that can reach it may write to,
+ * and a caller that names a wider address is saying it has arranged that reachability itself. There is
+ * no server-side read or idle timeout either — {@code SO_TIMEOUT} does not bound a
+ * {@code SocketChannel} read — so a connection that opens and then says nothing holds its slot until
+ * it is closed. {@link BrokerConfig#connectionCap()} is what bounds that today, and a reaper rides
+ * with the slice that brings authentication.
  */
 public final class ShrikeBroker implements AutoCloseable {
 
@@ -175,8 +177,8 @@ public final class ShrikeBroker implements AutoCloseable {
     }
 
     /**
-     * Recovers what is in the data directory, binds the port, starts accepting, and writes the ready
-     * file.
+     * Recovers what is in the data directory, binds the port on the loopback interface, starts
+     * accepting, and writes the ready file.
      *
      * @param config     where things live and how much of them there may be
      * @param timeSource the clock that stamps appended records and bounds every fetch's wait
@@ -185,8 +187,31 @@ public final class ShrikeBroker implements AutoCloseable {
      *                           opened or written
      */
     public static ShrikeBroker start(BrokerConfig config, TimeSource timeSource) {
+        return start(config, timeSource, InetAddress.getLoopbackAddress());
+    }
+
+    /**
+     * The same start, listening on an address the caller names instead of the loopback one.
+     *
+     * <p>Widening the bind has a signature of its own because it is a decision rather than a setting.
+     * Nothing this build ships calls it with anything but loopback except {@link BrokerMain}, and
+     * {@link BrokerMain} does it only when the environment it was started in says so in so many words:
+     * a broker reachable from another host is a broker anything that can reach the port may append to,
+     * since there is no authentication, no authorization, and no transport security here. The case this
+     * exists for is a container, which binds every interface inside a network namespace of its own and
+     * is reached through a port its operator published on purpose.
+     *
+     * @param config      where things live and how much of them there may be
+     * @param timeSource  the clock that stamps appended records and bounds every fetch's wait
+     * @param bindAddress the interface to listen on
+     * @return the running broker, which the caller closes
+     * @throws ShrikeIOException if the data directory, a log, the socket, or the ready file cannot be
+     *                           opened or written
+     */
+    public static ShrikeBroker start(BrokerConfig config, TimeSource timeSource, InetAddress bindAddress) {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(timeSource, "timeSource");
+        Objects.requireNonNull(bindAddress, "bindAddress");
 
         Path dataDirectory = config.dataDirectory();
         try {
@@ -199,7 +224,7 @@ public final class ShrikeBroker implements AutoCloseable {
         ShrikeBroker broker;
         try {
             GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory);
-            ServerSocketChannel serverChannel = bind(config);
+            ServerSocketChannel serverChannel = bind(config, bindAddress);
             broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, timeSource,
                     boundPort(serverChannel));
         } catch (RuntimeException e) {
@@ -217,8 +242,8 @@ public final class ShrikeBroker implements AutoCloseable {
             throw e;
         }
 
-        LOGGER.log(System.Logger.Level.INFO, () -> "shrike is listening on port " + broker.port + ", data directory "
-                + dataDirectory + ", ready file " + config.readyFilePath());
+        LOGGER.log(System.Logger.Level.INFO, () -> "shrike is listening on " + bindAddress.getHostAddress() + " port "
+                + broker.port + ", data directory " + dataDirectory + ", ready file " + config.readyFilePath());
         return broker;
     }
 
@@ -491,19 +516,19 @@ public final class ShrikeBroker implements AutoCloseable {
         }
     }
 
-    private static ServerSocketChannel bind(BrokerConfig config) {
+    private static ServerSocketChannel bind(BrokerConfig config, InetAddress bindAddress) {
         ServerSocketChannel serverChannel = null;
         try {
             serverChannel = ServerSocketChannel.open();
             serverChannel.setOption(StandardSocketOptions.SO_REUSEADDR, Boolean.TRUE);
             // The backlog matches the connection cap: sockets the operating system holds for a broker
             // that is already full are sockets it will only close.
-            serverChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), config.port()),
-                    config.connectionCap());
+            serverChannel.bind(new InetSocketAddress(bindAddress, config.port()), config.connectionCap());
             return serverChannel;
         } catch (IOException e) {
             closeQuietly(serverChannel, "the listening socket");
-            throw new ShrikeIOException("cannot listen on port " + config.port(), e);
+            throw new ShrikeIOException("cannot listen on " + bindAddress.getHostAddress() + " port " + config.port(),
+                    e);
         }
     }
 
