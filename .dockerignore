@@ -1,0 +1,21 @@
+# What the build stage needs is the source and the poms. Everything below is either produced by a
+# build, produced by an editor, or the history itself, and all of it would be copied into the docker
+# daemon before the first instruction ran.
+
+target/
+**/target/
+
+.git/
+.github/
+
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.project
+.classpath
+.settings/
+
+.DS_Store
+Thumbs.db

@@ -160,6 +160,47 @@ Read as times rather than rates, that is 68.3 µs to put the mebibyte on the soc
 **A footnote about what `per-record` was measured under, and it is not a small one.** On macOS, `FileChannel.force()` issues `fsync(2)` rather than `fcntl(F_FULLFSYNC)` (JDK-8080589), so it does not push the drive's cache out to the media. The `per-record` numbers above are therefore weaker-durability numbers than the same benchmark on Linux would produce, and they are measurements of this machine rather than claims about what any other machine does. That cuts one way and the direction is the point: a force that stops at the drive's cache is cheaper than one that reaches the media, so `per-record` here is the optimistic arm, and the distance between the two flush modes above is a lower bound on what a media-durable force would open rather than a flattering one.
 
 And `per-record` is per record, not per produce request. The row above is one `append` and therefore one force; a produce carrying a batch of N records under this mode pays N of them, so a client batching to amortize the network amortizes nothing here.
+## Run it in a container
+
+The image holds a Temurin 21 JRE and one jar, runs as a user that is not root, and keeps everything under `/var/lib/shrike`, which is where its volume goes.
+
+```
+docker build -t shrike:0.1.0 .
+docker run -d --name shrike -p 9750:9750 -v shrike-data:/var/lib/shrike shrike:0.1.0
+```
+
+The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a host port onto the container's own interface and never onto its loopback. The bare broker's default is the loopback address and stays that way: the image opts in, inside a network namespace of its own, and the port it can be reached on is the one its operator published. `SHRIKE_DATA_DIRECTORY`, `SHRIKE_PORT`, and `SHRIKE_READY_FILE` are the other three variables, and `docker run -e` is how any of them changes. `docker stop` is a `SIGTERM`, which the broker answers by closing its logs.
+
+Without a container it is the same entry point, reading the same variables and binding loopback because nothing told it otherwise:
+
+```
+SHRIKE_DATA_DIRECTORY=/var/lib/shrike java -cp shrike-core/target/classes io.shrike.core.net.BrokerMain
+```
+
+That published port is an ordinary broker port. From the host, with `shrike-core` and `shrike-clients` on the classpath — both of which depend on the JDK alone:
+
+```java
+ClientConfig config = ClientConfig.defaults("127.0.0.1", 9750);
+try (ShrikeTopics topics = ShrikeTopics.open(config)) {
+    topics.create("orders", 1);
+}
+try (ShrikeProducer producer = ShrikeProducer.open(config)) {
+    producer.send("orders", 0, "order-1".getBytes(UTF_8), "a record".getBytes(UTF_8));
+}
+try (ShrikeConsumer consumer = ShrikeConsumer.open(config)) {
+    FetchedRecords fetched = consumer.fetch("orders", 0, 0L, 64 * 1024, 0, 0);
+    consumer.commitOffset("billing", "orders", 0, fetched.nextOffset(0L));
+}
+```
+
+The admin facade is not in the image. It runs beside the container and already points at `127.0.0.1:9750`:
+
+```
+java -jar shrike-admin/target/shrike-admin-0.1.0-SNAPSHOT.jar
+curl -s localhost:8080/api/v1/topics
+curl -s localhost:8080/api/v1/topics/orders
+curl -s localhost:8080/api/v1/groups/billing/lag
+```
 
 ## Claims
 
