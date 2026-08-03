@@ -354,7 +354,7 @@ Where it lives is decided by which import would be a cycle. `io.shrike.core.prot
 
 **Refined in Slice 6.** The bind address became nameable, once, by the process that starts the broker — see "The bind address is an argument to a second `start`, and everything else gets loopback" below. What binds by default did not move, and the paragraph on authentication and the idle connection stands as written.
 
-**Decision.** The listener binds `InetAddress.getLoopbackAddress()`. There is no authentication, no authorization, and no transport security, and the bind address is not configurable. There is also no server-side read or idle timeout: a connection that opens and then says nothing holds its slot under the connection cap until it is closed or the broker stops. This entry, the README, and the `ShrikeBroker` class javadoc all say so.
+**Decision.** The listener binds `InetAddress.getLoopbackAddress()`. There is no authentication, no authorization, and no transport security, and the bind address is not configurable — that last clause was true when this entry was written and stopped being true in Slice 6, as the refinement above says; the rest of the paragraph still holds. There is also no server-side read or idle timeout: a connection that opens and then says nothing holds its slot under the connection cap until it is closed or the broker stops. This entry, the README, and the `ShrikeBroker` class javadoc all say so.
 
 **Alternative rejected.** A configurable bind address now, defaulting to loopback. A read timeout implemented with `SO_TIMEOUT`.
 
