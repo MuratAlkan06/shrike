@@ -22,3 +22,4 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 
 | Claim | Evidence | Slice |
 |---|---|---|
+| A short write cannot truncate a write: the log's write path loops until the buffer is drained, even against a channel that accepts one byte per call | `ByteChannelsTest#writesEveryByteWhenTheChannelAcceptsOnlyOneBytePerCall` | 1 |
