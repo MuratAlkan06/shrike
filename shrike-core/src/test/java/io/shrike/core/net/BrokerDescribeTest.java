@@ -3,6 +3,7 @@ package io.shrike.core.net;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.shrike.core.log.LogConfig;
 import io.shrike.core.log.ProducedRecord;
@@ -51,6 +52,9 @@ class BrokerDescribeTest {
 
     /** An entry every byte, so a segment past its first record has an index worth counting. */
     private static final int INDEX_INTERVAL_BYTES = 1;
+
+    /** Everything sealed is retired the moment it is sealed, so one sweep trims to the active segment. */
+    private static final long DELETE_EVERY_SEALED_SEGMENT_MS = 0L;
 
     @TempDir
     Path dataDirectory;
@@ -130,6 +134,40 @@ class BrokerDescribeTest {
             assertEquals(3, partition.segmentCount(), "five records into two-record segments rolled twice");
             assertEquals(bytesOnDisk(dataDirectory.resolve(TOPIC + "-0")), partition.bytes(),
                     "the bytes reported are the log files and the index files of every segment, added up");
+        }
+    }
+
+    @Test
+    void reportsTheOffsetRetentionMovedToBesideACommitThatFellBehindIt() throws IOException {
+        LogConfig smallSegmentsThatRetireAtOnce = new LogConfig(LogConfig.DEFAULT_MAX_RECORD_BYTES,
+                TWO_RECORD_SEGMENT_BYTES, INDEX_INTERVAL_BYTES, DELETE_EVERY_SEALED_SEGMENT_MS,
+                LogConfig.RETENTION_DISABLED);
+
+        try (ShrikeBroker broker = ShrikeBroker.start(BrokerHarness.configWithLogConfig(dataDirectory,
+                smallSegmentsThatRetireAtOnce), BrokerHarness.SYSTEM_CLOCK);
+                WireClient client = WireClient.connectTo(broker)) {
+            client.call(1, new CreateTopicRequest(TOPIC, 1));
+            for (int record = 0; record < 5; record++) {
+                client.call(2 + record, produce(record));
+            }
+            client.call(7, new CommitOffsetRequest(GROUP, TOPIC, 0, 1L));
+            // The same call shrike-retention makes, so the group's commit is now below the offset this
+            // partition starts at: the records it had not read are gone.
+            broker.partition(TOPIC, 0).orElseThrow().deleteRetiredSegments(System.currentTimeMillis());
+
+            PartitionDescription partition = describeTopics(client, new DescribeTopicsRequest(List.of(TOPIC)))
+                    .topics().get(0).partitions().get(0);
+            GroupOffset committed = describeGroup(client, new DescribeGroupRequest(GROUP)).offsets().get(0);
+
+            assertEquals(4L, partition.logStartOffset(), "every sealed segment was retired, so the log starts at 4");
+            assertEquals(5L, partition.highWaterMark(), "retention never touches the mark a fetch is served against");
+            assertEquals(1, partition.segmentCount(), "the segment still taking appends is never deleted");
+            assertEquals(bytesOnDisk(dataDirectory.resolve(TOPIC + "-0")), partition.bytes(),
+                    "the bytes reported are the segments that are left, so the unlinked ones are not counted");
+            assertEquals(1L, committed.committedOffset(),
+                    "the commit stands where the group left it; retention does not rewrite a group's file");
+            assertTrue(committed.committedOffset() < partition.logStartOffset(),
+                    "this group fell behind retention, which is the case the description has to survive");
         }
     }
 

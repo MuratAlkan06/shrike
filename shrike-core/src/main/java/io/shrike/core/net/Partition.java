@@ -454,6 +454,14 @@ final class Partition implements Closeable {
      * snapshot or wholly after it. The lock is held for reads of file sizes the log already knows, so
      * this costs an appending thread the same as any other reader of this partition.
      *
+     * <p>{@link #deleteRetiredSegments(long)} is the reason the pass has to be one pass rather than a
+     * convenience. It takes this same lock from {@code shrike-retention}'s own thread, and it moves the
+     * first and third of these numbers and both byte counts together; a describe that read them one at
+     * a time could see a start offset retention had just advanced beside a high-water mark from before
+     * it, and {@link io.shrike.core.protocol.PartitionDescription} refuses that pair — which would put
+     * an {@link io.shrike.core.protocol.ErrorCode#INTERNAL} on a read-only request anybody may send.
+     * {@code PartitionDescribeRetentionRaceTest} is what holds that shut.
+     *
      * @return the snapshot
      */
     PartitionStatistics statistics() {
