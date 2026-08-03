@@ -107,7 +107,7 @@ Two things this slice added are worth a number rather than an adjective: what `f
 mvn -pl shrike-core -P bench test-compile exec:exec
 ```
 
-**Everything below is a measurement of one machine at one commit.** The harness is commit `b5a3614`, the machine is an Apple M4 Pro with 14 cores and 48 GiB of memory running macOS 15.6.1, and the JVM is the one the toolchain selects:
+**Everything below is a measurement of one machine at one commit.** The harness is commit `b15a687`, the machine is an Apple M4 Pro with 14 cores and 48 GiB of memory running macOS 15.6.1, and the JVM is the one the toolchain selects:
 
 ```
 openjdk version "21.0.7" 2025-04-15 LTS
@@ -115,31 +115,33 @@ OpenJDK Runtime Environment Temurin-21.0.7+6 (build 21.0.7+6-LTS)
 OpenJDK 64-Bit Server VM Temurin-21.0.7+6 (build 21.0.7+6-LTS, mixed mode, sharing)
 ```
 
-Every benchmark ran on one thread, in 2 forks of 3 one-second warmup iterations and 5 one-second measurement iterations, with no JVM arguments of its own. The suite takes about a minute and a half. The raw JMH output is committed exactly as it was written, and it is what the rows below are read from: [`docs/bench/slice-5-flush-and-fetch.json`](docs/bench/slice-5-flush-and-fetch.json).
+Every benchmark ran on one thread, in 2 forks of 3 one-second warmup iterations and 5 one-second measurement iterations, with no JVM arguments of its own. The suite takes about two minutes. The raw JMH output is committed exactly as it was written, and it is what the rows below are read from: [`docs/bench/slice-5-flush-and-fetch.json`](docs/bench/slice-5-flush-and-fetch.json).
 
 **What a flush mode costs an append.** One `SegmentedLog.append` of a 162-byte frame — a 128-byte value and no key — on a log opened with the defaults apart from the mode. The ± is JMH's own 99.9% confidence interval over the ten measured iterations.
 
 | `flush.mode` | Appends per second | p50, closed-loop service time | p99, closed-loop service time | Samples timed |
 |---|---|---|---|---|
-| `per-record` | 247.5 ± 1.4 | 4.00 ms | 11.99 ms | 2 406 |
-| `interval`, 100 ms / 1 MiB | 495 333 ± 165 128 | 0.96 µs | 7.66 µs | 297 453 |
+| `per-record` | 222.1 ± 41.5 | 4.00 ms | 5.97 ms | 2 492 |
+| `interval`, 100 ms / 1 MiB | 485 739 ± 76 685 | 0.96 µs | 3.79 µs | 333 677 |
 
 **Both percentile columns are closed-loop service time, and that phrase is load-bearing.** The harness issues the next append only once the previous one has returned, so nothing ever queues behind anything: these are the times the log took, not the times a client would have waited under an arrival rate the broker does not control. A percentile measured this way understates latency under open load, which is why it is written into the column heading rather than left to be assumed.
 
-The confidence interval on the second row is wide, and that is the measurement rather than noise around it: in that mode the append that crosses `flush.interval.bytes` forces where it stands, and a roll forces and seals a whole 128 MiB segment, so a run that is mostly page-cache writes has rare long appends in it. They are in the same run's tail: p99.9 is 33 µs, p99.99 is 5.3 ms, and the slowest of the 297 453 timed samples was 87 ms.
+The confidence interval on the second row is wide, and that is the measurement rather than noise around it: in that mode the append that crosses `flush.interval.bytes` forces where it stands, and a roll forces and seals a whole 128 MiB segment, so a run that is mostly page-cache writes has rare long appends in it. They are in the same run's tail: p99.9 is 26 µs, p99.99 is 4.3 ms, and the slowest of the 333 677 timed samples was 8.3 ms.
 
-**A sample is not an append.** JMH's `SampleTime` mode times some invocations rather than all of them, and it thins that subset as a run goes on, so the `Samples timed` column counts the appends that were timed and not the appends that were made. The 297 453 on the `interval` row were drawn from several million appends; the 2 406 on the `per-record` row are very nearly every append that run made. Each percentile stands on the count printed beside it.
+The interval on the first row is wide for a different reason, and it is named here rather than smoothed away. The two forks of that trial did not agree: the five measured iterations of the first sustained between 245 and 249 appends a second, and the five of the second sustained between 181 and 213. What a force costs is the device's answer rather than the JVM's, and it changed between the two forks, so 222.1 is a mean across a machine that moved underneath the run and not a rate the run held throughout. The sample arm of the same benchmark is a separate trial and it did not see it: every one of its ten iterations, across both of its forks, averaged between 244.5 and 249.4 appends a second. So the slow fork was something the machine did for a few seconds and not something the mode does, and the honest reading of the first row is a rate that sat near 247 with an excursion in it. The number is published as it was measured, spread and all: a tighter one would have had to come from choosing between runs.
 
-**The two rows do not write the same amount of data, and only one of them rolls a segment.** At the rates in the first column, a `per-record` trial appends about 2 000 records over its three warmup and five measured seconds — some 310 KiB of frames — and never comes near the 128 MiB `segment.bytes`, so it rolls no segment at all. An `interval` trial appends about four million records in the same eight seconds, some 610 MiB, and rolls and seals a segment about every 128 MiB while it does. The roll, and the force that seals a segment, are charged to the `interval` row alone: the `per-record` row contains no roll at all.
+**A sample is not an append.** JMH's `SampleTime` mode times some invocations rather than all of them, and it thins that subset as a run goes on, so the `Samples timed` column counts the appends that were timed and not the appends that were made. The 333 677 on the `interval` row were drawn from several million appends; the 2 492 on the `per-record` row are very nearly every append that run made. Each percentile stands on the count printed beside it.
 
-That tail is a property of a trial of this length rather than a constant of the mode. The percentiles above come from a run that grew one log by hundreds of mebibytes across its warmup and five measured iterations, which is four or five seals and that much writeback for the operating system to do underneath. A shorter trial meets fewer of both and a longer one meets more, so 87 ms is what this trial found rather than a number to plan against.
+**The two rows do not write the same amount of data, and only one of them rolls a segment.** At the rates in the first column, a `per-record` trial appends about 1 800 records over its three warmup and five measured seconds — some 280 KiB of frames — and never comes near the 128 MiB `segment.bytes`, so it rolls no segment at all. An `interval` trial appends about 3.9 million records in the same eight seconds, some 600 MiB, and rolls and seals a segment about every 128 MiB while it does. The roll, and the force that seals a segment, are charged to the `interval` row alone: the `per-record` row contains no roll at all.
+
+That tail is a property of a trial of this length rather than a constant of the mode. The percentiles above come from a run that grew one log by hundreds of mebibytes across its warmup and five measured iterations, which is four or five seals and that much writeback for the operating system to do underneath. A shorter trial meets fewer of both and a longer one meets more, so 8.3 ms is what this trial found rather than a number to plan against.
 
 **What serving a fetch out of the file costs.** One fetch of the same 1 MiB range — 991 frames, 1 048 478 bytes — of the same pre-built log, sent into a connected pair of loopback `SocketChannel`s with a thread reading the other end and discarding it. The two rows are the two calls `fetch.zero.copy` selects between and nothing else.
 
 | Path | Fetches per second | Bytes per second (derived) |
 |---|---|---|
-| `FileChannel.transferTo` out of the segment file | 2 530.8 ± 75.6 | 2 530 MiB/s |
-| read into a buffer, then one `writeFully` | 2 253.0 ± 71.7 | 2 253 MiB/s |
+| `FileChannel.transferTo` out of the segment file | 2 567.3 ± 62.2 | 2 567 MiB/s |
+| read into a buffer, then one `writeFully` | 2 253.5 ± 36.9 | 2 253 MiB/s |
 
 The `Bytes per second` column is derived rather than measured: it is the row beside it multiplied by the 1 048 478-byte range, and it carries that row's ± with it.
 
@@ -147,9 +149,13 @@ Both rows include loopback TCP and the thread draining it. That is deliberate: a
 
 The transfer row also opens a file descriptor on the segment file for every fetch and closes it once the range has been sent, because that is what `SegmentedLog.openRange` does inside the broker; the buffered row reads through the channel the segment already holds. That open and close is what lets a range still be sent after retention has deleted the segment it is in, and it is a cost `fetch.zero.copy=true` pays per fetch, so it sits inside the transfer number rather than beside it.
 
-What the shared sink costs was measured rather than assumed. Writing the same mebibyte into the same loopback pair with no log behind it ran at about 18 600 writes a second on this machine, against the 2 530.8 and 2 253.0 fetches a second above, so neither row is bound by the socket. It is not free either: it is about 13% of each row's time, and both rows pay it. The transfer row served 12.3% more fetches a second than the buffered row on this machine, and taking the shared sink out of both leaves about 14.3%, so the difference in the table understates the difference between the two paths rather than flattering it. That probe was run to bound the sink and is not among the committed results.
+**What the shared sink costs is a third benchmark rather than a sentence.** `FetchPathBenchmark.writeRangeToTheSinkAlone` writes the same 1 048 478 bytes into the same loopback pair with no log behind it — no range located, no file read, no descriptor opened — and it ran at 14 637.6 ± 213.2 writes a second. It is in the same committed JSON as the two rows above and it is deliberately not in the table beside them: it is not a path a fetch can take, it is the floor under both of the paths that are.
 
-**A footnote about what `per-record` was measured under, and it is not a small one.** On macOS, `FileChannel.force()` issues `fsync(2)` rather than `fcntl(F_FULLFSYNC)` (JDK-8080589), so it does not push the drive's cache out to the media. The `per-record` numbers above are therefore weaker-durability numbers than the same benchmark on Linux would produce, and they are measurements of this machine rather than claims about what any other machine does.
+Read as times rather than rates, that is 68.3 µs to put the mebibyte on the socket against 389.5 µs and 443.8 µs to serve it, so neither row is bound by the socket — which is the question the sink was measured to answer. It is not free either: it is 17.5% of the transfer row's time and 15.4% of the buffered row's, and both rows pay it. The transfer row served 13.9% more fetches a second than the buffered row on this machine, and taking the same 68.3 µs off both leaves 16.9%, so the difference in the table understates the difference between the two paths rather than flattering it. Every figure in this paragraph is a reciprocal or a ratio of three scores in that one file and nothing else.
+
+**A footnote about what `per-record` was measured under, and it is not a small one.** On macOS, `FileChannel.force()` issues `fsync(2)` rather than `fcntl(F_FULLFSYNC)` (JDK-8080589), so it does not push the drive's cache out to the media. The `per-record` numbers above are therefore weaker-durability numbers than the same benchmark on Linux would produce, and they are measurements of this machine rather than claims about what any other machine does. That cuts one way and the direction is the point: a force that stops at the drive's cache is cheaper than one that reaches the media, so `per-record` here is the optimistic arm, and the distance between the two flush modes above is a lower bound on what a media-durable force would open rather than a flattering one.
+
+And `per-record` is per record, not per produce request. The row above is one `append` and therefore one force; a produce carrying a batch of N records under this mode pays N of them, so a client batching to amortize the network amortizes nothing here.
 
 ## Claims
 
@@ -239,6 +245,7 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A torn tail written under interval mode, with nothing forced, is truncated to the last whole record at startup, and the recovered log takes the offset after it | `SegmentedLogFlushTest#truncatesATornTailWrittenUnderTheIntervalFlushMode` | 5 |
 | The flush interval runs on a thread named shrike-flush, repeatedly, and closing it ends that thread | `FlushSweepTest#flushesOnItsOwnNamedThreadUntilItIsClosed` | 5 |
 | A log opened without naming a flush policy forces on whichever of 100 milliseconds and 1 MiB comes first | `LogConfigTest#defaultsToFlushingOnWhicheverOfOneHundredMillisecondsAndOneMebibyteComesFirst` | 5 |
-| On the machine, the JVM, and the harness commit named under Benchmarks, appending a 162-byte frame measured 247.5 ± 1.4 appends a second under `flush.mode=per-record` and 495 333 ± 165 128 under `interval` | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
-| On that same machine, commit, and JVM, the closed-loop p99 service time of one append measured 11.99 ms under `per-record` over 2 406 timed samples of about as many appends, and 7.66 µs under `interval` over 297 453 timed samples drawn from several million appends | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
-| On that same machine, commit, and JVM, serving one 1 MiB range into a loopback socket measured 2 530.8 ± 75.6 fetches a second through `FileChannel.transferTo` and 2 253.0 ± 71.7 through a buffered read | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
+| On the machine, the JVM, and the harness commit named under Benchmarks, appending a 162-byte frame measured 222.1 ± 41.5 appends a second under `flush.mode=per-record`, under macOS `fsync(2)` and not `F_FULLFSYNC`, and 485 739 ± 76 685 under `interval` | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
+| On that same machine, commit, and JVM, the closed-loop p99 service time of one append measured 5.97 ms under `per-record`, under macOS `fsync(2)` and not `F_FULLFSYNC`, over 2 492 timed samples of about as many appends, and 3.79 µs under `interval` over 333 677 timed samples drawn from several million appends | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
+| On that same machine, commit, and JVM, serving one 1 MiB range into a loopback socket measured 2 567.3 ± 62.2 fetches a second through `FileChannel.transferTo` and 2 253.5 ± 36.9 through a buffered read | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
+| On that same machine, commit, and JVM, writing the same 1 048 478 bytes into the same loopback socket with no log behind it measured 14 637.6 ± 213.2 writes a second, which is 17.5% of the transfer path's time per fetch and 15.4% of the buffered path's | `docs/bench/slice-5-flush-and-fetch.json` | 5 |

@@ -38,10 +38,10 @@ import org.openjdk.jmh.annotations.Warmup;
  * as they fall inside a running broker's.
  *
  * <p><strong>Only the {@code interval} arm reaches a roll.</strong> At the rates the two modes run
- * at, a {@code per-record} trial appends about two thousand records over its warmup and measured
- * seconds — some 310 KiB of frames — and never comes near the 128 MiB {@code segment.bytes}, so it
- * rolls no segment at all. An {@code interval} trial appends about four million in the same eight
- * seconds, some 610 MiB, and rolls and seals a segment about every 128 MiB while it does. The cost of
+ * at, a {@code per-record} trial appends some eighteen hundred records over its warmup and measured
+ * seconds — about 280 KiB of frames — and never comes near the 128 MiB {@code segment.bytes}, so it
+ * rolls no segment at all. An {@code interval} trial appends nearly four million in the same eight
+ * seconds, some 600 MiB, and rolls and seals a segment about every 128 MiB while it does. The cost of
  * rolling and sealing is therefore charged to the {@code interval} arm alone, and it lands in that
  * arm's tail.
  *
