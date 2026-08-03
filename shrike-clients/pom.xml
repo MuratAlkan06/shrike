@@ -30,6 +30,24 @@
 
   <build>
     <plugins>
+      <!-- The process harness these tests are built on — a child JVM, a ready-file handshake, and a
+           destroy that takes the whole process tree — is the same harness shrike-admin needs to start a
+           broker for its own *IT classes. Attaching the test classes as a second artifact publishes it
+           once instead of copying it, so there is one place where a bounded wait or a cleanup rule can
+           be got wrong. DESIGN.md records the choice. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>attach-the-process-harness</id>
+            <goals>
+              <goal>test-jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
       <!-- The *IT classes start real brokers, producers, and consumers as separate operating-system
            processes, so they run in the integration-test phase against the built artifacts rather
            than beside the unit tests. Surefire ignores an *IT by default; verify is what fails the

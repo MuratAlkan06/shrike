@@ -30,6 +30,7 @@
     <maven-compiler-plugin.version>3.15.0</maven-compiler-plugin.version>
     <maven-enforcer-plugin.version>3.6.3</maven-enforcer-plugin.version>
     <maven-failsafe-plugin.version>3.5.6</maven-failsafe-plugin.version>
+    <maven-jar-plugin.version>3.5.0</maven-jar-plugin.version>
     <maven-surefire-plugin.version>3.5.6</maven-surefire-plugin.version>
     <maven-toolchains-plugin.version>3.3.0</maven-toolchains-plugin.version>
   </properties>
@@ -73,6 +74,13 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-failsafe-plugin</artifactId>
           <version>${maven-failsafe-plugin.version}</version>
+        </plugin>
+        <!-- Pinned because shrike-clients attaches a test-jar, and a plugin whose version the build
+             does not state is a plugin whose behaviour can change without the build changing. -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-jar-plugin</artifactId>
+          <version>${maven-jar-plugin.version}</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
