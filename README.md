@@ -2,7 +2,7 @@
 
 Shrike is a single-node, log-structured message broker written in Java 21. Producers append records to a segmented commit log on one machine's disk, consumers read them back by offset, and delivery is at-least-once: a record may be redelivered after a failure, and no record is silently dropped.
 
-Status: Slice 5 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets, plus a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed. This slice added retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, a `flush.mode` that is either per-record or interval, and JMH benchmarks of what the last two cost on one machine.
+Status: Slice 6 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a `flush.mode` that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker.
 
 ## Non-goals
 
@@ -15,6 +15,71 @@ Status: Slice 5 — a TCP broker with a length-guarded wire protocol, long-polli
 - TLS or auth
 - Kafka wire-protocol compatibility
 - any web UI
+- any admin api that writes: the facade reads a broker and nothing else
+
+## Quickstart
+
+**Build it.** Maven, and a Temurin 21 toolchain registered in `~/.m2/toolchains.xml`: the reactor selects that JDK for `javac` and for every test fork, so what the suite runs on is what a Java 21 user runs.
+
+```
+mvn -B clean verify
+```
+
+**Run the broker.** `SHRIKE_DATA_DIRECTORY` is the one variable with no default, because a default would be a path this build picked rather than one somebody chose:
+
+```
+SHRIKE_DATA_DIRECTORY=/var/lib/shrike java -cp shrike-core/target/classes io.shrike.core.net.BrokerMain
+```
+
+It listens on port 9750, binds the loopback interface, and writes `shrike.ready` — the port it bound and its pid — into the data directory. `SHRIKE_PORT`, `SHRIKE_READY_FILE`, and `SHRIKE_BIND_ADDRESS` are the other three variables, each of which has a default, and the last of them is the only way this broker comes to listen anywhere but loopback.
+
+**Or run it in a container.** The image is the same entry point reading the same four variables, with `SHRIKE_BIND_ADDRESS` set to `0.0.0.0` because a published port never lands on a container's loopback:
+
+```
+docker build -t shrike:0.1.0 .
+docker run -d --name shrike -p 9750:9750 -v shrike-data:/var/lib/shrike shrike:0.1.0
+```
+
+**Produce and consume.** A published port is an ordinary broker port, so this is the same whether the broker is in a container or not. With `shrike-core` and `shrike-clients` on the classpath — both of which depend on the JDK alone:
+
+```java
+ClientConfig config = ClientConfig.defaults("127.0.0.1", 9750);
+try (ShrikeTopics topics = ShrikeTopics.open(config)) {
+    topics.create("orders", 1);
+}
+try (ShrikeProducer producer = ShrikeProducer.open(config)) {
+    producer.send("orders", 0, "order-1".getBytes(UTF_8), "a record".getBytes(UTF_8));
+}
+try (ShrikeConsumer consumer = ShrikeConsumer.open(config)) {
+    FetchedRecords fetched = consumer.fetch("orders", 0, 0L, 64 * 1024, 0, 0);
+    consumer.commitOffset("billing", "orders", 0, fetched.nextOffset(0L));
+}
+```
+
+**Read it back over HTTP.** The admin facade is not in the image. It runs beside the broker and already points at `127.0.0.1:9750`:
+
+```
+java -jar shrike-admin/target/shrike-admin-0.1.0-SNAPSHOT.jar
+curl -s localhost:8080/api/v1/topics
+curl -s localhost:8080/api/v1/topics/orders
+curl -s localhost:8080/api/v1/groups/billing/lag
+```
+
+It binds `127.0.0.1:8080`, and what those three answer with is under [Admin endpoints](#admin-endpoints).
+
+## Architecture
+
+**Three modules, and nothing points back up the chain.** `shrike-core` is the broker itself — the log, the protocol, the group offset store, and the sockets — and it depends on the JDK alone, which `maven-enforcer` fails the build over rather than leaving to a reviewer's memory. `shrike-clients` is the blocking client library; it declares one dependency, `shrike-core`, for the protocol and codec types it names, so it too runs on the JDK alone, and it reaches a broker over TCP and no other way. `shrike-admin` is the read-only HTTP facade and the only module in this build that names Spring: it is a client of a broker that is up, configured with a host and a port and no path at all, so it opens none of the broker's files either.
+
+**Storage is one append-only log per partition.** A partition's records live under `<data dir>/<topic>-<partition>/`, split into segments named for the offset they start at, each with a sparse `.index` beside it holding one entry per `index.interval.bytes` of appended records. A segment rolls when the next record would push it past `segment.bytes`, and it is forced before it is sealed, which is why recovery only ever walks the last one. Appends to a partition go through that partition's own lock — one writer at a time — and readers mutate nothing.
+
+**The protocol is framed, and every length is checked before a byte is allocated.** A request names an api key and a version; an answer carries the correlation id that says which request it belongs to, and an error code. There are six keys, and [Protocol](#protocol) is the table of them.
+
+**Consumer groups are arithmetic, and the arithmetic runs on the client.** A key picks its partition in `shrike-clients`, a member reads the partitions its index owns, and the broker stores nothing about a group but the offsets it committed. Delivery is at-least-once: duplicates are possible after a failure, and no acknowledged record is dropped.
+
+**Lag is computed in the admin facade, not in the broker.** The broker answers what a group committed and what a partition holds; the subtraction happens in `shrike-admin`, which is the only number it publishes that the broker did not say.
+
+Every decision behind those sentences — with the strongest alternative that was rejected, and why — is in DESIGN.md.
 
 ## Protocol
 
@@ -160,47 +225,53 @@ Read as times rather than rates, that is 68.3 µs to put the mebibyte on the soc
 **A footnote about what `per-record` was measured under, and it is not a small one.** On macOS, `FileChannel.force()` issues `fsync(2)` rather than `fcntl(F_FULLFSYNC)` (JDK-8080589), so it does not push the drive's cache out to the media. The `per-record` numbers above are therefore weaker-durability numbers than the same benchmark on Linux would produce, and they are measurements of this machine rather than claims about what any other machine does. That cuts one way and the direction is the point: a force that stops at the drive's cache is cheaper than one that reaches the media, so `per-record` here is the optimistic arm, and the distance between the two flush modes above is a lower bound on what a media-durable force would open rather than a flattering one.
 
 And `per-record` is per record, not per produce request. The row above is one `append` and therefore one force; a produce carrying a batch of N records under this mode pays N of them, so a client batching to amortize the network amortizes nothing here.
-## Run it in a container
 
-The image holds a Temurin 21 JRE and one jar, runs as a user that is not root, and keeps everything under `/var/lib/shrike`, which is where its volume goes.
+## Admin endpoints
 
+`shrike-admin` answers three GETs in JSON by asking a running broker the same questions any other client may ask it. It reads and never writes, it opens no file the broker owns, and it keeps nothing between requests: each call opens a connection, gets its answer, and closes it. It serves `127.0.0.1:8080` and reads a broker at `127.0.0.1:9750` unless `server.address`, `server.port`, `shrike.broker.host`, and `shrike.broker.port` say otherwise.
+
+The bodies below came off a broker holding two topics — `orders` with three partitions and `shipments` with two — carrying five records in `orders-0`, two in `orders-1`, three in `shipments-0`, and a group `watchers` that had committed 2, 2, and 1 against them. `AdminFacadeIT` pins the same three bodies whole, against a broker in a process of its own.
+
+`GET /api/v1/topics` — every topic the broker holds, in the order the broker lists them. A broker holding none answers `{"topics":[]}` with status 200, because an empty broker is a truth rather than a failure.
+
+```json
+{"topics":[{"name":"orders","partitionCount":3},{"name":"shipments","partitionCount":2}]}
 ```
-docker build -t shrike:0.1.0 .
-docker run -d --name shrike -p 9750:9750 -v shrike-data:/var/lib/shrike shrike:0.1.0
+
+`GET /api/v1/topics/{topic}` — one topic, a line per partition. `logStartOffset` and `highWaterMark` count records and `bytes` counts bytes: what the partition can serve is the half-open range `[logStartOffset, highWaterMark)`, so a partition holding nothing reports the same number twice, and `bytes` is that partition's log files and index files added together. The name that comes back is the folded one that is a topic's identity, whatever casing the path was spelled in.
+
+```json
+{"name":"orders","partitions":[{"partition":0,"logStartOffset":0,"highWaterMark":5,"segmentCount":1,"bytes":220},{"partition":1,"logStartOffset":0,"highWaterMark":2,"segmentCount":1,"bytes":88},{"partition":2,"logStartOffset":0,"highWaterMark":0,"segmentCount":1,"bytes":0}]}
 ```
+
+`GET /api/v1/groups/{group}/lag` — one row per partition that group has committed an offset for, topic and then partition. `lag` is `highWaterMark - committedOffset`, and it is subtracted here rather than by the broker. `committedOffset` is the next offset the group should read, so a group that has read a partition to its end has a lag of 0 rather than 1. The group is asked about before the topics are, which is what keeps a lag from coming out negative; one that did anyway would be refused rather than published.
+
+```json
+{"group":"watchers","partitions":[{"topic":"orders","partition":0,"committedOffset":2,"highWaterMark":5,"lag":3},{"topic":"orders","partition":1,"committedOffset":2,"highWaterMark":2,"lag":0},{"topic":"shipments","partition":0,"committedOffset":1,"highWaterMark":3,"lag":2}]}
+```
+
+**Every failure is one shape:** `{"error":"<one sentence>"}`, and nothing else. No stack trace, no exception class name, and no path on anybody's disk reaches a caller; what actually failed is logged by the facade, where an operator can read it.
+
+| Status | When | The sentence |
+|---|---|---|
+| 400 | a topic name or group id the protocol will not carry, refused before anything is asked of the broker | `topic must be 1 to 200 characters of [A-Za-z0-9._-] and neither "." nor "..", but was "orders!"` |
+| 404 | a topic the broker does not hold | `no such topic` |
+| 404 | a group that has committed nothing, which is also what a group this broker has never heard of looks like | `group has no committed offsets: nobody` |
+| 404 | a path this facade does not serve | `no such endpoint` |
+| 405 | a method it does not answer, every endpoint here being a read | `this facade answers GET only` |
+| 502 | something answered on the broker's port with bytes this client will not believe | `broker answer could not be read` |
+| 503 | a broker that cannot be reached, or does not answer in time | `broker unreachable` |
+| 500 | anything else, which is a bug in the facade | `internal error` |
+
+The 400 sentence names the field the name arrived in — `topic` on a topic path, `groupId` on a group path — and quotes the caller's own input back, cut down when it is long. That quotation is the only detail any error body here carries, and it is the caller's, not the broker's.
+
+## The container image
+
+The image holds a Temurin 21 JRE and one jar, runs as a user that is not root, and keeps everything under `/var/lib/shrike`, which is where its volume goes. The two commands that build it and start it are in the [quickstart](#quickstart) above.
 
 The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a host port onto the container's own interface and never onto its loopback. The bare broker's default is the loopback address and stays that way: the image opts in, inside a network namespace of its own, and the port it can be reached on is the one its operator published. `SHRIKE_DATA_DIRECTORY`, `SHRIKE_PORT`, and `SHRIKE_READY_FILE` are the other three variables, and `docker run -e` is how any of them changes. `docker stop` is a `SIGTERM`, which the broker answers by closing its logs.
 
-Without a container it is the same entry point, reading the same variables and binding loopback because nothing told it otherwise:
-
-```
-SHRIKE_DATA_DIRECTORY=/var/lib/shrike java -cp shrike-core/target/classes io.shrike.core.net.BrokerMain
-```
-
-That published port is an ordinary broker port. From the host, with `shrike-core` and `shrike-clients` on the classpath — both of which depend on the JDK alone:
-
-```java
-ClientConfig config = ClientConfig.defaults("127.0.0.1", 9750);
-try (ShrikeTopics topics = ShrikeTopics.open(config)) {
-    topics.create("orders", 1);
-}
-try (ShrikeProducer producer = ShrikeProducer.open(config)) {
-    producer.send("orders", 0, "order-1".getBytes(UTF_8), "a record".getBytes(UTF_8));
-}
-try (ShrikeConsumer consumer = ShrikeConsumer.open(config)) {
-    FetchedRecords fetched = consumer.fetch("orders", 0, 0L, 64 * 1024, 0, 0);
-    consumer.commitOffset("billing", "orders", 0, fetched.nextOffset(0L));
-}
-```
-
-The admin facade is not in the image. It runs beside the container and already points at `127.0.0.1:9750`:
-
-```
-java -jar shrike-admin/target/shrike-admin-0.1.0-SNAPSHOT.jar
-curl -s localhost:8080/api/v1/topics
-curl -s localhost:8080/api/v1/topics/orders
-curl -s localhost:8080/api/v1/groups/billing/lag
-```
+That published port is an ordinary broker port, which the client code in the quickstart talks to unchanged. The admin facade is not in the image: it is an HTTP server of its own, and it runs beside the container.
 
 ## Claims
 
