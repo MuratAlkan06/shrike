@@ -9,6 +9,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 
@@ -36,6 +37,29 @@ final class WireClient implements AutoCloseable {
     static WireClient connectTo(ShrikeBroker broker) throws IOException {
         return new WireClient(SocketChannel.open(
                 new InetSocketAddress(InetAddress.getLoopbackAddress(), broker.port())));
+    }
+
+    /**
+     * Connects with a receive buffer small enough that the broker cannot hand a large answer to the
+     * kernel and walk away from it. A test that has to act while a response is still being written
+     * needs the response to still be being written, and the buffer is set before the connect because
+     * that is the only point at which it can change the window the peer is told about.
+     *
+     * @param broker             a started broker
+     * @param receiveBufferBytes what to ask for as {@code SO_RCVBUF}
+     * @return a connected client
+     * @throws IOException if the connection is refused
+     */
+    static WireClient connectWithASmallReceiveBuffer(ShrikeBroker broker, int receiveBufferBytes) throws IOException {
+        SocketChannel socket = SocketChannel.open();
+        try {
+            socket.setOption(StandardSocketOptions.SO_RCVBUF, receiveBufferBytes);
+            socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), broker.port()));
+        } catch (IOException e) {
+            socket.close();
+            throw e;
+        }
+        return new WireClient(socket);
     }
 
     /**
@@ -68,6 +92,44 @@ final class WireClient implements AutoCloseable {
     ResponseDecoding receive(short apiKey) throws IOException {
         int lengthBytes = readFully(ResponseFrame.LENGTH_FIELD_BYTES).getInt();
         return ResponseFrame.decode(apiKey, readFully(lengthBytes));
+    }
+
+    /**
+     * Sends one request and reads its answer as the bytes that came off the socket, length field and
+     * all, without decoding any of them. Used where the claim is about the bytes rather than about
+     * what they mean.
+     *
+     * @param correlationId the number the answer must echo
+     * @param request       the request to send
+     * @return every byte of the response frame
+     * @throws IOException if the connection fails
+     */
+    byte[] callForBytes(int correlationId, Request request) throws IOException {
+        send(correlationId, request);
+        int lengthBytes = receiveResponseLength();
+        ByteBuffer frame = ByteBuffer.allocate(ResponseFrame.LENGTH_FIELD_BYTES + lengthBytes);
+        return frame.putInt(lengthBytes).put(readFully(lengthBytes)).array();
+    }
+
+    /**
+     * Reads the length field of the next response and nothing else, which is the broker's promise
+     * about how many bytes are still to come.
+     *
+     * @return what that field says
+     * @throws IOException if the connection fails
+     */
+    int receiveResponseLength() throws IOException {
+        return readFully(ResponseFrame.LENGTH_FIELD_BYTES).getInt();
+    }
+
+    /**
+     * @param lengthBytes how many bytes to take off the socket
+     * @return exactly that many bytes
+     * @throws java.io.EOFException if the broker closed the connection part way through them
+     * @throws IOException          if the connection fails
+     */
+    byte[] receiveExactly(int lengthBytes) throws IOException {
+        return readFully(lengthBytes).array();
     }
 
     /**

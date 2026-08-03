@@ -116,7 +116,7 @@ class SegmentedLogTest {
                     assertThrows(OffsetOutOfRangeException.class, () -> log.read(unreadableOffset));
 
             assertEquals(unreadableOffset, refusal.requestedOffset());
-            assertEquals(0L, refusal.firstOffset());
+            assertEquals(0L, refusal.logStartOffset());
             assertEquals(3L, refusal.nextOffset());
             assertTrue(refusal.getMessage().contains("[0, 3)"), refusal.getMessage());
         }
@@ -128,7 +128,7 @@ class SegmentedLogTest {
             OffsetOutOfRangeException refusal = assertThrows(OffsetOutOfRangeException.class, () -> log.read(0L));
 
             assertEquals(0L, log.nextOffset());
-            assertEquals(0L, refusal.firstOffset());
+            assertEquals(0L, refusal.logStartOffset());
             assertEquals(0L, refusal.nextOffset(), "an empty log has an empty readable range");
         }
     }

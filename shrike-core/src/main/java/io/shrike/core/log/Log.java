@@ -4,7 +4,9 @@ import java.io.Closeable;
 
 /**
  * The append-only record log of one topic partition. Records go in at the end and come back out by
- * offset, where an offset is a logical record number and never a byte count.
+ * offset, where an offset is a logical record number and never a byte count. Nothing is ever rewritten
+ * in place; the only thing that leaves a log is whole segments of its oldest records, which is what
+ * {@link #deleteRetiredSegments(long)} does and what {@link #logStartOffset()} then reports.
  *
  * <p>A log has a single writer. Nothing here is safe to call from two threads at once.
  */
@@ -73,10 +75,78 @@ public interface Log extends Closeable {
     byte[] readRange(long fetchOffset, long limitOffset, int maxBytes);
 
     /**
+     * Locates the same range {@link #readRange} would return and opens it instead of reading it: the
+     * caller is handed the file, the byte position, and the byte count, and sends the bytes wherever
+     * they are going itself.
+     *
+     * <p>Every rule above applies unchanged — where the range starts, where it stops, the whole-frame
+     * rule and its first-frame exception — because both methods ask the same segment the same
+     * question and only differ in what they do with the answer. That is deliberate: the bytes a
+     * consumer receives must not depend on which of the two served them.
+     *
+     * <p>The range holds a channel of its own, so the caller closes it once the bytes have gone. What
+     * that buys is stated on {@link RecordRange}: a transfer already under way is not disturbed by
+     * retention deleting the segment it is reading.
+     *
+     * @param fetchOffset the logical record number to start at; {@link #nextOffset()} is legal and
+     *                    yields an empty range
+     * @param limitOffset the exclusive logical record number to stop before, clamped to
+     *                    {@link #nextOffset()} so no range can cross the high-water mark
+     * @param maxBytes    the most bytes to cover, subject to the whole-frame rule above
+     * @return the range, which the caller closes
+     * @throws IllegalArgumentException  if {@code maxBytes} is negative
+     * @throws OffsetOutOfRangeException if {@code fetchOffset} is below the first readable offset or
+     *                                   past {@link #nextOffset()}
+     * @throws CorruptRecordException    if a frame in the range contradicts what the log knows
+     * @throws ShrikeIOException         if the segment cannot be read or opened
+     */
+    RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes);
+
+    /**
      * @return the offset the next append will take, which is also the exclusive upper bound of the
      *         readable offsets: the high-water mark
      */
     long nextOffset();
+
+    /**
+     * @return the lowest offset this log can still serve, which is the inclusive lower bound of the
+     *         readable offsets. It is 0 until retention deletes something, and it only ever moves
+     *         forward; a read below it is refused with this number, so a consumer that fell behind
+     *         retention can reset to the oldest record that still exists
+     */
+    long logStartOffset();
+
+    /**
+     * Deletes the oldest stored records this log is no longer configured to keep, in whole segments.
+     *
+     * <p>This is the one operation that removes acknowledged records, so it is deliberately something
+     * a caller asks for at a moment of its choosing rather than something an append does on the side.
+     * What "no longer kept" means is the implementation's policy, and it is stated there.
+     *
+     * @param nowMillis the epoch millisecond retention is evaluated at, from the caller's time source
+     * @return how many segments were deleted
+     * @throws ShrikeIOException if a segment's files cannot be removed
+     */
+    int deleteRetiredSegments(long nowMillis);
+
+    /**
+     * Forces the records this log has not yet put on the device, when the configured flush policy says
+     * the time bound has been reached.
+     *
+     * <p>This is the time half of {@code flush.mode}, and it is deliberately a synchronous method a
+     * caller invokes at a moment of its choosing rather than a schedule the log keeps for itself: the
+     * broker's {@code shrike-flush} thread is what asks, and a test asks by hand. The volume half —
+     * {@code flush.interval.bytes} — is decided by the append that crosses the bound, because that is
+     * the only moment at which the bound can be observed being crossed.
+     *
+     * <p>In {@link FlushMode#PER_RECORD} there is never anything unforced to find, so this does
+     * nothing.
+     *
+     * @param nowMillis the epoch millisecond the interval is measured against, from the caller's clock
+     * @return whether anything was forced
+     * @throws ShrikeIOException if the force fails
+     */
+    boolean flushIfDue(long nowMillis);
 
     /**
      * Closes the log's file. Implementations state in their own documentation what closing means for

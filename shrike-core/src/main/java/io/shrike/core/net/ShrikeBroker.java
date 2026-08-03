@@ -3,9 +3,11 @@ package io.shrike.core.net;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
+import io.shrike.core.flush.FlushSweep;
 import io.shrike.core.group.GroupOffsetStore;
 import io.shrike.core.log.ShrikeIOException;
 import io.shrike.core.protocol.RequestReader;
+import io.shrike.core.retention.RetentionSweep;
 import io.shrike.core.time.TimeSource;
 import java.io.Closeable;
 import java.io.IOException;
@@ -36,22 +38,34 @@ import java.util.concurrent.atomic.AtomicLong;
  * same connection an hour apart. Connections are capped: at
  * {@link BrokerConfig#connectionCap()} the next socket is accepted and immediately closed. Accepting
  * and closing is the point — the acceptor never blocks and nothing is queued, so a client that opens
- * a thousand sockets costs a thousand closes rather than a thousand threads.
+ * a thousand sockets costs a thousand closes rather than a thousand threads. Two more threads:
+ * {@code shrike-retention} does nothing but ask each partition to delete the segments retention no
+ * longer keeps — with retention off, which is the default, it asks and there is nothing to do — and
+ * {@code shrike-flush} does nothing but ask each partition to force the records that have sat unforced
+ * for {@code flush.interval.ms} — in {@code per-record} mode it asks and there is nothing to do,
+ * because the append already forced.
  *
  * <p><strong>Starting.</strong> The topic registry and every partition log are opened and recovered
- * first, then the committed offsets are loaded, then the socket binds, then the acceptor starts, and
- * only then is the {@link ReadyFile} written. A reader that can see the ready file can connect.
+ * first, then the committed offsets are loaded, then the socket binds, then the acceptor, the
+ * retention thread, and the flush thread start, and only then is the {@link ReadyFile} written. A
+ * reader that can see the ready file can connect.
  *
- * <p><strong>Stopping.</strong> Stop accepting, wake every fetch that is waiting on a partition, close
- * the open connections so their threads come out of their blocking reads, join those threads under a
- * bounded deadline, and close every log — which forces the segment it was still writing. Nothing is
- * deleted, including the ready file.
+ * <p><strong>Stopping.</strong> Stop accepting, stop retention and the flush interval and wait for a
+ * pass of each in flight, wake every fetch that is waiting on a partition, close the open connections
+ * so their threads come out of their blocking reads, join those threads under a bounded deadline, and
+ * close every log — which forces the segment it was still writing. Nothing is deleted on the way out,
+ * including the ready file: what retention deletes it deletes while the broker is running and says so
+ * in the log.
  *
- * <p><strong>Durability.</strong> A produce is acknowledged once its bytes are with the operating
- * system, not once they are on the device: that is what {@code SegmentedLog.append} promises and this
- * broker promises nothing more. A commit is different and stronger — it is acknowledged only after its
- * file has been forced and atomically moved into place. A configurable flush mode is a later slice,
- * and until it exists this paragraph is the whole durability claim.
+ * <p><strong>Durability.</strong> What a produce promises is decided by {@code flush.mode} and by
+ * nothing else. Under {@link io.shrike.core.log.FlushMode#PER_RECORD} a produce is acknowledged only
+ * after {@code force()}, so an acknowledged record survives an operating-system or power failure.
+ * Under {@link io.shrike.core.log.FlushMode#INTERVAL}, the default, acknowledged records survive a
+ * process crash (they are in the page cache), but up to one flush interval of acknowledged records can
+ * be lost on an operating-system or power failure, after which recovery truncates the torn tail. A
+ * commit is neither of those and is stronger than both — it is acknowledged only after its file has
+ * been forced and atomically moved into place. None of this is a statement about delivery, which is
+ * at-least-once whichever mode this broker runs in.
  *
  * <p><strong>Binding.</strong> The listener binds the loopback interface. This build has no
  * authentication and no transport security, so the port it listens on is a port anything that can
@@ -87,6 +101,17 @@ public final class ShrikeBroker implements AutoCloseable {
     private final TopicRegistry topics;
     private final GroupOffsetStore groupOffsets;
     private final RequestDispatcher dispatcher;
+
+    /** The {@code shrike-retention} thread and its schedule; built here, started by {@link #start}. */
+    private final RetentionSweep retention;
+
+    /**
+     * The {@code shrike-flush} thread and its schedule; built here, started by {@link #start}. It asks
+     * exactly as often as {@code flush.interval.ms}, which is what keeps the window of unforced records
+     * at one interval rather than at two.
+     */
+    private final FlushSweep flush;
+
     private final int port;
 
     /**
@@ -138,12 +163,14 @@ public final class ShrikeBroker implements AutoCloseable {
     private volatile Thread acceptor;
 
     private ShrikeBroker(BrokerConfig config, ServerSocketChannel serverChannel, TopicRegistry topics,
-                         GroupOffsetStore groupOffsets, int port) {
+                         GroupOffsetStore groupOffsets, TimeSource timeSource, int port) {
         this.config = config;
         this.serverChannel = serverChannel;
         this.topics = topics;
         this.groupOffsets = groupOffsets;
         this.dispatcher = new RequestDispatcher(topics, groupOffsets);
+        this.retention = new RetentionSweep(topics, timeSource, RetentionSweep.DEFAULT_CHECK_INTERVAL_MILLIS);
+        this.flush = new FlushSweep(topics, timeSource, config.logConfig().flushIntervalMs());
         this.port = port;
     }
 
@@ -173,13 +200,16 @@ public final class ShrikeBroker implements AutoCloseable {
         try {
             GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory);
             ServerSocketChannel serverChannel = bind(config);
-            broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, boundPort(serverChannel));
+            broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, timeSource,
+                    boundPort(serverChannel));
         } catch (RuntimeException e) {
             topics.close();
             throw e;
         }
 
         try {
+            broker.retention.start();
+            broker.flush.start();
             broker.startAccepting();
             ReadyFile.write(config.readyFilePath(), broker.port, ProcessHandle.current().pid());
         } catch (RuntimeException e) {
@@ -215,6 +245,12 @@ public final class ShrikeBroker implements AutoCloseable {
 
         closeQuietly(serverChannel, "the listening socket");
         joinBounded(acceptor, STOP_TIMEOUT_MILLIS);
+        // Before the logs are closed, because a pass of either in flight is holding a partition lock
+        // and is about to unlink a file or force a channel: waiting for both here is what keeps a
+        // shutdown from racing them. Closing a log forces it anyway, so nothing is lost by stopping the
+        // flush interval first.
+        retention.close();
+        flush.close();
 
         // Woken before their sockets are closed, so a fetch that is part way through a long poll
         // returns rather than being joined against for a deadline it was told it could use.

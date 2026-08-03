@@ -22,6 +22,14 @@ import java.util.Objects;
  *                          {@code maxWaitMs} it asks for. A request's wait is clamped to it, because a
  *                          waiting fetch holds a connection slot and a platform thread, and the wire
  *                          format lets a client ask for a wait of nearly 25 days
+ * @param zeroCopyFetch     {@code fetch.zero.copy}: whether a fetch's records go from the segment file
+ *                          to the socket without being read into memory on the way. On by default.
+ *                          Turning it off selects the path that reads the range into a buffer and
+ *                          writes that, which is what this broker did before the setting existed. One
+ *                          setting does two jobs on purpose: it is the way back to the older path if
+ *                          the newer one ever misbehaves on some filesystem or kernel, and it is the
+ *                          A and the B of the benchmark that measures the difference. Both paths ask
+ *                          the log for the same range and put the same bytes on the wire
  * @param connectionCap     the most connections served at once; the one after that is accepted and
  *                          closed rather than queued
  * @param maxTotalPartitions the most partitions this broker will hold open across every topic. Each one
@@ -32,8 +40,9 @@ import java.util.Objects;
  *                          the process it runs in
  * @param logConfig         the record, segment, and index sizes every partition log opens with
  */
-public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, int maxFetchWaitMs, int connectionCap,
-                           int maxTotalPartitions, Path readyFilePath, LogConfig logConfig) {
+public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, int maxFetchWaitMs,
+                           boolean zeroCopyFetch, int connectionCap, int maxTotalPartitions, Path readyFilePath,
+                           LogConfig logConfig) {
 
     /** Ask the operating system for a free port, and read back which one it gave. */
     public static final int EPHEMERAL_PORT = 0;
@@ -67,6 +76,14 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
      */
     public static final int DEFAULT_MAX_TOTAL_PARTITIONS = 1024;
 
+    /**
+     * On. A fetch response is already the log's own bytes rather than a re-encoding of its records, so
+     * sending them out of the file they are in is what the format was chosen for. The buffered path is
+     * kept beside it, one setting away, because a broker with no way back to the code it had before is
+     * a broker whose operator has no move to make when something goes wrong.
+     */
+    public static final boolean DEFAULT_ZERO_COPY_FETCH = true;
+
     public BrokerConfig {
         Objects.requireNonNull(dataDirectory, "dataDirectory");
         Objects.requireNonNull(readyFilePath, "readyFilePath");
@@ -93,9 +110,10 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
 
     /**
      * The configuration a broker gets when the caller names only where things live: the default
-     * request bound, a fetch wait capped at {@value #DEFAULT_MAX_FETCH_WAIT_MILLIS}ms,
-     * {@value #DEFAULT_CONNECTION_CAP} connections, {@value #DEFAULT_MAX_TOTAL_PARTITIONS} partitions
-     * across every topic, and {@link LogConfig#defaults()}.
+     * request bound, a fetch wait capped at {@value #DEFAULT_MAX_FETCH_WAIT_MILLIS}ms, fetches served
+     * out of the segment file, {@value #DEFAULT_CONNECTION_CAP} connections,
+     * {@value #DEFAULT_MAX_TOTAL_PARTITIONS} partitions across every topic, and
+     * {@link LogConfig#defaults()}.
      *
      * @param dataDirectory the directory every path is derived from
      * @param port          the port to listen on, or {@value #EPHEMERAL_PORT}
@@ -104,7 +122,7 @@ public record BrokerConfig(Path dataDirectory, int port, int maxRequestBytes, in
      */
     public static BrokerConfig defaults(Path dataDirectory, int port, Path readyFilePath) {
         return new BrokerConfig(dataDirectory, port, RequestReader.DEFAULT_MAX_REQUEST_BYTES,
-                DEFAULT_MAX_FETCH_WAIT_MILLIS, DEFAULT_CONNECTION_CAP, DEFAULT_MAX_TOTAL_PARTITIONS, readyFilePath,
-                LogConfig.defaults());
+                DEFAULT_MAX_FETCH_WAIT_MILLIS, DEFAULT_ZERO_COPY_FETCH, DEFAULT_CONNECTION_CAP,
+                DEFAULT_MAX_TOTAL_PARTITIONS, readyFilePath, LogConfig.defaults());
     }
 }

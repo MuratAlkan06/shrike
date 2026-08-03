@@ -10,6 +10,7 @@ import io.shrike.core.protocol.CreateTopicRequest;
 import io.shrike.core.protocol.CreateTopicResponse;
 import io.shrike.core.protocol.ErrorCode;
 import io.shrike.core.protocol.FetchRequest;
+import io.shrike.core.protocol.FetchResponse;
 import io.shrike.core.protocol.ProduceRequest;
 import io.shrike.core.protocol.ProduceResponse;
 import io.shrike.core.protocol.Request;
@@ -34,7 +35,10 @@ import java.util.Optional;
  *       the count the topic was created with, including a negative one.
  *   <li>{@link ErrorCode#OFFSET_OUT_OF_RANGE} — a fetch below the first offset a partition still holds
  *       or past its high-water mark, or a commit past that mark. The mark itself is <em>in</em> range
- *       in both cases: it is where a caught-up consumer sits.
+ *       in both cases: it is where a caught-up consumer sits. This is the one refusal that answers
+ *       with a number too — the offset the partition now starts at — because a consumer whose
+ *       committed offset has fallen behind retention has to be told where to resume, and the code on
+ *       its own does not say.
  *   <li>{@link ErrorCode#CORRUPT_RECORD} — a stored frame no longer matches its checksum.
  *   <li>{@link ErrorCode#FRAME_TOO_LARGE} — a produce record whose frame would exceed
  *       {@code max.record.bytes}. Checked for every record of a request before any of them is
@@ -93,10 +97,21 @@ final class RequestDispatcher {
         }
 
         try {
-            return new Answer.Served(partition.get().fetch(request.fetchOffset(), request.maxBytes(),
-                    request.maxWaitMs(), request.minBytes()));
+            // Two shapes in, two shapes out: a fetch whose records were copied into memory is an
+            // ordinary body, and one whose records are still in the file is the answer the connection
+            // has to write a header for and then send. Nothing here decides which; the partition
+            // already did, from the setting it was started with.
+            return switch (partition.get().fetch(request.fetchOffset(), request.maxBytes(), request.maxWaitMs(),
+                    request.minBytes())) {
+                case FetchedRecords.Copied copied -> new Answer.Served(new FetchResponse(copied.highWaterMark(),
+                        copied.records()));
+                case FetchedRecords.Pinned pinned -> new Answer.Streamed(pinned.highWaterMark(), pinned.records());
+            };
         } catch (OffsetOutOfRangeException e) {
-            return new Answer.Refused(ErrorCode.OFFSET_OUT_OF_RANGE, e.getMessage());
+            // The offset comes off the exception rather than from a second call on the partition: it
+            // is what the range was when the read was refused, and asking again could answer with a
+            // start offset that has moved since.
+            return new Answer.OutOfRange(e.logStartOffset(), e.getMessage());
         } catch (CorruptRecordException e) {
             return new Answer.Refused(ErrorCode.CORRUPT_RECORD, e.getMessage());
         }
@@ -116,7 +131,7 @@ final class RequestDispatcher {
         // there is" says, and the offset it names is the one it will ask for next.
         long highWaterMark = partition.get().highWaterMark();
         if (request.offset() > highWaterMark) {
-            return new Answer.Refused(ErrorCode.OFFSET_OUT_OF_RANGE, "offset " + request.offset()
+            return new Answer.OutOfRange(partition.get().logStartOffset(), "offset " + request.offset()
                     + " is past the high-water mark " + highWaterMark + " of topic=" + request.topic()
                     + " partition=" + request.partition());
         }

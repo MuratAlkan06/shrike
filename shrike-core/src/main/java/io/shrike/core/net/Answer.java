@@ -1,15 +1,17 @@
 package io.shrike.core.net;
 
+import io.shrike.core.log.RecordRange;
 import io.shrike.core.protocol.ErrorCode;
 import io.shrike.core.protocol.Response;
 import java.util.Objects;
 
 /**
- * What the broker owes one request it understood: a body, or one error code that is the whole answer.
+ * What the broker owes one request it understood: a body, a fetch whose records have not been read
+ * into memory, an error code that is the whole answer, or the one error code that comes with a number.
  *
- * <p>It is a sealed type rather than an exception because both outcomes are ordinary. An unknown
- * topic, an offset outside a partition's range, and a topic that already exists are all things a
- * caller is entitled to ask about and be told, and a connection loop that handled one and forgot the
+ * <p>It is a sealed type rather than an exception because all of those outcomes are ordinary. An
+ * unknown topic, an offset outside a partition's range, and a topic that already exists are all things
+ * a caller is entitled to ask about and be told, and a connection loop that handled one and forgot the
  * other would still compile if these travelled as exceptions.
  */
 sealed interface Answer {
@@ -21,6 +23,30 @@ sealed interface Answer {
 
         public Served {
             Objects.requireNonNull(response, "response");
+        }
+    }
+
+    /**
+     * A fetch answered without its records passing through memory: the connection writes the response
+     * header first — the length field included, already counting every byte of records that follows —
+     * and then sends the records themselves out of the segment file they are in.
+     *
+     * <p>It is its own shape rather than a {@link Served} carrying some other kind of body because it
+     * is the one answer a connection cannot simply encode and write: it owns a channel, so the
+     * connection has to close it, and the bytes it promises leave the broker after the header rather
+     * than with it. A connection loop that treated it as an ordinary body would not compile.
+     *
+     * @param highWaterMark the offset that partition will append next
+     * @param records       the range of the segment file to send, whose channel the connection closes
+     *                      once the response is complete
+     */
+    record Streamed(long highWaterMark, RecordRange records) implements Answer {
+
+        public Streamed {
+            Objects.requireNonNull(records, "records");
+            if (highWaterMark < 0) {
+                throw new IllegalArgumentException("highWaterMark must not be negative, but was " + highWaterMark);
+            }
         }
     }
 
@@ -37,6 +63,29 @@ sealed interface Answer {
             if (errorCode == ErrorCode.NONE) {
                 throw new IllegalArgumentException("a refusal cannot carry " + ErrorCode.NONE);
             }
+            if (errorCode == ErrorCode.OFFSET_OUT_OF_RANGE) {
+                throw new IllegalArgumentException("a refusal carrying " + ErrorCode.OFFSET_OUT_OF_RANGE
+                        + " is an OutOfRange, because that code owes the caller a log start offset");
+            }
+        }
+    }
+
+    /**
+     * The one refusal that answers with a number as well as a code. It is its own shape rather than a
+     * field on {@link Refused} so that the connection loop cannot forget to write the number, and so
+     * that the two places which produce it — a fetch below the log start offset, and a commit past the
+     * high-water mark — cannot produce it without having one.
+     *
+     * @param logStartOffset the lowest offset that partition can still serve, read as the answer is
+     *                       decided. Retention only moves it forward, so a client that resets to it is
+     *                       resetting to a record that existed a moment ago rather than to one that
+     *                       was already gone
+     * @param reason         why, for the broker's own log; this half never goes on the wire
+     */
+    record OutOfRange(long logStartOffset, String reason) implements Answer {
+
+        public OutOfRange {
+            Objects.requireNonNull(reason, "reason");
         }
     }
 }

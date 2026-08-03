@@ -1,8 +1,10 @@
 package io.shrike.core.log;
 
 /**
- * A read asked for an offset the log does not hold: a negative one, or one at or past the high-water
- * mark. The exception carries the range that was readable when the read was refused.
+ * A read asked for an offset the log does not hold: a negative one, one retention has already
+ * deleted, or one at or past the high-water mark. The exception carries the range that was readable
+ * when the read was refused, and its lower end — the log start offset — is the number a consumer that
+ * fell behind retention needs in order to reset deliberately rather than guess.
  */
 public final class OffsetOutOfRangeException extends RuntimeException {
 
@@ -11,16 +13,17 @@ public final class OffsetOutOfRangeException extends RuntimeException {
     private final String topic;
     private final int partition;
     private final long requestedOffset;
-    private final long firstOffset;
+    private final long logStartOffset;
     private final long nextOffset;
 
-    public OffsetOutOfRangeException(String topic, int partition, long requestedOffset, long firstOffset, long nextOffset) {
-        super("offset " + requestedOffset + " is outside the readable range [" + firstOffset + ", " + nextOffset
+    public OffsetOutOfRangeException(String topic, int partition, long requestedOffset, long logStartOffset,
+                                     long nextOffset) {
+        super("offset " + requestedOffset + " is outside the readable range [" + logStartOffset + ", " + nextOffset
                 + ") of topic=" + topic + " partition=" + partition);
         this.topic = topic;
         this.partition = partition;
         this.requestedOffset = requestedOffset;
-        this.firstOffset = firstOffset;
+        this.logStartOffset = logStartOffset;
         this.nextOffset = nextOffset;
     }
 
@@ -37,10 +40,12 @@ public final class OffsetOutOfRangeException extends RuntimeException {
     }
 
     /**
-     * @return the lowest offset the log can still serve, inclusive
+     * @return the lowest offset the log can still serve, inclusive, as of the moment the read was
+     *         refused. Retention only ever moves it forward, so a consumer that resets to it is
+     *         resetting to the oldest record that still exists rather than to one that was deleted
      */
-    public long firstOffset() {
-        return firstOffset;
+    public long logStartOffset() {
+        return logStartOffset;
     }
 
     /**

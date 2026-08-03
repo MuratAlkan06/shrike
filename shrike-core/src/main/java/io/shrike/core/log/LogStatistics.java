@@ -11,7 +11,8 @@ package io.shrike.core.log;
 public interface LogStatistics {
 
     /**
-     * @return the lowest offset the log can still serve: the base offset of its first segment
+     * @return the lowest offset the log can still serve: the base offset of its first segment, which
+     *         retention moves forward as it deletes the segments before it
      */
     long logStartOffset();
 

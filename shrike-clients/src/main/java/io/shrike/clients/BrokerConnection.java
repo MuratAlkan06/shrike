@@ -33,8 +33,10 @@ import java.util.Objects;
  * land in {@code [ResponseFrame.MINIMUM_LENGTH_BYTES, maxResponseBytes]} before a byte is allocated
  * for the body. A length outside that range, a correlation id that answers a different question, or a
  * body that does not parse means this stream cannot be resynchronized: the connection is closed and a
- * {@link MalformedResponseException} says why. An error response with a body is one of those cases —
- * the codec refuses it, because an error is a code and nothing else.
+ * {@link MalformedResponseException} says why. That covers the bodies an error response is not
+ * allowed to carry as well: every code but {@code OFFSET_OUT_OF_RANGE} is a code and nothing else,
+ * and that one carries exactly eight bytes of log start offset — anything else under either rule is a
+ * frame this client refuses rather than reads.
  *
  * <p><strong>Timeouts.</strong> Connecting is bounded by {@code connectTimeoutMillis}. Reading is
  * bounded by {@code readTimeoutMillis}, except for a fetch, whose bound is its own {@code maxWaitMs}
@@ -214,7 +216,8 @@ public final class BrokerConnection implements AutoCloseable {
             }
             case ResponseDecoding.Failed failed -> {
                 requireAnswerTo(failed.correlationId(), correlationId, request);
-                throw new BrokerErrorException(failed.errorCode(), correlationId, describe(request));
+                throw new BrokerErrorException(failed.errorCode(), correlationId, describe(request),
+                        failed.logStartOffset());
             }
             case ResponseDecoding.BrokenFrame broken -> throw closeOnBrokenResponse("the answer to "
                     + describe(request) + " is not a response: " + broken.reason());
