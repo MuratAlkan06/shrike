@@ -16,11 +16,21 @@ import java.util.Objects;
  * commit api and the broker's files both use. So a group that has read a partition to its end has
  * committed the high-water mark itself and its lag is zero, not one.
  *
+ * <p><strong>Retention does not change the subtraction.</strong> A group that fell far enough behind
+ * for retention to delete the records it had not read has a committed offset below the partition's log
+ * start offset, and its lag is still the high-water mark minus that commit: how far behind the group
+ * is, not how much of it the broker can still serve. Nothing here is clamped to the log start offset,
+ * because a lag of zero is what a caught-up group looks like and a group whose backlog was deleted has
+ * not caught up — it has lost records, which its next fetch learns from the offset carried by
+ * {@link io.shrike.core.protocol.ErrorCode#OFFSET_OUT_OF_RANGE}. The offsets a describe reports beside
+ * this are what say which of the two happened.
+ *
  * @param topic           the topic, under the folded name the commit was keyed by
  * @param partition       the partition of that topic
  * @param committedOffset the next offset the group should read
  * @param highWaterMark   the offset the partition's next append will take
- * @param lag             how many records the group has not read yet
+ * @param lag             how many records the group has not read yet, whether or not they are all still
+ *                        stored
  */
 public record PartitionLag(String topic, int partition, long committedOffset, long highWaterMark, long lag) {
 

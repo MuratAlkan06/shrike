@@ -59,6 +59,21 @@ class GroupLagTest {
     }
 
     @Test
+    void countsTheRecordsRetentionDeletedInTheLagOfAGroupThatFellBehindIt() {
+        List<GroupOffset> committed = List.of(new GroupOffset("orders", 0, 2));
+        // Retention has moved this partition's start offset past what the group committed, so offsets 2
+        // to 5 are gone and the group can never read them: its next fetch is refused with 6.
+        List<TopicDescription> described = List.of(new TopicDescription("orders",
+                List.of(new PartitionDescription(0, 6L, 9L, 2, 0L))));
+
+        GroupLag lag = GroupLag.across(GROUP, committed, described);
+
+        assertEquals(List.of(new PartitionLag("orders", 0, 2, 9, 7)), lag.partitions(),
+                "lag is the high-water mark minus the commit whether or not the records between them are"
+                        + " still stored: it is how far behind the group is, not how much it can still read");
+    }
+
+    @Test
     void refusesToReportOnAPartitionThatWasNotDescribed() {
         List<GroupOffset> committed = List.of(new GroupOffset("orders", 3, 1));
         List<TopicDescription> described = List.of(new TopicDescription("orders",
