@@ -2,7 +2,7 @@
 
 Shrike is a single-node, log-structured message broker written in Java 21. Producers append records to a segmented commit log on one machine's disk, consumers read them back by offset, and delivery is at-least-once: a record may be redelivered after a failure, and no record is silently dropped.
 
-Status: Slice 6 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a `flush.mode` that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker.
+Version 1.0.0 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a flush policy that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker. What a running broker can be told is four environment variables and no more, which [Configuration](#configuration) sets out; the [Non-goals](#non-goals) below are what this build does not do at all.
 
 ## Non-goals
 
@@ -31,13 +31,13 @@ mvn -B clean verify
 SHRIKE_DATA_DIRECTORY=/var/lib/shrike java -cp shrike-core/target/classes io.shrike.core.net.BrokerMain
 ```
 
-It listens on port 9750, binds the loopback interface, and writes `shrike.ready` — the port it bound and its pid — into the data directory. `SHRIKE_PORT`, `SHRIKE_READY_FILE`, and `SHRIKE_BIND_ADDRESS` are the other three variables, each of which has a default, and the last of them is the only way this broker comes to listen anywhere but loopback.
+It listens on port 9750, binds the loopback interface, and writes `shrike.ready` — the port it bound and its pid — into the data directory. `SHRIKE_PORT`, `SHRIKE_READY_FILE`, and `SHRIKE_BIND_ADDRESS` are the other three variables, each of which has a default, and the last of them is the only way this broker comes to listen anywhere but loopback. Those four are the whole of what this entry point reads; everything else runs at its default, and [Configuration](#configuration) is the list of what that means.
 
 **Or run it in a container.** The image is the same entry point reading the same four variables, with `SHRIKE_BIND_ADDRESS` set to `0.0.0.0` because a published port never lands on a container's loopback:
 
 ```
-docker build -t shrike:0.1.0 .
-docker run -d --name shrike -p 127.0.0.1:9750:9750 -v shrike-data:/var/lib/shrike shrike:0.1.0
+docker build -t shrike:1.0.0 .
+docker run -d --name shrike -p 127.0.0.1:9750:9750 -v shrike-data:/var/lib/shrike shrike:1.0.0
 ```
 
 **The address in front of that port is not decoration.** The unqualified `-p 9750:9750` publishes on every interface the host has, and this broker has no authentication, so that form hands an unauthenticated broker to whatever can reach the machine. It is also not something a host firewall necessarily catches: on Linux, Docker publishes a port by writing DNAT rules that are traversed before the `INPUT` chain, so a firewall written as `INPUT` rules is a firewall the published port goes around. `127.0.0.1:9750:9750` publishes to the host's loopback and nowhere else, which is what the rest of this quickstart connects to.
@@ -61,13 +61,44 @@ try (ShrikeConsumer consumer = ShrikeConsumer.open(config)) {
 **Read it back over HTTP.** The admin facade is not in the image. It runs beside the broker and already points at `127.0.0.1:9750`:
 
 ```
-java -jar shrike-admin/target/shrike-admin-0.1.0-SNAPSHOT.jar
+java -jar shrike-admin/target/shrike-admin-1.0.0.jar
 curl -s localhost:8080/api/v1/topics
 curl -s localhost:8080/api/v1/topics/orders
 curl -s localhost:8080/api/v1/groups/billing/lag
 ```
 
 It binds `127.0.0.1:8080`, and what those three answer with is under [Admin endpoints](#admin-endpoints).
+
+## Configuration
+
+**The broker's shipped entry point reads four environment variables and nothing else.** `BrokerMain` builds a `BrokerLaunch` out of the environment — no configuration file, no command line, and an argument is refused rather than silently ignored — and hands the broker `BrokerConfig.defaults(dataDirectory, port, readyFilePath)`. The container image runs that same entry point, so it runs those same defaults.
+
+| Variable | Default | What it names |
+|---|---|---|
+| `SHRIKE_DATA_DIRECTORY` | none: it is required | the directory every path this broker writes derives from |
+| `SHRIKE_PORT` | `9750` | the TCP port to listen on |
+| `SHRIKE_READY_FILE` | `<data dir>/shrike.ready` | the file written once the broker is listening, holding the port it bound and its pid |
+| `SHRIKE_BIND_ADDRESS` | the loopback address | the interface to listen on |
+
+**Every other setting named in this README is a field of `LogConfig` or `BrokerConfig`, and the only way to give one a value today is to build that record in Java.** They are real settings — each is validated where its record is constructed, read on a live path, and exercised by the suite this build runs — but they are a library surface rather than an operator surface. An application that puts `shrike-core` on its classpath and calls `ShrikeBroker.start(config, timeSource)` with a configuration it assembled gets whatever it named; the quickstart's entry point and the image, which build no configuration of their own, get the right-hand column. Reading these out of the environment is not something this build does, and it is tracked in #30.
+
+| Setting | Field | Lives on | What the entry point and the image run |
+|---|---|---|---|
+| `retention.ms` | `retentionMs` | `LogConfig` | `-1`, which is off |
+| `retention.bytes` | `retentionBytes` | `LogConfig` | `-1`, which is off |
+| `flush.mode` | `flushMode` | `LogConfig` | `interval` |
+| `flush.interval.ms` | `flushIntervalMs` | `LogConfig` | 100 |
+| `flush.interval.bytes` | `flushIntervalBytes` | `LogConfig` | 1 MiB |
+| `segment.bytes` | `segmentBytes` | `LogConfig` | 128 MiB |
+| `max.record.bytes` | `maxRecordBytes` | `LogConfig` | 1 MiB |
+| `index.interval.bytes` | `indexIntervalBytes` | `LogConfig` | 4 KiB |
+| `max.fetch.wait.ms` | `maxFetchWaitMs` | `BrokerConfig` | 30 000 |
+| `max.request.bytes` | `maxRequestBytes` | `BrokerConfig` | 4 MiB |
+| `fetch.zero.copy` | `zeroCopyFetch` | `BrokerConfig` | on |
+
+The dotted names in the left-hand column are what the javadoc on those two records calls each field, and what the prose below calls them. They are not keys anything in this build parses, and writing one as `name=value` anywhere would not set it. Two more numbers sit on `BrokerConfig` beside them and are defaulted the same way: `connectionCap`, 64, and `maxTotalPartitions`, 1024.
+
+`shrike-admin` has a settable surface of its own, because it is a Spring application: `server.address`, `server.port`, `shrike.broker.host`, and `shrike.broker.port` are set the way any Spring Boot property is, and they are described under [Admin endpoints](#admin-endpoints).
 
 ## Architecture
 
@@ -123,11 +154,11 @@ No key past 5 exists. A request naming one is refused as an invalid request, exa
 
 **Long-poll fetch.** A fetch that finds fewer than `minBytes` of records readable is held open for up to `maxWaitMs` and answered the moment an append to that partition makes enough available; a wait that runs out is answered with whatever is there — usually nothing — and the code `none`, because "there is nothing new yet" is an answer rather than a failure. A `maxWaitMs` or `minBytes` of 0 is answered on the first pass without waiting at all.
 
-**How a fetch's records reach the socket.** The records block of a fetch response is a byte range of a segment file copied out verbatim, so by default the broker sends it without reading it into memory at all: it writes the response header — whose length field already counts every record byte to come — and then transfers the range straight from the file to the connection with `FileChannel.transferTo`. `fetch.zero.copy=false` selects the other path, which reads the range into a buffer and writes the response as one frame; that is what this broker did before the setting existed, and it is both the way back if the transfer ever misbehaves somewhere and the A/B the fetch benchmark below measures across. The two are the same bytes on the wire, envelope included, and a client cannot tell which answered it. Records that have been appended and not yet written out to the device are served the same way, because the transfer reads the same file the append wrote; what bounds a range is the high-water mark, not what has been flushed.
+**How a fetch's records reach the socket.** The records block of a fetch response is a byte range of a segment file copied out verbatim, so by default the broker sends it without reading it into memory at all: it writes the response header — whose length field already counts every record byte to come — and then transfers the range straight from the file to the connection with `FileChannel.transferTo`. A `BrokerConfig` whose `fetch.zero.copy` is off selects the other path, which reads the range into a buffer and writes the response as one frame; that is what this broker did before the setting existed, and it is both the way back if the transfer ever misbehaves somewhere and the A/B the fetch benchmark below measures across. The two are the same bytes on the wire, envelope included, and a client cannot tell which answered it. Records that have been appended and not yet written out to the device are served the same way, because the transfer reads the same file the append wrote; what bounds a range is the high-water mark, not what has been flushed.
 
 **The frame guard.** A reader takes the four length bytes first and allocates nothing until it believes them. The broker believes a request length inside `[8, max.request.bytes]` — 4 MiB by default — and a length outside it ends the connection with no reply, because the correlation id a reply would be addressed to lives after the length and is worth no more than the length is. The client applies the same shape to responses, bounded by the broker's serving cap plus a kibibyte of envelope headroom.
 
-**Durability, per flush mode.** `flush.mode` decides when a record reaches the device, and it is the only thing that decides it. It defaults to `interval`.
+**Durability, per flush mode.** `flush.mode` decides when a record reaches the device, and it is the only thing that decides it. It is a `LogConfig` field, per [Configuration](#configuration), and it defaults to `interval` — which is therefore what the entry point and the image run.
 
 - `per-record` — a produce is acknowledged only after `force()`, so an acknowledged record survives an operating-system or power failure. The cost is one fsync per record, paid on the thread the producer is waiting on and under the partition's own lock, so a partition answers one produce at a time at the speed of its device.
 - `interval` — acknowledged records survive a process crash (they are in the page cache), but up to one flush interval of acknowledged records can be lost on an operating-system or power failure, after which recovery truncates the torn tail. Whichever of `flush.interval.ms` (100 by default) and `flush.interval.bytes` (1 MiB by default) comes first is what forces: the append that crosses the byte bound forces where it stands, because that is the only moment the bound can be seen being crossed, and a thread named `shrike-flush` asks each partition once per interval about the other. Every force is `force(true)`, so the file's new length is on the device beside the bytes it reaches.
@@ -162,13 +193,13 @@ Earlier segments are not walked, because a segment is forced before it is sealed
 
 ## Retention
 
-**Retention deletes acknowledged records, on purpose, by a policy you configure.** That is what it is for, and it is worth saying in those words rather than in softer ones. Two settings decide it, per partition log: `retention.ms` deletes a sealed segment once every record in it is that many milliseconds old, and `retention.bytes` deletes the oldest sealed segments until the partition's log files add up to no more than that many bytes. **Both default to −1, which is off: a broker started without naming them keeps every record it has ever stored.**
+**Retention deletes acknowledged records, on purpose, whenever a log is opened under a policy that asks for it.** That is what it is for, and it is worth saying in those words rather than in softer ones. Two `LogConfig` fields decide it, per partition log: `retention.ms` deletes a sealed segment once every record in it is that many milliseconds old, and `retention.bytes` deletes the oldest sealed segments until the partition's log files add up to no more than that many bytes. **Both default to −1, which is off, and off is what the entry point and the image run: a broker started either of those ways keeps every record it has ever stored.** Asking for retention takes an application that builds its own `LogConfig`, per [Configuration](#configuration); #30 tracks reaching these two from the entry point.
 
 A segment's age is the largest record timestamp inside it — the timestamp the broker stamped when it appended the newest record it holds — and never a file's modification time, which a copy or a restore resets while the records do not change. Because the age comes from the newest record, no record is ever deleted inside its own window. Whole sealed segments only: the segment still taking appends is never deleted, however old it is and however large the partition has grown, so a partition can sit above `retention.bytes` by the size of that one segment.
 
-A deletion is announced rather than silent. It is asked for by configuration, it happens on a thread named `shrike-retention` that sweeps once a minute, and each segment that goes is an INFO line naming the topic, the partition, the base offset, the bytes, the reason, and the offset the partition starts at afterwards. Deleting the oldest segments moves that start offset forward, and a fetch below it is answered `offset out of range` **carrying the new start offset**, so a consumer that was down long enough to fall behind is told where it may resume instead of guessing.
+A deletion is announced rather than silent. It happens only where a `LogConfig` asked for it, on a thread named `shrike-retention` that sweeps once a minute, and each segment that goes is an INFO line naming the topic, the partition, the base offset, the bytes, the reason, and the offset the partition starts at afterwards. Deleting the oldest segments moves that start offset forward, and a fetch below it is answered `offset out of range` **carrying the new start offset**, so a consumer that was down long enough to fall behind is told where it may resume instead of guessing.
 
-This is a different thing from the delivery semantics above, and neither weakens the other. At-least-once is about what a failure may do to a record — redeliver it, never silently drop it. Retention is about what an operator has asked the broker to stop storing after a stated age or size, which is neither a failure nor silent. With retention off, which is the default, the two never meet at all.
+This is a different thing from the delivery semantics above, and neither weakens the other. At-least-once is about what a failure may do to a record — redeliver it, never silently drop it. Retention is about what a log's configuration has asked the broker to stop storing after a stated age or size, which is neither a failure nor silent. With retention off, which is the default, the two never meet at all.
 
 ## Benchmarks
 
@@ -178,7 +209,7 @@ Two things this slice added are worth a number rather than an adjective: what `f
 mvn -pl shrike-core -P bench test-compile exec:exec
 ```
 
-**Everything below is a measurement of one machine at one commit.** The harness is commit `b15a687`, the machine is an Apple M4 Pro with 14 cores and 48 GiB of memory running macOS 15.6.1, and the JVM is the one the toolchain selects:
+**Everything below is a measurement of one machine at one commit.** The harness is commit `9261b81`, the machine is an Apple M4 Pro with 14 cores and 48 GiB of memory running macOS 15.6.1, and the JVM is the one the toolchain selects:
 
 ```
 openjdk version "21.0.7" 2025-04-15 LTS
@@ -187,6 +218,8 @@ OpenJDK 64-Bit Server VM Temurin-21.0.7+6 (build 21.0.7+6-LTS, mixed mode, shari
 ```
 
 Every benchmark ran on one thread, in 2 forks of 3 one-second warmup iterations and 5 one-second measurement iterations, with no JVM arguments of its own. The suite takes about two minutes. The raw JMH output is committed exactly as it was written, and it is what the rows below are read from: [`docs/bench/slice-5-flush-and-fetch.json`](docs/bench/slice-5-flush-and-fetch.json).
+
+**Why that commit and not the one the run was started from.** Slice branches are squash-merged into `main` in this repository, so the branch commit the benchmark process was actually launched at does not exist in this history under its own identity, and a fresh clone cannot resolve it. `9261b81` is the squash that carries the same harness and the same committed JSON into `main`, and it is the commit named above for that reason. Its benchmark sources differ from the ones the run used by one javadoc paragraph and by nothing a measurement passes through.
 
 **What a flush mode costs an append.** One `SegmentedLog.append` of a 162-byte frame — a 128-byte value and no key — on a log opened with the defaults apart from the mode. The ± is JMH's own 99.9% confidence interval over the ten measured iterations.
 
@@ -218,7 +251,7 @@ The `Bytes per second` column is derived rather than measured: it is the row bes
 
 Both rows include loopback TCP and the thread draining it. That is deliberate: a transfer differs from a read-then-write only when the destination is a socket, so a sink that was not one would have compared the buffered path with itself. Neither row is a measurement of a disk, of a network, or of any machine other than this one.
 
-The transfer row also opens a file descriptor on the segment file for every fetch and closes it once the range has been sent, because that is what `SegmentedLog.openRange` does inside the broker; the buffered row reads through the channel the segment already holds. That open and close is what lets a range still be sent after retention has deleted the segment it is in, and it is a cost `fetch.zero.copy=true` pays per fetch, so it sits inside the transfer number rather than beside it.
+The transfer row also opens a file descriptor on the segment file for every fetch and closes it once the range has been sent, because that is what `SegmentedLog.openRange` does inside the broker; the buffered row reads through the channel the segment already holds. That open and close is what lets a range still be sent after retention has deleted the segment it is in, and it is a cost the transfer path pays per fetch, so it sits inside the transfer number rather than beside it.
 
 **What the shared sink costs is a third benchmark rather than a sentence.** `FetchPathBenchmark.writeRangeToTheSinkAlone` writes the same 1 048 478 bytes into the same loopback pair with no log behind it — no range located, no file read, no descriptor opened — and it ran at 14 637.6 ± 213.2 writes a second. It is in the same committed JSON as the two rows above and it is deliberately not in the table beside them: it is not a path a fetch can take, it is the floor under both of the paths that are.
 
@@ -368,7 +401,7 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A torn tail written under interval mode, with nothing forced, is truncated to the last whole record at startup, and the recovered log takes the offset after it | `SegmentedLogFlushTest#truncatesATornTailWrittenUnderTheIntervalFlushMode` | 5 |
 | The flush interval runs on a thread named shrike-flush, repeatedly, and closing it ends that thread | `FlushSweepTest#flushesOnItsOwnNamedThreadUntilItIsClosed` | 5 |
 | A log opened without naming a flush policy forces on whichever of 100 milliseconds and 1 MiB comes first | `LogConfigTest#defaultsToFlushingOnWhicheverOfOneHundredMillisecondsAndOneMebibyteComesFirst` | 5 |
-| On the machine, the JVM, and the harness commit named under Benchmarks, appending a 162-byte frame measured 222.1 ± 41.5 appends a second under `flush.mode=per-record`, under macOS `fsync(2)` and not `F_FULLFSYNC`, and 485 739 ± 76 685 under `interval` | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
+| On the machine, the JVM, and the harness commit named under Benchmarks, appending a 162-byte frame measured 222.1 ± 41.5 appends a second in `per-record` flush mode, under macOS `fsync(2)` and not `F_FULLFSYNC`, and 485 739 ± 76 685 under `interval` | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
 | On that same machine, commit, and JVM, the closed-loop p99 service time of one append measured 5.97 ms under `per-record`, under macOS `fsync(2)` and not `F_FULLFSYNC`, over 2 492 timed samples of about as many appends, and 3.79 µs under `interval` over 333 677 timed samples drawn from several million appends | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
 | On that same machine, commit, and JVM, serving one 1 MiB range into a loopback socket measured 2 567.3 ± 62.2 fetches a second through `FileChannel.transferTo` and 2 253.5 ± 36.9 through a buffered read | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
 | On that same machine, commit, and JVM, writing the same 1 048 478 bytes into the same loopback socket with no log behind it measured 14 637.6 ± 213.2 writes a second, which is 17.5% of the transfer path's time per fetch and 15.4% of the buffered path's | `docs/bench/slice-5-flush-and-fetch.json` | 5 |
