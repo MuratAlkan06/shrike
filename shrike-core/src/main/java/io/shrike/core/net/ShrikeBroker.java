@@ -8,6 +8,8 @@ import io.shrike.core.group.GroupOffsetStore;
 import io.shrike.core.log.ShrikeIOException;
 import io.shrike.core.protocol.RequestReader;
 import io.shrike.core.retention.RetentionSweep;
+import io.shrike.core.time.MonotonicTimeSource;
+import io.shrike.core.time.SystemMonotonicTimeSource;
 import io.shrike.core.time.TimeSource;
 import java.io.Closeable;
 import java.io.IOException;
@@ -81,7 +83,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@link BrokerConfig#connectionCap()} back. {@code SO_TIMEOUT} is not what does it: that bounds reads
  * on a socket's streams and not on the {@code SocketChannel} this broker reads through. The bound is
  * deliberately not a bound on the connection: a fetch held open for {@code max.fetch.wait.ms} is this
- * broker waiting to write rather than a client failing to speak, and it is never closed for it.
+ * broker waiting to write rather than a client failing to speak, and it is never closed for it. The
+ * bound is measured on elapsed time — {@link MonotonicTimeSource} — and not on the wall clock, so a
+ * host whose date is stepped keeps the bound it was configured with rather than one the step chose.
  * Authentication is still not here, and #9 is still where the rest of that is tracked.
  */
 public final class ShrikeBroker implements AutoCloseable {
@@ -128,8 +132,14 @@ public final class ShrikeBroker implements AutoCloseable {
      */
     private final ConnectionReaper reaper;
 
-    /** Handed to each connection, so every read phase is stamped from the clock this broker was given. */
+    /** The wall clock: what a record's timestamp is stamped from and what a fetch's wait expires on. */
     private final TimeSource timeSource;
+
+    /**
+     * The elapsed-time clock, handed to each connection and to the reaper, so that every deadline this
+     * broker holds is an amount of time that has to pass rather than a date that can be stepped.
+     */
+    private final MonotonicTimeSource monotonicTime;
 
     private final int port;
 
@@ -194,7 +204,8 @@ public final class ShrikeBroker implements AutoCloseable {
     private volatile Thread acceptor;
 
     private ShrikeBroker(BrokerConfig config, ServerSocketChannel serverChannel, TopicRegistry topics,
-                         GroupOffsetStore groupOffsets, TimeSource timeSource, int port) {
+                         GroupOffsetStore groupOffsets, TimeSource timeSource, MonotonicTimeSource monotonicTime,
+                         int port) {
         this.config = config;
         this.serverChannel = serverChannel;
         this.topics = topics;
@@ -203,10 +214,11 @@ public final class ShrikeBroker implements AutoCloseable {
         this.retention = new RetentionSweep(topics, timeSource, RetentionSweep.DEFAULT_CHECK_INTERVAL_MILLIS);
         this.flush = new FlushSweep(topics, timeSource, config.logConfig().flushIntervalMs());
         this.timeSource = timeSource;
+        this.monotonicTime = monotonicTime;
         this.port = port;
         // Last, and holding a method of a broker that is one statement from being built: the reaper only
         // stores it here, and the thread that would call it does not exist until start().
-        this.reaper = new ConnectionReaper(this::closeStalledConnections, timeSource, config.readTimeoutMs());
+        this.reaper = new ConnectionReaper(this::closeStalledConnections, monotonicTime, config.readTimeoutMs());
     }
 
     /**
@@ -242,9 +254,30 @@ public final class ShrikeBroker implements AutoCloseable {
      *                           opened or written
      */
     public static ShrikeBroker start(BrokerConfig config, TimeSource timeSource, InetAddress bindAddress) {
+        return start(config, timeSource, bindAddress, new SystemMonotonicTimeSource());
+    }
+
+    /**
+     * The same start again, against an elapsed-time clock the caller names instead of the host's.
+     *
+     * <p>Package-private because it is a seam for this package's own tests and not a setting. There is
+     * exactly one elapsed-time clock in production — the host's, which no operator configures and no
+     * daemon steps — so an overload that let a caller name another would be a public way to stop every
+     * deadline this broker holds. What it buys inside the package is that a test crosses a bound by
+     * moving a clock instead of by waiting for one.
+     *
+     * @param config        where things live and how much of them there may be
+     * @param timeSource    the wall clock that stamps appended records and bounds every fetch's wait
+     * @param bindAddress   the interface to listen on
+     * @param monotonicTime the elapsed-time clock every connection deadline is measured against
+     * @return the running broker, which the caller closes
+     */
+    static ShrikeBroker start(BrokerConfig config, TimeSource timeSource, InetAddress bindAddress,
+                              MonotonicTimeSource monotonicTime) {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(timeSource, "timeSource");
         Objects.requireNonNull(bindAddress, "bindAddress");
+        Objects.requireNonNull(monotonicTime, "monotonicTime");
 
         Path dataDirectory = config.dataDirectory();
         try {
@@ -258,7 +291,7 @@ public final class ShrikeBroker implements AutoCloseable {
         try {
             GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory, config.maxTotalGroups());
             ServerSocketChannel serverChannel = bind(config, bindAddress);
-            broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, timeSource,
+            broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, timeSource, monotonicTime,
                     boundPort(serverChannel));
         } catch (RuntimeException e) {
             topics.close();
@@ -485,7 +518,7 @@ public final class ShrikeBroker implements AutoCloseable {
             socket.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
 
             Connection connection = new Connection(name, socket, new RequestReader(config.maxRequestBytes()),
-                    dispatcher, timeSource);
+                    dispatcher, monotonicTime);
             reserved = connection;
             Thread thread = new Thread(() -> {
                 try {
@@ -559,13 +592,14 @@ public final class ShrikeBroker implements AutoCloseable {
      * of its blocking read, and that thread removes its map entry and its place under the cap on the way
      * out, exactly as it does for a client that hung up.
      *
-     * @param nowMillis the epoch millisecond every read phase's age is measured against
+     * @param nowNanos the reading of the elapsed-time clock every read phase's age is measured against
      * @return how many connections this pass closed
      */
-    int closeStalledConnections(long nowMillis) {
+    int closeStalledConnections(long nowNanos) {
+        long readTimeoutNanos = MILLISECONDS.toNanos(config.readTimeoutMs());
         int closed = 0;
         for (Connection connection : openConnections.keySet()) {
-            if (connection.closeIfStalled(nowMillis, config.readTimeoutMs())) {
+            if (connection.closeIfStalled(nowNanos, readTimeoutNanos)) {
                 closed++;
             }
         }

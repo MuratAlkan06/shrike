@@ -6,7 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-import io.shrike.core.time.TimeSource;
+import io.shrike.core.time.MonotonicTimeSource;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -28,16 +28,22 @@ class ConnectionReaperTest {
 
     private static final long THIRTY_SECONDS_MS = 30_000L;
 
+    /** Half an hour of elapsed time, which is a number this reaper only ever subtracts from. */
+    private static final long AN_ELAPSED_READING_NANOS = 1_800_000_000_000L;
+
+    /** What a stub of {@link io.shrike.core.time.MonotonicTimeSource} answers when nothing moves. */
+    private static final long ONE_NANOSECOND_IN = 1L;
+
     @Test
     void looksForStalledConnectionsWithTheTimeItReadsFromTheInjectedClock() {
-        AtomicLong lookedAtMillis = new AtomicLong(-1L);
-        TimeSource clock = () -> 1_700_000_000_000L;
+        AtomicLong lookedAtNanos = new AtomicLong(-1L);
+        MonotonicTimeSource elapsed = () -> AN_ELAPSED_READING_NANOS;
 
-        try (ConnectionReaper reaper = new ConnectionReaper(lookedAtMillis::set, clock, THIRTY_SECONDS_MS)) {
+        try (ConnectionReaper reaper = new ConnectionReaper(lookedAtNanos::set, elapsed, THIRTY_SECONDS_MS)) {
             reaper.runOnce();
         }
 
-        assertEquals(1_700_000_000_000L, lookedAtMillis.get(),
+        assertEquals(AN_ELAPSED_READING_NANOS, lookedAtNanos.get(),
                 "how long a connection has been reading is measured against the injected clock and nothing else");
     }
 
@@ -46,10 +52,10 @@ class ConnectionReaperTest {
         CountDownLatch twoPasses = new CountDownLatch(2);
         AtomicReference<String> reapingThread = new AtomicReference<>();
 
-        ConnectionReaper reaper = new ConnectionReaper(nowMillis -> {
+        ConnectionReaper reaper = new ConnectionReaper(nowNanos -> {
             reapingThread.set(Thread.currentThread().getName());
             twoPasses.countDown();
-        }, () -> 1L, 1L);
+        }, () -> ONE_NANOSECOND_IN, 1L);
         try {
             reaper.start();
             awaitLatch(twoPasses, "the reaper thread to make two passes");
@@ -67,13 +73,13 @@ class ConnectionReaperTest {
     @Test
     void refusesAnIntervalThatWouldWalkEveryConnectionAsFastAsItCan() {
         assertThrows(IllegalArgumentException.class,
-                () -> new ConnectionReaper(nowMillis -> { }, () -> 1L, 0L));
+                () -> new ConnectionReaper(nowNanos -> { }, () -> ONE_NANOSECOND_IN, 0L));
     }
 
     @Test
     void closesWithoutWaitingForAnythingWhenItWasNeverStarted() {
-        ConnectionReaper reaper = new ConnectionReaper(nowMillis -> fail("a reaper that never started must not run"),
-                () -> 1L, THIRTY_SECONDS_MS);
+        ConnectionReaper reaper = new ConnectionReaper(nowNanos -> fail("a reaper that never started must not run"),
+                () -> ONE_NANOSECOND_IN, THIRTY_SECONDS_MS);
 
         reaper.close();
         reaper.close();

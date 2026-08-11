@@ -1,12 +1,14 @@
 package io.shrike.core.net;
 
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
 import io.shrike.core.log.ByteChannels;
 import io.shrike.core.log.RecordRange;
 import io.shrike.core.protocol.ErrorCode;
 import io.shrike.core.protocol.RequestDecoding;
 import io.shrike.core.protocol.RequestReader;
 import io.shrike.core.protocol.ResponseFrame;
-import io.shrike.core.time.TimeSource;
+import io.shrike.core.time.MonotonicTimeSource;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
@@ -44,7 +46,7 @@ import java.util.Objects;
  *
  * <p><strong>The read phase.</strong> A connection is in its read phase from the moment it is built
  * until {@link #serve} has a whole frame, and again from the moment an answer is written until the next
- * whole frame arrives. {@link #readPhaseStartedAtMillis} is when the current one began, and
+ * whole frame arrives. {@link #readPhaseStartedAtNanos} is when the current one began, and
  * {@link #closeIfStalled} is what {@code shrike-conn-reaper} asks with. Everything between those two
  * phases — dispatching a request, waiting out a long poll's {@code maxWaitMs}, writing an answer — is
  * serving rather than reading, and is bounded by {@code max.fetch.wait.ms} and by nothing else. That
@@ -55,18 +57,26 @@ final class Connection implements AutoCloseable {
 
     private static final System.Logger LOGGER = System.getLogger(Connection.class.getName());
 
-    /** What {@link #readPhaseStartedAtMillis} holds while this connection is serving a request. */
+    /**
+     * What {@link #readPhaseStartedAtNanos} holds while this connection is serving a request. A
+     * reading of the elapsed-time clock is never negative, so no reading can be mistaken for it.
+     */
     private static final long NOT_READING = -1L;
 
     private final String name;
     private final SocketChannel socket;
     private final RequestReader reader;
     private final RequestDispatcher dispatcher;
-    private final TimeSource timeSource;
+    private final MonotonicTimeSource monotonicTime;
 
     /**
      * When the read phase this connection is in began, or {@link #NOT_READING} while it is serving a
      * request rather than reading one.
+     *
+     * <p>It is a reading of the elapsed-time clock rather than of the wall clock, because what the
+     * reaper asks is how long this phase has lasted and not when it started. A wall clock stepped
+     * backwards by a time-synchronization daemon would otherwise stretch every bound in flight by the
+     * size of the step, and one stepped forwards would close connections that had just spoken.
      *
      * <p>volatile because this connection's own thread is the only one that writes it and
      * {@code shrike-conn-reaper} is the one that reads it, and a reaper reading a stale value would
@@ -78,24 +88,24 @@ final class Connection implements AutoCloseable {
      */
     // guarded by: nothing. Written once by shrike-acceptor, before this connection is reachable from
     // anywhere, and after that only by this connection's own thread; read only by shrike-conn-reaper.
-    private volatile long readPhaseStartedAtMillis;
+    private volatile long readPhaseStartedAtNanos;
 
     /**
-     * @param name       the connection's name, which is also its thread's, so a log line and a thread
-     *                   dump name the same connection
-     * @param socket     the accepted, blocking socket
-     * @param reader     this connection's own frame guard
-     * @param dispatcher the broker's answer to a request, shared by every connection
-     * @param timeSource the clock every read phase of this connection is stamped from
+     * @param name          the connection's name, which is also its thread's, so a log line and a
+     *                      thread dump name the same connection
+     * @param socket        the accepted, blocking socket
+     * @param reader        this connection's own frame guard
+     * @param dispatcher    the broker's answer to a request, shared by every connection
+     * @param monotonicTime the elapsed-time clock every read phase of this connection is stamped from
      */
     Connection(String name, SocketChannel socket, RequestReader reader, RequestDispatcher dispatcher,
-               TimeSource timeSource) {
+               MonotonicTimeSource monotonicTime) {
         this.name = Objects.requireNonNull(name, "name");
         this.socket = Objects.requireNonNull(socket, "socket");
         this.reader = Objects.requireNonNull(reader, "reader");
         this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
-        this.timeSource = Objects.requireNonNull(timeSource, "timeSource");
-        this.readPhaseStartedAtMillis = timeSource.currentTimeMillis();
+        this.monotonicTime = Objects.requireNonNull(monotonicTime, "monotonicTime");
+        this.readPhaseStartedAtNanos = monotonicTime.elapsedNanos();
     }
 
     /**
@@ -110,7 +120,7 @@ final class Connection implements AutoCloseable {
                 // A whole frame is in hand, so this connection is serving rather than reading and the
                 // read bound stops applying to it. What the work below may cost is max.fetch.wait.ms
                 // and the api's own time, which are somebody else's numbers.
-                readPhaseStartedAtMillis = NOT_READING;
+                readPhaseStartedAtNanos = NOT_READING;
                 switch (decoding) {
                     case RequestDecoding.BrokenFrame broken -> {
                         LOGGER.log(System.Logger.Level.DEBUG,
@@ -128,7 +138,7 @@ final class Connection implements AutoCloseable {
                 // where this connection blocks: the two are the same instant to a client, and stamping
                 // before the blocking call is what keeps a reaper from measuring a phase that has no
                 // beginning yet.
-                readPhaseStartedAtMillis = timeSource.currentTimeMillis();
+                readPhaseStartedAtNanos = monotonicTime.elapsedNanos();
             }
         } catch (IOException e) {
             // The socket failed or was closed under this thread by a broker stopping. Either way the
@@ -143,7 +153,7 @@ final class Connection implements AutoCloseable {
     }
 
     /**
-     * Closes this connection when it has spent at least {@code readTimeoutMs} in one read phase, and
+     * Closes this connection when it has spent at least {@code read.timeout.ms} in one read phase, and
      * leaves it alone otherwise. A connection that is serving a request is never closed here, however
      * long that request takes: a long poll waiting out its {@code maxWaitMs} is the broker waiting to
      * write rather than the client failing to speak, and closing it would break the one api this broker
@@ -154,24 +164,24 @@ final class Connection implements AutoCloseable {
      * place under the connection cap, exactly as it does for a client that hung up — there is no second
      * path that releases a slot, so a reaped connection cannot leak one or give one back twice.
      *
-     * @param nowMillis     the epoch millisecond the read phase's age is measured against, which is
-     *                      where the injected clock enters
-     * @param readTimeoutMs {@code read.timeout.ms}: the bound this broker holds, which lives on
-     *                      {@link BrokerConfig} rather than on each connection because it is one number
-     *                      for all of them
+     * @param nowNanos         the reading of the elapsed-time clock the read phase's age is measured
+     *                         against, which is where the injected clock enters
+     * @param readTimeoutNanos {@code read.timeout.ms} in nanoseconds: the bound this broker holds,
+     *                         which lives on {@link BrokerConfig} rather than on each connection
+     *                         because it is one number for all of them
      * @return whether this connection was closed
      */
-    boolean closeIfStalled(long nowMillis, long readTimeoutMs) {
-        long startedAtMillis = readPhaseStartedAtMillis;
-        if (startedAtMillis == NOT_READING || nowMillis - startedAtMillis < readTimeoutMs) {
+    boolean closeIfStalled(long nowNanos, long readTimeoutNanos) {
+        long startedAtNanos = readPhaseStartedAtNanos;
+        if (startedAtNanos == NOT_READING || nowNanos - startedAtNanos < readTimeoutNanos) {
             return false;
         }
         // DEBUG rather than WARNING, and behind a supplier: which connections stall is decided by
         // whoever is connecting, and a line an anonymous caller can write as fast as it opens sockets
         // is a line that can fill a disk.
         LOGGER.log(System.Logger.Level.DEBUG, () -> name + " closed: it has been reading one request for "
-                + (nowMillis - startedAtMillis) + "ms, which is past the read.timeout.ms of " + readTimeoutMs
-                + "ms, so its place under the connection cap goes back");
+                + NANOSECONDS.toMillis(nowNanos - startedAtNanos) + "ms, which is past the read.timeout.ms of "
+                + NANOSECONDS.toMillis(readTimeoutNanos) + "ms, so its place under the connection cap goes back");
         close();
         return true;
     }
