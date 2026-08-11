@@ -74,6 +74,15 @@ class BrokerReadTimeoutTest {
      */
     private static final int SHORT_READ_TIMEOUT_MS = 1_000;
 
+    /**
+     * An hour, which is longer than anything this class moves its clock by. The bound under test here
+     * is the read one, and a broker holds both: a connection that has just finished writing an answer
+     * clears its write stamp on its own thread one instant after its client has the last byte, and an
+     * injected clock can be moved a whole bound inside that instant. Setting the write bound past every
+     * step these tests take means what closes a connection here is the bound this class is about.
+     */
+    private static final int WRITE_TIMEOUT_BEYOND_THIS_TEST_MS = 3_600_000;
+
     /** One short of the fetch wait, so the long poll below is still inside its deadline at the end. */
     private static final int SWEEPS_WHILE_THE_FETCH_WAITS = 29;
 
@@ -277,8 +286,8 @@ class BrokerReadTimeoutTest {
     }
 
     private void startBroker(int connectionCap, int readTimeoutMs) {
-        broker = ShrikeBroker.start(BrokerHarness.configWithReadTimeout(dataDirectory, connectionCap, readTimeoutMs),
-                clock, InetAddress.getLoopbackAddress(), elapsed);
+        broker = ShrikeBroker.start(BrokerHarness.configWithTimeouts(dataDirectory, connectionCap, readTimeoutMs,
+                WRITE_TIMEOUT_BEYOND_THIS_TEST_MS), clock, InetAddress.getLoopbackAddress(), elapsed);
         clientThread = Executors.newSingleThreadExecutor();
     }
 

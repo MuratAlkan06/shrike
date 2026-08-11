@@ -4,6 +4,7 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 import io.shrike.core.log.ByteChannels;
 import io.shrike.core.log.RecordRange;
+import io.shrike.core.log.WriteProgress;
 import io.shrike.core.protocol.ErrorCode;
 import io.shrike.core.protocol.RequestDecoding;
 import io.shrike.core.protocol.RequestReader;
@@ -49,9 +50,23 @@ import java.util.Objects;
  * whole frame arrives. {@link #readPhaseStartedAtNanos} is when the current one began, and
  * {@link #closeIfStalled} is what {@code shrike-conn-reaper} asks with. Everything between those two
  * phases — dispatching a request, waiting out a long poll's {@code maxWaitMs}, writing an answer — is
- * serving rather than reading, and is bounded by {@code max.fetch.wait.ms} and by nothing else. That
- * split is the whole point: a fetch legitimately holds this connection for thirty seconds while the
- * broker waits to write, and a bound on the socket rather than on the read phase would close it.
+ * serving rather than reading. That split is the whole point: a fetch legitimately holds this
+ * connection for thirty seconds while the broker waits to write, and a bound on the socket rather than
+ * on the read phase would close it.
+ *
+ * <p><strong>The write, and what bounds it.</strong> Serving is not one thing either. Waiting out a
+ * long poll is bounded by {@code max.fetch.wait.ms} and by nothing else, because this connection is
+ * not writing yet. From the first byte of an answer it is, and then {@code write.timeout.ms} applies —
+ * to the time this connection's write spends with no byte of it leaving, and not to how long the whole
+ * answer takes. {@link #writeProgressAtNanos} is when bytes last went, stamped as a write begins and
+ * again from inside the write loops each time some of them do, and {@link #closeIfStalled} is what
+ * {@code shrike-conn-reaper} asks with. A peer that keeps taking its answer is making progress and is
+ * never closed, however long the whole of it takes — as long as it takes at least
+ * {@link WriteProgress#MAX_BYTES_BETWEEN_REPORTS} of it per bound, which is as fine as a blocking
+ * write can be seen; a peer that asked for an answer and stopped reading makes no progress at all, and
+ * is closed one bound after it stopped. Closing the socket is what brings this
+ * connection's own thread out of its blocking write, with a closed-channel {@link IOException} that
+ * ends {@link #serve} down the same path a client hanging up does.
  */
 final class Connection implements AutoCloseable {
 
@@ -62,6 +77,12 @@ final class Connection implements AutoCloseable {
      * reading of the elapsed-time clock is never negative, so no reading can be mistaken for it.
      */
     private static final long NOT_READING = -1L;
+
+    /**
+     * What {@link #writeProgressAtNanos} holds while this connection has no answer on the wire, which
+     * is every instant except the ones between the first byte of a response and its last.
+     */
+    private static final long NOT_WRITING = -1L;
 
     private final String name;
     private final SocketChannel socket;
@@ -89,6 +110,27 @@ final class Connection implements AutoCloseable {
     // guarded by: nothing. Written once by shrike-acceptor, before this connection is reachable from
     // anywhere, and after that only by this connection's own thread; read only by shrike-conn-reaper.
     private volatile long readPhaseStartedAtNanos;
+
+    /**
+     * When the answer this connection is writing last put bytes on the socket, or {@link #NOT_WRITING}
+     * when it is not writing one. It is set as a write begins — a write that has moved nothing yet has
+     * still only just started — and again every time bytes actually leave, so what the reaper measures
+     * is how long this write has been getting nowhere and never how long the answer has taken.
+     *
+     * <p>volatile for the reason the stamp above is: this connection's own thread writes it and
+     * {@code shrike-conn-reaper} reads it, and a reaper reading a stale value would close a connection
+     * that is being drained perfectly well.
+     */
+    // guarded by: nothing. Written only by this connection's own thread; read only by
+    // shrike-conn-reaper.
+    private volatile long writeProgressAtNanos = NOT_WRITING;
+
+    /**
+     * Handed to both write loops, so that what leaves is stamped as it leaves rather than once the
+     * call that wrote it returns. One per connection instead of one per write, because a lambda that
+     * captures {@code this} is otherwise built on every response this connection sends.
+     */
+    private final WriteProgress writeProgress = bytesWritten -> stampWriteProgress();
 
     /**
      * @param name          the connection's name, which is also its thread's, so a log line and a
@@ -153,25 +195,36 @@ final class Connection implements AutoCloseable {
     }
 
     /**
-     * Closes this connection when it has spent at least {@code read.timeout.ms} in one read phase, and
-     * leaves it alone otherwise. A connection that is serving a request is never closed here, however
-     * long that request takes: a long poll waiting out its {@code maxWaitMs} is the broker waiting to
-     * write rather than the client failing to speak, and closing it would break the one api this broker
-     * holds a connection open for on purpose.
+     * Closes this connection when it has spent at least {@code read.timeout.ms} in one read phase, or
+     * at least {@code write.timeout.ms} with an answer on the wire that no byte of has moved, and
+     * leaves it alone otherwise. A connection can be in only one of those two states, so the two
+     * bounds never both apply and this closes at most one connection: the one it was asked about.
+     *
+     * <p>A connection waiting out a long poll is in neither state and is never closed here, however
+     * long the wait: it is the broker waiting to write rather than the client failing to speak or
+     * failing to listen, and closing it would break the one api this broker holds a connection open
+     * for on purpose.
      *
      * <p>Closing is the whole of what happens. The socket going away is what brings this connection's
-     * own thread out of its blocking read, and that thread is what gives back the map entry and the
-     * place under the connection cap, exactly as it does for a client that hung up — there is no second
-     * path that releases a slot, so a reaped connection cannot leak one or give one back twice.
+     * own thread out of its blocking read or its blocking write, and that thread is what gives back the
+     * map entry and the place under the connection cap, exactly as it does for a client that hung up —
+     * there is no second path that releases a slot, so a reaped connection cannot leak one or give one
+     * back twice.
      *
-     * @param nowNanos         the reading of the elapsed-time clock the read phase's age is measured
-     *                         against, which is where the injected clock enters
-     * @param readTimeoutNanos {@code read.timeout.ms} in nanoseconds: the bound this broker holds,
-     *                         which lives on {@link BrokerConfig} rather than on each connection
-     *                         because it is one number for all of them
+     * @param nowNanos          the reading of the elapsed-time clock both ages are measured against,
+     *                          which is where the injected clock enters
+     * @param readTimeoutNanos  {@code read.timeout.ms} in nanoseconds: the bound this broker holds,
+     *                          which lives on {@link BrokerConfig} rather than on each connection
+     *                          because it is one number for all of them
+     * @param writeTimeoutNanos {@code write.timeout.ms} in nanoseconds, held in the same place and for
+     *                          the same reason
      * @return whether this connection was closed
      */
-    boolean closeIfStalled(long nowNanos, long readTimeoutNanos) {
+    boolean closeIfStalled(long nowNanos, long readTimeoutNanos, long writeTimeoutNanos) {
+        return closeIfReadStalled(nowNanos, readTimeoutNanos) || closeIfWriteStalled(nowNanos, writeTimeoutNanos);
+    }
+
+    private boolean closeIfReadStalled(long nowNanos, long readTimeoutNanos) {
         long startedAtNanos = readPhaseStartedAtNanos;
         if (startedAtNanos == NOT_READING || nowNanos - startedAtNanos < readTimeoutNanos) {
             return false;
@@ -182,6 +235,21 @@ final class Connection implements AutoCloseable {
         LOGGER.log(System.Logger.Level.DEBUG, () -> name + " closed: it has been reading one request for "
                 + NANOSECONDS.toMillis(nowNanos - startedAtNanos) + "ms, which is past the read.timeout.ms of "
                 + NANOSECONDS.toMillis(readTimeoutNanos) + "ms, so its place under the connection cap goes back");
+        close();
+        return true;
+    }
+
+    private boolean closeIfWriteStalled(long nowNanos, long writeTimeoutNanos) {
+        long progressAtNanos = writeProgressAtNanos;
+        if (progressAtNanos == NOT_WRITING || nowNanos - progressAtNanos < writeTimeoutNanos) {
+            return false;
+        }
+        // DEBUG for the reason above, and saying what it says because the two stalls are told apart
+        // only here: the peer of this one is not reading rather than not speaking.
+        LOGGER.log(System.Logger.Level.DEBUG, () -> name + " closed: no byte of the answer this broker is "
+                + "writing has left for " + NANOSECONDS.toMillis(nowNanos - progressAtNanos)
+                + "ms, which is past the write.timeout.ms of " + NANOSECONDS.toMillis(writeTimeoutNanos)
+                + "ms, so its place under the connection cap goes back");
         close();
         return true;
     }
@@ -251,11 +319,45 @@ final class Connection implements AutoCloseable {
             ByteBuffer header = ResponseFrame.encodeFetchHeader(correlationId, streamed.highWaterMark(),
                     records.lengthBytes());
             write(header);
-            records.transferTo(socket);
+            transfer(records);
         }
     }
 
     private void write(ByteBuffer frame) throws IOException {
-        ByteChannels.writeFully(socket, frame);
+        stampWriteProgress();
+        try {
+            ByteChannels.writeFully(socket, frame, writeProgress);
+        } finally {
+            endWriting();
+        }
+    }
+
+    private void transfer(RecordRange records) throws IOException {
+        stampWriteProgress();
+        try {
+            records.transferTo(socket, writeProgress);
+        } finally {
+            endWriting();
+        }
+    }
+
+    /**
+     * Says that this connection's write has just got somewhere, which is both what puts it under the
+     * write bound and what keeps it there. It is called once before a write begins — a write that has
+     * moved nothing yet is a write that started now, and a peer which never takes a single byte would
+     * otherwise never be under the bound at all — and again from inside the write loop every time
+     * bytes actually leave, which is what makes the bound one on making no progress rather than one on
+     * how long an answer takes.
+     */
+    private void stampWriteProgress() {
+        writeProgressAtNanos = monotonicTime.elapsedNanos();
+    }
+
+    /**
+     * Takes this connection back out from under the write bound, in a {@code finally} so that it
+     * happens whether the write finished, threw, or was ended by this socket being closed under it.
+     */
+    private void endWriting() {
+        writeProgressAtNanos = NOT_WRITING;
     }
 }

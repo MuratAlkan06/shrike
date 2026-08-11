@@ -46,7 +46,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code shrike-flush} does nothing but ask each partition to force the records that have sat unforced
  * for {@code flush.interval.ms} — in {@code per-record} mode it asks and there is nothing to do,
  * because the append already forced — and {@code shrike-conn-reaper} does nothing but ask each open
- * connection whether it has spent longer than {@code read.timeout.ms} reading one request.
+ * connection whether it has spent longer than {@code read.timeout.ms} reading one request, or longer
+ * than {@code write.timeout.ms} writing an answer no byte of is moving.
  *
  * <p><strong>Starting.</strong> The topic registry and every partition log are opened and recovered
  * first, then the committed offsets are loaded, then the socket binds, then the acceptor, the
@@ -76,17 +77,20 @@ import java.util.concurrent.atomic.AtomicLong;
  * security, so a port it listens on past loopback is a port anything that can reach it may write to,
  * and a caller that names a wider address is saying it has arranged that reachability itself.
  *
- * <p><strong>Reading and idling are bounded; serving is not.</strong> A connection may spend at most
+ * <p><strong>Idling, reading, and writing are each bounded.</strong> A connection may spend at most
  * {@link BrokerConfig#readTimeoutMs()} in one read phase — sitting idle between requests, or part way
- * through a request frame — and {@code shrike-conn-reaper} closes it when it spends more, which is what
- * brings its thread out of the blocking read and gives its place under
- * {@link BrokerConfig#connectionCap()} back. {@code SO_TIMEOUT} is not what does it: that bounds reads
- * on a socket's streams and not on the {@code SocketChannel} this broker reads through. The bound is
- * deliberately not a bound on the connection: a fetch held open for {@code max.fetch.wait.ms} is this
- * broker waiting to write rather than a client failing to speak, and it is never closed for it. The
- * bound is measured on elapsed time — {@link MonotonicTimeSource} — and not on the wall clock, so a
- * host whose date is stepped keeps the bound it was configured with rather than one the step chose.
- * Authentication is still not here, and #9 is still where the rest of that is tracked.
+ * through a request frame — and at most {@link BrokerConfig#writeTimeoutMs()} writing an answer with no
+ * byte of it leaving. {@code shrike-conn-reaper} closes it when it crosses either, which is what brings
+ * its thread out of the blocking call and gives its place under {@link BrokerConfig#connectionCap()}
+ * back. {@code SO_TIMEOUT} is not what does either: it bounds reads on a socket's streams, not on the
+ * {@code SocketChannel} this broker reads through, and there is no send-side equivalent to bound a
+ * write with at all. Neither bound is a bound on the connection: a fetch held open for
+ * {@code max.fetch.wait.ms} is this broker waiting to write rather than a client failing to speak, and
+ * a peer draining a large answer slowly but steadily is making progress; neither is closed. Both are
+ * measured on elapsed time — {@link MonotonicTimeSource} — and not on the wall clock, so a host whose
+ * date is stepped keeps the bounds it was configured with rather than the ones the step chose.
+ * What none of them is, is access control: this build has no authentication, and the loopback default
+ * is what stands in for it.
  */
 public final class ShrikeBroker implements AutoCloseable {
 
@@ -127,8 +131,9 @@ public final class ShrikeBroker implements AutoCloseable {
 
     /**
      * The {@code shrike-conn-reaper} thread and its schedule; built here, started by {@link #start}. It
-     * asks exactly as often as {@code read.timeout.ms}, so a connection that stalls holds its slot for
-     * between one and two bounds rather than for as long as its client stays connected.
+     * asks exactly as often as the shorter of {@code read.timeout.ms} and {@code write.timeout.ms}, so
+     * a connection that stalls either way holds its slot for between one and two of its own bounds
+     * rather than for as long as its client stays connected.
      */
     private final ConnectionReaper reaper;
 
@@ -218,7 +223,8 @@ public final class ShrikeBroker implements AutoCloseable {
         this.port = port;
         // Last, and holding a method of a broker that is one statement from being built: the reaper only
         // stores it here, and the thread that would call it does not exist until start().
-        this.reaper = new ConnectionReaper(this::closeStalledConnections, monotonicTime, config.readTimeoutMs());
+        this.reaper = new ConnectionReaper(this::closeStalledConnections, monotonicTime,
+                Math.min(config.readTimeoutMs(), config.writeTimeoutMs()));
     }
 
     /**
@@ -583,23 +589,25 @@ public final class ShrikeBroker implements AutoCloseable {
     }
 
     /**
-     * One pass of the read bound: close every open connection that has spent at least
-     * {@code read.timeout.ms} in one read phase, and leave the rest alone. It is what
-     * {@code shrike-conn-reaper} calls on its own thread, and what a test calls directly with a clock it
-     * advanced, because when a pass happens is not what the bound means.
+     * One pass of both bounds: close every open connection that has spent at least
+     * {@code read.timeout.ms} in one read phase or at least {@code write.timeout.ms} writing an answer
+     * that no byte of has moved, and leave the rest alone. It is what {@code shrike-conn-reaper} calls
+     * on its own thread, and what a test calls directly with a clock it advanced, because when a pass
+     * happens is not what either bound means.
      *
      * <p>Nothing here gives a slot back. Closing the socket is what brings a connection's own thread out
-     * of its blocking read, and that thread removes its map entry and its place under the cap on the way
-     * out, exactly as it does for a client that hung up.
+     * of its blocking read or its blocking write, and that thread removes its map entry and its place
+     * under the cap on the way out, exactly as it does for a client that hung up.
      *
      * @param nowNanos the reading of the elapsed-time clock every read phase's age is measured against
      * @return how many connections this pass closed
      */
     int closeStalledConnections(long nowNanos) {
         long readTimeoutNanos = MILLISECONDS.toNanos(config.readTimeoutMs());
+        long writeTimeoutNanos = MILLISECONDS.toNanos(config.writeTimeoutMs());
         int closed = 0;
         for (Connection connection : openConnections.keySet()) {
-            if (connection.closeIfStalled(nowNanos, readTimeoutNanos)) {
+            if (connection.closeIfStalled(nowNanos, readTimeoutNanos, writeTimeoutNanos)) {
                 closed++;
             }
         }
