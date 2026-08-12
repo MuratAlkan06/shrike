@@ -35,6 +35,25 @@ class BrokerLaunchTest {
             Map.entry(BrokerLaunch.READ_TIMEOUT_MS_VARIABLE, BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS),
             Map.entry(BrokerLaunch.WRITE_TIMEOUT_MS_VARIABLE, BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS));
 
+    /** One past the largest number an {@code int} holds, which is the value that tells the two apart. */
+    private static final String ONE_PAST_AN_INT = String.valueOf(Integer.MAX_VALUE + 1L);
+
+    /**
+     * Every setting this launch reads into an {@code int} field, whichever record the field belongs to.
+     * The port is not among them because it is read in a range of its own; it has its own test below.
+     */
+    private static final List<String> SETTINGS_READ_AS_INTS = List.of(
+            BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE,
+            BrokerLaunch.MAX_FETCH_WAIT_MS_VARIABLE,
+            BrokerLaunch.CONNECTION_CAP_VARIABLE,
+            BrokerLaunch.READ_TIMEOUT_MS_VARIABLE,
+            BrokerLaunch.WRITE_TIMEOUT_MS_VARIABLE,
+            BrokerLaunch.MAX_TOTAL_PARTITIONS_VARIABLE,
+            BrokerLaunch.MAX_TOTAL_GROUPS_VARIABLE,
+            BrokerLaunch.MAX_RECORD_BYTES_VARIABLE,
+            BrokerLaunch.SEGMENT_BYTES_VARIABLE,
+            BrokerLaunch.INDEX_INTERVAL_BYTES_VARIABLE);
+
     @Test
     void bindsTheLoopbackAddressWhenTheEnvironmentDoesNotAskForAWiderOne() {
         Map<String, String> environment = Map.of(BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY);
@@ -277,6 +296,59 @@ class BrokerLaunchTest {
                 "a value too long to be a number is cut rather than echoed whole: " + refusal.getMessage());
         assertFalse(refusal.getMessage().contains(tenKilobytesOfDigits),
                 "the ten-kilobyte value never reaches the log line in full");
+    }
+
+    @Test
+    void refusesEverySettingItReadsAsAnIntAtANumberOnePastAnIntsLargest() {
+        for (String variable : SETTINGS_READ_AS_INTS) {
+            Map<String, String> onePastAnInt = Map.of(
+                    BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                    variable, ONE_PAST_AN_INT);
+
+            IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                    () -> BrokerLaunch.from(NO_ARGUMENTS, onePastAnInt));
+
+            assertTrue(refusal.getMessage().contains(variable), refusal.getMessage());
+            assertTrue(refusal.getMessage().contains("must be a whole number from " + Integer.MIN_VALUE
+                            + " to " + Integer.MAX_VALUE),
+                    "the width the field is read at is the width the refusal states, so widening the field "
+                            + "without a word here fails here first: " + refusal.getMessage());
+        }
+    }
+
+    @Test
+    void keepsEverySettingItReadsAsALongAtANumberOnePastAnIntsLargest() {
+        Map<String, String> onePastAnInt = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.RETENTION_MS_VARIABLE, ONE_PAST_AN_INT,
+                BrokerLaunch.RETENTION_BYTES_VARIABLE, ONE_PAST_AN_INT,
+                BrokerLaunch.FLUSH_INTERVAL_MS_VARIABLE, ONE_PAST_AN_INT,
+                BrokerLaunch.FLUSH_INTERVAL_BYTES_VARIABLE, ONE_PAST_AN_INT);
+
+        LogConfig logConfig = BrokerLaunch.from(NO_ARGUMENTS, onePastAnInt).config().logConfig();
+
+        assertEquals(Integer.MAX_VALUE + 1L, logConfig.retentionMs(),
+                "a setting counted in longs takes a number an int could not hold, and narrowing the field "
+                        + "would be caught here");
+        assertEquals(Integer.MAX_VALUE + 1L, logConfig.retentionBytes());
+        assertEquals(Integer.MAX_VALUE + 1L, logConfig.flushIntervalMs());
+        assertEquals(Integer.MAX_VALUE + 1L, logConfig.flushIntervalBytes());
+    }
+
+    @Test
+    void refusesAPortOnePastAnIntsLargestInTheRangeAPortIsReadAt() {
+        Map<String, String> onePastAnInt = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.PORT_VARIABLE, ONE_PAST_AN_INT);
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, onePastAnInt));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.PORT_VARIABLE), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("from " + BrokerConfig.EPHEMERAL_PORT
+                        + " to " + BrokerConfig.MAX_PORT),
+                "the port is the one number read in a range narrower than the field, and it says so: "
+                        + refusal.getMessage());
     }
 
     @Test
