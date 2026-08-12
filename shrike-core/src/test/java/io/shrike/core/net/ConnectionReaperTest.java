@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import io.shrike.core.time.MonotonicTimeSource;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -68,6 +69,42 @@ class ConnectionReaperTest {
         assertTrue(Thread.getAllStackTraces().keySet().stream()
                         .noneMatch(thread -> ConnectionReaper.THREAD_NAME.equals(thread.getName())),
                 "closing a reaper ends its thread rather than leaving it running");
+    }
+
+    /**
+     * A pass that fails with an {@link Error} rather than with a {@link RuntimeException}.
+     *
+     * <p>The distinction used to decide whether this broker kept either of its connection bounds. A pass
+     * walks every open connection, which allocates an iterator; it formats a DEBUG line for each one it
+     * closes; and it closes sockets. Under the memory pressure where a stalled peer holding a place under
+     * the cap costs the most, any of those can fail with an {@code OutOfMemoryError} — and an {@code
+     * Error} is not a {@code RuntimeException}, so it ended this thread and took the read bound and the
+     * write bound with it, silently, leaving nothing at all to close a connection that had stopped
+     * speaking or stopped listening.
+     */
+    @Test
+    void keepsReapingAfterAPassThrowsAnErrorRatherThanLosingBothBoundsWithThatPass() {
+        CountDownLatch twoPassesAfterTheOneThatThrew = new CountDownLatch(2);
+        AtomicBoolean failTheFirstPass = new AtomicBoolean(true);
+        AtomicReference<String> reapingThread = new AtomicReference<>();
+
+        ConnectionReaper reaper = new ConnectionReaper(nowNanos -> {
+            if (failTheFirstPass.compareAndSet(true, false)) {
+                throw new OutOfMemoryError("a pass that could not allocate (thrown by a test)");
+            }
+            reapingThread.set(Thread.currentThread().getName());
+            twoPassesAfterTheOneThatThrew.countDown();
+        }, () -> ONE_NANOSECOND_IN, 1L);
+        try {
+            reaper.start();
+            awaitLatch(twoPassesAfterTheOneThatThrew, "the reaper to make two more passes after one threw an Error");
+        } finally {
+            reaper.close();
+        }
+
+        assertEquals(ConnectionReaper.THREAD_NAME, reapingThread.get(),
+                "the passes after the throw are the same named thread's: one pass that failed does not take"
+                        + " the read bound and the write bound down with it");
     }
 
     @Test

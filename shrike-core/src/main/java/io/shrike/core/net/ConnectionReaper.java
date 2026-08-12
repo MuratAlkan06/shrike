@@ -34,9 +34,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * read fails and {@code serve} returns, which is the one path that releases a slot however a connection
  * ends.
  *
- * <p><strong>Failures.</strong> A pass that throws is a WARN and nothing more. The thread stays alive,
- * because a reaper that died on one connection would leave every other stalled connection holding a
- * slot and say so only once.
+ * <p><strong>Failures.</strong> A pass that throws <em>anything</em> is a WARN and nothing more. The
+ * thread stays alive, because a reaper that died on one connection would leave every other stalled
+ * connection holding a slot and say so only once — and this one thread is what enforces the read bound
+ * and the write bound both, so losing it loses every bound this broker has on how long one peer may
+ * hold a place under the connection cap. An {@link Error} counts: walking the open connections
+ * allocates an iterator, a DEBUG line allocates a message, and closing a socket can fail with anything
+ * the operating system has left, all under exactly the memory pressure where the bounds matter most.
+ * Even the WARN is guarded, for the reason {@code ShrikeBroker.warnHandoffFailed} sets out: what has
+ * just failed may be the logger, and a bound that stopped being enforced because a line could not be
+ * written would be a far larger outage than the missing line. That exception to PRINCIPLES §3 is
+ * written down in DESIGN.md, under "The read bound covers idling and mid-frame reading".
  */
 final class ConnectionReaper implements AutoCloseable {
 
@@ -128,10 +136,29 @@ final class ConnectionReaper implements AutoCloseable {
             }
             try {
                 runOnce();
-            } catch (RuntimeException e) {
-                LOGGER.log(System.Logger.Level.WARNING, THREAD_NAME + " could not finish a pass, so it waits "
-                        + checkIntervalMillis + "ms and looks again", e);
+            } catch (Throwable passFailed) {
+                warnPassFailed(passFailed);
             }
+        }
+    }
+
+    /**
+     * Writes the WARN a failed pass earns, and drops a throwable from the writing of it.
+     *
+     * <p>That is the one thing this codebase drops, and it is dropped here for the reason the class
+     * comment gives: what has just failed may be the logger itself, so there is nowhere left to report
+     * the failure of reporting, and this thread is the only thing enforcing either bound. A reaper that
+     * ended because it could not write one line would leave every stalled connection on this broker
+     * holding its place under the cap until the process ended.
+     *
+     * @param passFailed what stopped the pass, whatever it was
+     */
+    private void warnPassFailed(Throwable passFailed) {
+        try {
+            LOGGER.log(System.Logger.Level.WARNING, THREAD_NAME + " could not finish a pass, so it waits "
+                    + checkIntervalMillis + "ms and looks again", passFailed);
+        } catch (Throwable loggingFailed) {
+            // Dropped on purpose: see above. There is nowhere to report the failure of reporting.
         }
     }
 
