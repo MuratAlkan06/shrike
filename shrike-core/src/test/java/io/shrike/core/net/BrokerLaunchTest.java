@@ -23,6 +23,18 @@ class BrokerLaunchTest {
     private static final String DATA_DIRECTORY = "/var/lib/shrike";
     private static final List<String> NO_ARGUMENTS = List.of();
 
+    /**
+     * The five settings that multiply what a caller can make this broker hold — the memory one
+     * connection is worth, how many connections there may be, and the three times one of them may
+     * hold its place while nothing moves — each beside the largest value it takes.
+     */
+    private static final List<Map.Entry<String, Integer>> CAPPED_SETTINGS = List.of(
+            Map.entry(BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE, BrokerConfig.HIGHEST_MAX_REQUEST_BYTES),
+            Map.entry(BrokerLaunch.CONNECTION_CAP_VARIABLE, BrokerConfig.HIGHEST_CONNECTION_CAP),
+            Map.entry(BrokerLaunch.MAX_FETCH_WAIT_MS_VARIABLE, BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS),
+            Map.entry(BrokerLaunch.READ_TIMEOUT_MS_VARIABLE, BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS),
+            Map.entry(BrokerLaunch.WRITE_TIMEOUT_MS_VARIABLE, BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS));
+
     @Test
     void bindsTheLoopbackAddressWhenTheEnvironmentDoesNotAskForAWiderOne() {
         Map<String, String> environment = Map.of(BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY);
@@ -282,6 +294,49 @@ class BrokerLaunchTest {
         assertTrue(refusal.getMessage().contains(BrokerLaunch.WRITE_TIMEOUT_MS_VARIABLE), refusal.getMessage());
         assertTrue(refusal.getMessage().contains("writeTimeoutMs must be at least 1"),
                 "the record owns the bound and the launch says which variable crossed it: " + refusal.getMessage());
+    }
+
+    @Test
+    void refusesEveryCappedSettingOneOverItsCeilingNamingTheVariableThatCrossedIt() {
+        for (Map.Entry<String, Integer> setting : CAPPED_SETTINGS) {
+            Map<String, String> overTheCeiling = Map.of(
+                    BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                    setting.getKey(), String.valueOf(setting.getValue() + 1));
+
+            IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                    () -> BrokerLaunch.from(NO_ARGUMENTS, overTheCeiling));
+
+            assertTrue(refusal.getMessage().contains(setting.getKey()),
+                    "a value past a ceiling is refused like any other value this broker cannot use: "
+                            + refusal.getMessage());
+            assertTrue(refusal.getMessage().contains("must not exceed " + setting.getValue()),
+                    "the record owns the ceiling and the launch says which variable crossed it: "
+                            + refusal.getMessage());
+        }
+    }
+
+    @Test
+    void takesEveryCappedSettingAtItsCeilingExactly() {
+        Map<String, String> atTheCeiling = Map.ofEntries(
+                Map.entry(BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY),
+                Map.entry(BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE,
+                        String.valueOf(BrokerConfig.HIGHEST_MAX_REQUEST_BYTES)),
+                Map.entry(BrokerLaunch.CONNECTION_CAP_VARIABLE, String.valueOf(BrokerConfig.HIGHEST_CONNECTION_CAP)),
+                Map.entry(BrokerLaunch.MAX_FETCH_WAIT_MS_VARIABLE,
+                        String.valueOf(BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS)),
+                Map.entry(BrokerLaunch.READ_TIMEOUT_MS_VARIABLE,
+                        String.valueOf(BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS)),
+                Map.entry(BrokerLaunch.WRITE_TIMEOUT_MS_VARIABLE,
+                        String.valueOf(BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS)));
+
+        BrokerConfig config = BrokerLaunch.from(NO_ARGUMENTS, atTheCeiling).config();
+
+        assertEquals(BrokerConfig.HIGHEST_MAX_REQUEST_BYTES, config.maxRequestBytes(),
+                "the ceiling is a value this broker takes, and only the one past it is refused");
+        assertEquals(BrokerConfig.HIGHEST_CONNECTION_CAP, config.connectionCap());
+        assertEquals(BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS, config.maxFetchWaitMs());
+        assertEquals(BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS, config.readTimeoutMs());
+        assertEquals(BrokerConfig.HIGHEST_CONNECTION_HOLD_MILLIS, config.writeTimeoutMs());
     }
 
     @Test
