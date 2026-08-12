@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -39,8 +40,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p><strong>Two ways to be refused, one sentence for both.</strong> Another process holding the lock
  * makes {@link FileChannel#tryLock()} answer null; this same JVM already holding it — an application
- * that embeds two brokers, or a test starting a second one — is refused by {@link #CLAIMED_LOCK_FILES}
- * before a channel is opened at all. Neither is a condition an operator can act on differently, so both
+ * that embeds two brokers, or a test starting a second one — is refused by
+ * {@link #CLAIMED_LOCK_FILES_AND_DIRECTORIES} before a channel is opened at all. Neither is a condition an operator can act on differently, so both
  * arrive as one {@link ShrikeIOException} naming the directory and saying it is another broker's.
  *
  * <p><strong>Why the same-JVM refusal is answered before a second descriptor is opened.</strong> The
@@ -55,15 +56,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * anything: on that path the descriptor whose closing did the damage is never created, and that is
  * where every retry over a directory this JVM already holds now ends.
  *
- * <p><strong>A claim is kept under the lock file's identity, not the directory's name.</strong> The
+ * <p><strong>A claim is kept under two keys, because either one alone is the wrong one.</strong> The
  * JVM's own lock table is kept under the lock file's device and inode, so a claim kept under the data
  * directory's real path was keyed on something else: two directories that really are two directories
  * whose {@value #FILE_NAME} is one file — a hard link, a bind mount, a symbolic link to the lock file
  * rather than to the directory holding it — were two claims over one lock, and a start over the second
- * of them took its claim, opened a channel, and only then met the lock the first broker was holding. So
- * a claim is kept under what the lock table is kept under: the file's own identity, the
- * {@link BasicFileAttributes#fileKey() fileKey} a stat gives, which opens no descriptor to read. An
- * aliased start maps to the claim the running broker already holds and is refused before
+ * of them took its claim, opened a channel, and only then met the lock the first broker was holding.
+ * Keying on the file's identity instead answers that and gives up the other half, because an identity is
+ * a file's: {@value #FILE_NAME} deleted out from under a running broker leaves that broker's lock on an
+ * inode with no name, so the next start over the same directory creates a file of its own, reads an
+ * identity nobody holds, and takes it — two brokers over one data directory inside one process, which is
+ * the thing this class exists to refuse. So a take claims both, and either being somebody's already is
+ * the refusal: the {@link BasicFileAttributes#fileKey() fileKey} a stat gives, which opens no descriptor
+ * to read, and the directory's real path, which is what several spellings of one directory come to. A
+ * take that cannot have both takes neither, and both go back together. An aliased start and a start over
+ * a directory whose lock file has been replaced are refused the same way and in the same place: before
  * {@link FileChannel#open}, having opened nothing that could be closed.
  *
  * <p>Reading that identity wants the file to be there, and the first start over a directory is the one
@@ -74,13 +81,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * do by accident. A file it does create is one that did not exist a moment ago, which is a file nobody
  * can hold a lock on.
  *
- * <p>Two caveats, stated rather than hidden. A filesystem with no identity to give answers null to
- * {@code fileKey()} — Windows is the usual one — and the claim there falls back to the data directory's
- * real path, which is what it was keyed on before and what the backstop below covers. And an identity is
- * the file's, so a {@value #FILE_NAME} unlinked out from under a running broker leaves that broker's
- * claim and lock on an inode with no name: the next start creates a new file, claims it, and locks it.
- * Deleting that file already did exactly this to another process — the kernel's lock is on the inode too
- * — so it is the same hole rather than a new one, and it is one more reason nothing here deletes it.
+ * <p>Two edges, stated rather than hidden. A filesystem with no identity to give answers null to
+ * {@code fileKey()} — Windows is the usual one — and the claim is then the data directory's real path
+ * alone, which is what every claim used to be and what the backstop below covers. And a claim is this
+ * JVM's, so what the second key closes is the half of the deletion this process can see: a broker in
+ * <em>another</em> process still starts over a directory whose {@value #FILE_NAME} was deleted under the
+ * broker holding it, because the kernel's lock went with the inode and the file the new start makes has
+ * nothing on it to collide with. Nothing in this JVM can refuse that one, and it is why nothing here
+ * deletes the lock file.
  *
  * <p><strong>The overlap branch is a backstop, and what it opens it keeps.</strong> Two things can still
  * carry a start past the claim into {@link FileChannel#open} with somebody's lock on the other side: the
@@ -121,11 +129,14 @@ final class DataDirectoryLock implements Closeable {
     static final String FILE_NAME = "shrike.lock";
 
     /**
-     * The lock files this JVM is holding, each under its own identity — the device and inode a
-     * {@link BasicFileAttributes#fileKey() fileKey} is, which is what the JDK's own lock table is keyed
-     * on, so that two directories whose {@value #FILE_NAME} is one file are one entry rather than two
-     * claims on one lock. Where a filesystem has no identity to give, the entry is the data directory's
-     * real path instead, which is still one entry for every spelling of one directory.
+     * What this JVM is holding, under two keys for every lock a start takes: the lock file's own
+     * identity — the device and inode a {@link BasicFileAttributes#fileKey() fileKey} is, which is what
+     * the JDK's own lock table is keyed on — and the data directory's real path. Either of them being
+     * taken already is a refusal, and it takes both to make one, because each answers a question the
+     * other cannot. The identity is what sees two directories whose {@value #FILE_NAME} is one file; the
+     * real path is what sees one directory whose {@value #FILE_NAME} has been replaced underneath the
+     * broker holding it. Where a filesystem has no identity to give, the real path is the only key and
+     * is still one entry for every spelling of one directory.
      *
      * <p>This is one of the two pieces of static mutable state in this codebase, and PRINCIPLES §2
      * forbids it, so the exception is written down here and in DESIGN.md as the preamble to those rules
@@ -136,8 +147,8 @@ final class DataDirectoryLock implements Closeable {
      * could hand in a second copy of.
      */
     // guarded by: its own concurrency — a set backed by a ConcurrentHashMap, entered only through the
-    // atomic add below and left only through the removals in take() and close().
-    private static final Set<Object> CLAIMED_LOCK_FILES = ConcurrentHashMap.newKeySet();
+    // atomic adds in claimAllOrNone and left only through releaseClaims, which take() and close() call.
+    private static final Set<Object> CLAIMED_LOCK_FILES_AND_DIRECTORIES = ConcurrentHashMap.newKeySet();
 
     /**
      * The channels a refusal opened and must not close, one to a lock file, kept reachable so that
@@ -157,30 +168,37 @@ final class DataDirectoryLock implements Closeable {
      * documents, for the same reason as the first: an open descriptor is a fact about the process.
      */
     // guarded by: the claim on the same key, and by its own concurrency for the rest. A take reads or
-    // writes the entry for a key only while it holds that key in CLAIMED_LOCK_FILES, which admits one
-    // holder of a key at a time, so the read that decides whether to open a descriptor and the write
-    // that keeps the one it opened cannot interleave with another take's over the same file.
+    // writes the entry for a key only while it holds that key in CLAIMED_LOCK_FILES_AND_DIRECTORIES,
+    // which admits one holder of a key at a time, so the read that decides whether to open a descriptor
+    // and the write that keeps the one it opened cannot interleave with another take's over the same
+    // file. The key is the lock file's identity where there is one, so what an entry is kept under is
+    // always one of the keys the take holding it claimed.
     private static final ConcurrentMap<Object, FileChannel> PINNED_REFUSED_CHANNELS = new ConcurrentHashMap<>();
 
     private final Path lockFile;
 
-    /** The entry in {@link #CLAIMED_LOCK_FILES} this lock owns, given back by {@link #close()}. */
-    private final Object claim;
+    /**
+     * The entries in {@link #CLAIMED_LOCK_FILES_AND_DIRECTORIES} this lock owns — the lock file's
+     * identity and the data directory's real path, or the real path alone where there is no identity to
+     * be had — given back together by {@link #close()}.
+     */
+    private final List<Object> claims;
 
     /**
-     * Whether the entry above has already gone back, so that closing this lock twice gives it back
-     * once. The entry names a file and says nothing about who put it there, so a second close — after
-     * another broker had started over the same directory — would otherwise take that broker's claim.
+     * Whether the entries above have already gone back, so that closing this lock twice gives them back
+     * once. An entry names a file or a directory and says nothing about who put it there, so a second
+     * close — after another broker had started over the same directory — would otherwise take that
+     * broker's claim.
      */
     // guarded by: its own atomicity — read and written only by the compare-and-set in close().
-    private final AtomicBoolean claimReleased = new AtomicBoolean();
+    private final AtomicBoolean claimsReleased = new AtomicBoolean();
 
     private final FileChannel channel;
     private final FileLock lock;
 
-    private DataDirectoryLock(Path lockFile, Object claim, FileChannel channel, FileLock lock) {
+    private DataDirectoryLock(Path lockFile, List<Object> claims, FileChannel channel, FileLock lock) {
         this.lockFile = lockFile;
-        this.claim = claim;
+        this.claims = claims;
         this.channel = channel;
         this.lock = lock;
     }
@@ -197,11 +215,19 @@ final class DataDirectoryLock implements Closeable {
         Objects.requireNonNull(dataDirectory, "dataDirectory");
 
         Path lockFile = dataDirectory.resolve(FILE_NAME);
-        Object claim = claimOn(dataDirectory, lockFile);
-        if (!CLAIMED_LOCK_FILES.add(claim)) {
-            // Refused without opening a thing, which is the whole of what keying a claim on the lock
-            // file's identity buys: a channel opened here would drop the running broker's lock when it
-            // was closed, and every way a channel has of being closed counts, the collector's included.
+        createLockFileIfAbsent(dataDirectory, lockFile);
+        Object fileIdentity = identityOf(lockFile);
+        Path directoryPath = realPathOf(dataDirectory, lockFile);
+        // What the descriptor kept for a refusal is kept under: the file's identity is what the hazard
+        // is about, since POSIX drops the locks of an inode rather than of a name, and the directory is
+        // the best a filesystem with no identity to give leaves to key on.
+        Object identity = fileIdentity != null ? fileIdentity : directoryPath;
+        List<Object> claims = fileIdentity != null ? List.of(fileIdentity, directoryPath) : List.of(directoryPath);
+
+        if (!claimAllOrNone(claims)) {
+            // Refused without opening a thing, which is the whole of what claiming before opening buys:
+            // a channel opened here would drop the running broker's lock when it was closed, and every
+            // way a channel has of being closed counts, the collector's included.
             throw alreadyLocked(dataDirectory, lockFile, null);
         }
         boolean taken = false;
@@ -211,7 +237,7 @@ final class DataDirectoryLock implements Closeable {
             // opening a second is the thing a retry must not be allowed to repeat. Reading the entry
             // here is safe without any lock of this class's own: this take holds the claim on the key,
             // and nothing else can be filling or emptying that entry while it does.
-            FileChannel kept = PINNED_REFUSED_CHANNELS.get(claim);
+            FileChannel kept = PINNED_REFUSED_CHANNELS.get(identity);
             if (kept == null) {
                 opened = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             }
@@ -227,12 +253,12 @@ final class DataDirectoryLock implements Closeable {
                 }
                 throw alreadyLocked(dataDirectory, lockFile, null);
             }
-            DataDirectoryLock held = new DataDirectoryLock(lockFile, claim, channel, lock);
+            DataDirectoryLock held = new DataDirectoryLock(lockFile, claims, channel, lock);
             taken = true;
             // A kept channel that has just been granted the lock is this lock's own from here: it
             // leaves the map so that close() is free to close it, and so that the next start over this
             // file opens one of its own rather than asking a descriptor this broker has closed.
-            PINNED_REFUSED_CHANNELS.remove(claim, channel);
+            PINNED_REFUSED_CHANNELS.remove(identity, channel);
             return held;
         } catch (OverlappingFileLockException heldByThisJvm) {
             // Something in this JVM holds a lock on this very file, which the claim above did not see:
@@ -255,15 +281,17 @@ final class DataDirectoryLock implements Closeable {
             //
             // A channel still open is a channel one of those paths could not safely close, so it is
             // kept rather than dropped; the two paths where closing is safe have closed it already,
-            // and a channel that is closed is not kept. It is kept before the claim goes back, and that
-            // order is load-bearing: the claim is the only thing keeping the next take from opening a
+            // and a channel that is closed is not kept. It is kept before the claims go back, and that
+            // order is load-bearing: a claim is the only thing keeping the next take from opening a
             // second descriptor on this file, so the entry has to be there before that take can look.
-            // A claim left behind by a take that failed is worse than the failure that left it, because
-            // the entry names a file and nothing else: every later start over that file in this JVM
-            // would be refused for the life of the process by a claim with no broker behind it.
+            // Claims left behind by a take that failed are worse than the failure that left them,
+            // because an entry names a file or a directory and nothing else: every later start over
+            // either in this JVM would be refused for the life of the process by a claim with no broker
+            // behind it. Both of this take's go back, and only this take's — a refused claim was rolled
+            // back by claimAllOrNone before this ever ran.
             if (!taken) {
-                pinIfAFailedTakeLeftItOpen(claim, opened);
-                CLAIMED_LOCK_FILES.remove(claim);
+                pinIfAFailedTakeLeftItOpen(identity, opened);
+                releaseClaims(claims);
             }
         }
     }
@@ -280,13 +308,14 @@ final class DataDirectoryLock implements Closeable {
         try (FileChannel releasing = channel) {
             lock.release();
         } finally {
-            // In a finally because a release that failed still ends this broker's claim on the
-            // directory: leaving the entry behind would refuse every later start in this JVM over a
-            // directory the operating system had already let go of. Once, because the entry names the
-            // lock file rather than this lock: a second close of an instance that has already given
-            // its claim back would take away whatever broker holds that file now.
-            if (claimReleased.compareAndSet(false, true)) {
-                CLAIMED_LOCK_FILES.remove(claim);
+            // In a finally because a release that failed still ends this broker's claims on the
+            // directory: leaving them behind would refuse every later start in this JVM over a
+            // directory the operating system had already let go of. Once, because an entry names the
+            // lock file or the directory rather than this lock: a second close of an instance that has
+            // already given its claims back would take away whatever broker holds them now. Exactly the
+            // entries this take added go back, which is the same list it made them from.
+            if (claimsReleased.compareAndSet(false, true)) {
+                releaseClaims(claims);
             }
         }
     }
@@ -313,28 +342,65 @@ final class DataDirectoryLock implements Closeable {
     }
 
     /**
-     * The identity a claim is kept under: the lock file's own, so that two directories whose
-     * {@value #FILE_NAME} is one file are one claim rather than two claims over one lock. It is read
-     * with a stat and nothing else — no descriptor is opened on a file another broker may be holding,
-     * which is the point of doing it this way rather than by opening the file and asking it.
+     * The first of the two keys a claim is kept under: the lock file's own identity, so that two
+     * directories whose {@value #FILE_NAME} is one file are one claim rather than two claims over one
+     * lock. It is read with a stat and nothing else — no descriptor is opened on a file another broker
+     * may be holding, which is the point of doing it this way rather than by opening the file and
+     * asking it.
      *
-     * <p>Where the identity cannot be had — a filesystem that has none to give, which answers null, or
-     * a lock file that cannot be stat'ed at all, which is a symbolic link to a name that is not there —
-     * the claim falls back to the data directory's real path. That is what every claim was kept under
-     * before, so the fallback is a claim that sees one directory's several spellings and not one file's
-     * several directories; the backstop in {@link #take(Path)} is what covers the difference.
+     * @param lockFile the file whose identity is wanted
+     * @return the identity, or null where it cannot be had: a filesystem that has none to give answers
+     *         null itself, and a lock file that cannot be stat'ed at all — a symbolic link to a name
+     *         that is not there yet — has none to read. Neither is a start to refuse, because both can
+     *         still be opened and locked, so the claim is then the directory's real path alone and the
+     *         backstop in {@link #take(Path)} covers what that cannot see.
      */
-    private static Object claimOn(Path dataDirectory, Path lockFile) {
-        createLockFileIfAbsent(dataDirectory, lockFile);
+    private static Object identityOf(Path lockFile) {
         try {
-            Object fileIdentity = Files.readAttributes(lockFile, BasicFileAttributes.class).fileKey();
-            return fileIdentity != null ? fileIdentity : realPathOf(dataDirectory, lockFile);
+            return Files.readAttributes(lockFile, BasicFileAttributes.class).fileKey();
         } catch (IOException cannotStatTheLockFile) {
-            // Handled by keying on the directory instead, which is what the paragraph above says this
+            // Handled by keying on the directory alone, which is what the paragraph above says this
             // costs. It is not rethrown because a lock file that cannot be stat'ed can still be opened
-            // and locked — a symbolic link to a name that does not exist yet is the case — and a start
-            // this class used to allow is not one to refuse over the way its claim is keyed.
-            return realPathOf(dataDirectory, lockFile);
+            // and locked, and a start this class used to allow is not one to refuse over the way its
+            // claim is keyed.
+            return null;
+        }
+    }
+
+    /**
+     * Takes every key of a claim or none of them, so that a take is refused rather than half-registered
+     * and a refusal gives back exactly what it had taken and nothing anybody else is holding.
+     *
+     * <p>The keys are added in one order everywhere — the lock file's identity, then the directory's
+     * real path — so two takes that want the same key contend on it in the same place, and the one that
+     * loses is the one that rolls back. Two takes cannot each take a key the other wants and each fail:
+     * they collide on the first key they share, and the winner has the rest of its list to itself.
+     *
+     * @param claims the keys this take needs, in the order they are taken
+     * @return true if every one of them is now this take's, false if one was somebody else's, in which
+     *         case none of them is
+     */
+    private static boolean claimAllOrNone(List<Object> claims) {
+        int taken = 0;
+        for (Object claim : claims) {
+            if (!CLAIMED_LOCK_FILES_AND_DIRECTORIES.add(claim)) {
+                releaseClaims(claims.subList(0, taken));
+                return false;
+            }
+            taken++;
+        }
+        return true;
+    }
+
+    /**
+     * Gives back the keys a take added, and only those: the list is the one that take built, so nothing
+     * here can take away an entry another holder put there.
+     *
+     * @param claims the keys to give back
+     */
+    private static void releaseClaims(List<Object> claims) {
+        for (Object claim : claims) {
+            CLAIMED_LOCK_FILES_AND_DIRECTORIES.remove(claim);
         }
     }
 

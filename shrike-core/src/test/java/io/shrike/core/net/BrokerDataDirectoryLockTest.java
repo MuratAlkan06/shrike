@@ -320,6 +320,57 @@ class BrokerDataDirectoryLockTest {
         }
     }
 
+    /**
+     * The refusal a lock file's identity cannot make on its own: {@code shrike.lock} deleted out from
+     * under the broker holding it, and a second start over that very data directory.
+     *
+     * <p>Deleting it leaves that broker's claim and its lock on an inode with no name. The next start
+     * creates a file of its own and reads an identity nobody holds — so a claim kept under the lock
+     * file's identity and nothing else let it through, and what that allowed was two brokers over one
+     * data directory inside one JVM, each holding a valid lock on a different inode. That is the thing
+     * this class exists to refuse, arriving through the one operation that makes a lock file stop being
+     * the file it was. So a take claims the data directory's own real path as well as the lock file's
+     * identity, and this is the half of that pair the identity cannot answer.
+     *
+     * <p>What it does not cover is said here rather than left to be found. The same deletion in front
+     * of a broker in <em>another</em> process is still a start that succeeds: the kernel's lock is on
+     * the inode too, so there is nothing on the new file for a second process to collide with. That
+     * hole is older than any of this, it is the reason nothing here deletes the file, and no claim in
+     * this JVM can close it.
+     */
+    @Test
+    void refusesASecondBrokerOverADirectoryWhoseLockFileWasDeletedUnderTheBrokerHoldingIt() throws Exception {
+        try (ShrikeBroker running = BrokerHarness.start(dataDirectory)) {
+            Files.delete(dataDirectory.resolve(DataDirectoryLock.FILE_NAME));
+
+            ShrikeIOException refused = assertThrows(ShrikeIOException.class,
+                    () -> BrokerHarness.start(dataDirectory),
+                    "a second broker over a directory whose lock file was deleted is still a second"
+                            + " broker over that directory, and the lock file it makes for itself is a"
+                            + " handle on nothing");
+
+            assertTrue(refused.getMessage().contains(dataDirectory.toString()),
+                    "the refusal names the directory an operator has to choose another of: " + refused.getMessage());
+            assertNull(whatTheRefusalHadAlreadyOpenedAChannelOver(refused),
+                    "and the claim refused it before a descriptor existed: the new lock file is a new"
+                            + " inode, so what saw this start is the claim kept under the data"
+                            + " directory's own real path rather than the one kept under the file");
+            try (WireClient client = WireClient.connectTo(running)) {
+                assertInstanceOf(ResponseDecoding.Answered.class,
+                        client.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
+                        "and the broker that holds the directory is serving over it still");
+            }
+        }
+
+        try (ShrikeBroker afterwards = BrokerHarness.start(dataDirectory);
+             WireClient client = WireClient.connectTo(afterwards)) {
+            assertInstanceOf(ResponseDecoding.Answered.class,
+                    client.call(FIRST_CORRELATION_ID, new CreateTopicRequest(ANOTHER_TOPIC, ONLY_PARTITION_COUNT)),
+                    "and that refusal lasts exactly as long as the broker it was protecting: the next"
+                            + " start over the directory makes a lock file of its own and takes it");
+        }
+    }
+
     @Test
     void startsOverTheSameDataDirectoryOnceTheBrokerHoldingItHasStoppedCleanly() throws Exception {
         try (ShrikeBroker first = BrokerHarness.start(dataDirectory);
