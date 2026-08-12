@@ -29,6 +29,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 
 /**
  * The broker: a listening socket, a thread per connection, and the partitions and committed offsets
@@ -207,6 +208,17 @@ public final class ShrikeBroker implements AutoCloseable {
     // volatile because a test installs it from its own thread and every connection thread reads it.
     private volatile Runnable connectionEnded = () -> {
     };
+
+    /**
+     * The third test seam, and the last field here production code never writes. It is where the WARN a
+     * failed handoff earns is written, so that a test can make the writing of that line throw the way it
+     * would under the memory pressure that failed the handoff in the first place — which is the whole
+     * reason {@link #warnHandoffFailed(String, Throwable)} runs after the unwind rather than before it.
+     * Production leaves it writing the line.
+     */
+    // volatile because a test installs it from its own thread and shrike-acceptor is what reads it.
+    private volatile BiConsumer<String, Throwable> handoffFailureLog =
+            (message, failure) -> LOGGER.log(System.Logger.Level.WARNING, message, failure);
 
     /**
      * The one accepting thread. Not final because it starts after the broker is built, since a thread
@@ -450,6 +462,18 @@ public final class ShrikeBroker implements AutoCloseable {
         connectionEnded = seam;
     }
 
+    /**
+     * Installs the test seam described on {@link #handoffFailureLog}. Package-private for the same
+     * reason as {@link #onConnectionReserved(Runnable)}: where this broker writes its log lines is not
+     * a setting, and a way to redirect them from outside would be a way to silence them.
+     *
+     * @param seam what to write the WARN about a failed handoff with, given the line and what failed
+     */
+    void logHandoffFailuresThrough(BiConsumer<String, Throwable> seam) {
+        Objects.requireNonNull(seam, "seam");
+        handoffFailureLog = seam;
+    }
+
     private void startAccepting() {
         acceptor = new Thread(this::acceptConnections, ACCEPTOR_THREAD_NAME);
         acceptor.start();
@@ -520,7 +544,8 @@ public final class ShrikeBroker implements AutoCloseable {
      * {@code OutOfMemoryError} under exactly the pressure where a leaked place under the cap, a leaked
      * map entry, or a leaked socket costs the most — and a throwable that reached the accept loop would
      * end the one thread this broker accepts on while its port stayed bound and its ready file stayed
-     * where it was, which is a broker that is up and deaf.
+     * where it was, which is a broker that is up and deaf. The unwind runs <em>before</em> the WARN that
+     * reports it, for the reason {@link #warnHandoffFailed(String, Throwable)} sets out.
      *
      * @param socket the accepted socket
      * @return whether the next socket may be accepted straight away. False means the handoff failed for
@@ -582,16 +607,43 @@ public final class ShrikeBroker implements AutoCloseable {
         } catch (IOException e) {
             // About this socket rather than about this broker — the peer went away between the accept
             // and here — so the next one is worth accepting at once.
-            LOGGER.log(System.Logger.Level.WARNING, name + " could not be configured, so it was closed", e);
             abandon(reserved, socket);
+            warnHandoffFailed(name + " could not be configured, so it was closed", e);
             return true;
         } catch (Throwable e) {
             // Out of memory, out of native threads: the pressure case this unwinding exists for, at the
             // moment a place under the cap and a socket are worth most. Everything this connection took
             // goes back, and the acceptor stays alive to serve the connections that are already open.
-            LOGGER.log(System.Logger.Level.WARNING, name + " could not be handed a thread, so it was closed", e);
             abandon(reserved, socket);
+            warnHandoffFailed(name + " could not be handed a thread, so it was closed", e);
             return false;
+        }
+    }
+
+    /**
+     * Writes the WARN a failed handoff earns, once the unwind has already given back everything that
+     * handoff took.
+     *
+     * <p>Both of those are deliberate and neither is habit. <strong>The unwind runs first</strong>
+     * because the failure this whole guard exists for is terminal memory pressure, which is the one
+     * condition under which formatting a message and appending a line can themselves throw: logging
+     * first would leave the place under the cap taken, the socket open, and this thread dead — the
+     * three losses the unwind exists to prevent, arriving from the line that was meant to report them.
+     * <strong>And a throwable from the logging is dropped here</strong>, which is the one place in this
+     * codebase that drops one. What just failed is the logger, so there is nothing left to report the
+     * failure to; the connection's place, its map entry, and its socket are already back; and a broker
+     * that stopped accepting because it could not write a line about one socket would be a far larger
+     * outage than the missing line. That exception to PRINCIPLES §3 is written down in DESIGN.md, under
+     * "One acceptor, one platform thread per connection, and a hard cap".
+     *
+     * @param message what to say about the connection that was not served
+     * @param failure what stopped it being served
+     */
+    private void warnHandoffFailed(String message, Throwable failure) {
+        try {
+            handoffFailureLog.accept(message, failure);
+        } catch (Throwable loggingFailed) {
+            // Dropped on purpose: see above. There is nowhere to report the failure of reporting.
         }
     }
 

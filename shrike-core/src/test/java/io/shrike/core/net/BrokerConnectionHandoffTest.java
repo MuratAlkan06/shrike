@@ -82,4 +82,45 @@ class BrokerConnectionHandoffTest {
                             + " came back with it");
         }
     }
+
+    /**
+     * The same failure, with the WARN about it failing too.
+     *
+     * <p>That is not a contrived pair: the handoff fails because the machine is out of memory, and
+     * formatting a message and appending a line are two more allocations under that same condition. So
+     * the unwind runs before the line is written rather than after it, and the writing of the line is
+     * where a throwable stops. With the old order, an {@code OutOfMemoryError} from the logger left the
+     * place under the cap taken, the socket open, and the acceptor dead — the three losses the unwind
+     * exists to prevent, arriving from the line that was meant to report them.
+     */
+    @Test
+    void givesTheSlotBackAndKeepsAcceptingWhenTheWarnAboutAFailedHandoffThrowsToo() throws Exception {
+        CountDownLatch warnAttempted = new CountDownLatch(1);
+        AtomicBoolean failTheNextHandoff = new AtomicBoolean(true);
+        broker.onConnectionReserved(() -> {
+            if (failTheNextHandoff.compareAndSet(true, false)) {
+                throw new OutOfMemoryError("unable to create native thread (thrown by a test seam)");
+            }
+        });
+        broker.logHandoffFailuresThrough((line, failure) -> {
+            warnAttempted.countDown();
+            throw new OutOfMemoryError("unable to write a log line (thrown by a test seam)");
+        });
+
+        try (WireClient failed = WireClient.connectTo(broker)) {
+            Future<Boolean> closed = readerThread.submit(failed::isClosedWithNoReply);
+
+            Await.latch(warnAttempted, "the WARN about the failed handoff to be attempted");
+            assertTrue(Await.value(closed, "the broker to close the socket it could not hand over"),
+                    "the socket was closed before the line about it was written, so a WARN that throws"
+                            + " cannot leave it open");
+        }
+
+        try (WireClient served = WireClient.connectTo(broker)) {
+            assertInstanceOf(ResponseDecoding.Answered.class,
+                    served.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
+                    "the place under the cap came back before the WARN was attempted, and the acceptor"
+                            + " survived that WARN throwing");
+        }
+    }
 }
