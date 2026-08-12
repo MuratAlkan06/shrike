@@ -123,4 +123,57 @@ class BrokerConnectionHandoffTest {
                             + " survived that WARN throwing");
         }
     }
+
+    /**
+     * The same failure once more, with the unwind that answers it failing too.
+     *
+     * <p>That is the same pair as the one above rather than a new contrivance: removing a map entry and
+     * closing a socket are allocations under the very memory pressure that failed the handoff. A
+     * throwable from the unwind used to travel out of the handoff and end the accept loop, leaving a
+     * broker with its port bound, its ready file where it was, and nothing accepting — and it left the
+     * place under the cap taken on the way past, because the throw happened before the count came down.
+     *
+     * <p>So the two assertions are what the fix owes: the next connection is served, which takes both an
+     * acceptor that is alive and a place under the cap that came back; and the one after <em>that</em> is
+     * closed rather than served, which is how a place given back twice would show, since a count that had
+     * gone one below zero would let two connections through a cap of one.
+     */
+    @Test
+    void givesTheSlotBackOnceAndKeepsAcceptingWhenTheUnwindOfAFailedHandoffThrows() throws Exception {
+        CountDownLatch unwindAttempted = new CountDownLatch(1);
+        AtomicBoolean failTheNextHandoff = new AtomicBoolean(true);
+        AtomicBoolean failTheNextUnwind = new AtomicBoolean(true);
+        broker.onConnectionReserved(() -> {
+            if (failTheNextHandoff.compareAndSet(true, false)) {
+                throw new OutOfMemoryError("unable to create native thread (thrown by a test seam)");
+            }
+        });
+        broker.onConnectionAbandoned(() -> {
+            if (failTheNextUnwind.compareAndSet(true, false)) {
+                unwindAttempted.countDown();
+                throw new OutOfMemoryError("unable to close a socket (thrown by a test seam)");
+            }
+        });
+
+        try (WireClient failed = WireClient.connectTo(broker)) {
+            Await.latch(unwindAttempted, "the unwind of the failed handoff to be attempted");
+        }
+
+        try (WireClient served = WireClient.connectTo(broker)) {
+            Future<ResponseDecoding> answer = readerThread.submit(
+                    () -> served.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)));
+
+            assertInstanceOf(ResponseDecoding.Answered.class,
+                    Await.value(answer, "the broker to answer the connection after the one whose unwind threw"),
+                    "the acceptor outlived an unwind that threw, and the place under the cap came back with it");
+
+            try (WireClient overTheCap = WireClient.connectTo(broker)) {
+                Future<Boolean> closed = readerThread.submit(overTheCap::isClosedWithNoReply);
+
+                assertTrue(Await.value(closed, "the broker to close the connection past its cap"),
+                        "and the place came back once and only once: the cap is still one connection, so the"
+                                + " connection after the one being served is closed rather than served");
+            }
+        }
+    }
 }

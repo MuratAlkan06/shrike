@@ -314,8 +314,10 @@ class BrokerLaunchTest {
      * which a real environment variable cannot carry, so the map is crafted here rather than reached
      * through the JVM's own environment. The refusal must be the shape every other bad value gets: an
      * {@link IllegalArgumentException} naming the variable, echoing the value through the scrubber, on
-     * one line — not a {@code RuntimeException} that escapes the start's catch and prints the raw
-     * text with a stack.
+     * one line. What it used to be was an {@code InvalidPathException} — an
+     * {@link IllegalArgumentException} itself, so it always stopped the start on the same exit code as
+     * any other bad value, but with a sentence that named no variable and had never been through the
+     * scrubber, which is a value chosen to carry a newline writing a second line on standard error.
      */
     @Test
     void refusesAPathVariableHoldingACharacterNoPathCanCarryNamingItOnOneScrubbedLine() {
@@ -347,6 +349,65 @@ class BrokerLaunchTest {
         assertFalse(readyRefusal.getMessage().contains("\u0000"),
                 "the ready-file path is named and scrubbed the same way the data directory is: "
                         + readyRefusal.getMessage());
+    }
+
+    /**
+     * The sentence a refusal says is scrubbed, and so is everything that refusal is caused by.
+     *
+     * <p>{@link io.shrike.core.net.BrokerMain} prints {@link Throwable#getMessage()} and nothing else,
+     * so the shipped path was never the exposure here. {@link BrokerLaunch#from(List, Map)} is public
+     * api, though, and an embedder that logs a start it could not make logs the causes with it — which
+     * is where the JDK's own exceptions were arriving whole. {@link Integer#parseInt} names the text it
+     * could not read, and ten thousand digits are ASCII digits, so they reach it; a path no path can
+     * hold is embedded in an {@code InvalidPathException}; a name that will not resolve <em>is</em> the
+     * message of an {@code UnknownHostException}. Each of those carried the value a second time, one
+     * layer under the sentence that had scrubbed it, newline and all.
+     *
+     * <p>So every kind of value this class refuses is walked here to the bottom of its cause chain: the
+     * numeric settings in both widths they are read at, the two settings read into a path, the address,
+     * and one of the spelled-out settings, which is the case that keeps a scrubber call from being
+     * quietly removed from the paths where nothing is parsed at all.
+     */
+    @Test
+    void carriesNoneOfAHostileValueInWhateverARefusalIsCausedBy() {
+        String forgedLine = "\n2026-01-01 FATAL forged log line";
+        String tenKilobytesOfDigits = "9".repeat(10_000);
+
+        refusesCarryingNothingOf("1048576" + forgedLine, BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE);
+        refusesCarryingNothingOf("forever" + forgedLine, BrokerLaunch.RETENTION_MS_VARIABLE);
+        refusesCarryingNothingOf(tenKilobytesOfDigits, BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE);
+        refusesCarryingNothingOf("65536" + forgedLine, BrokerLaunch.PORT_VARIABLE);
+        refusesCarryingNothingOf(DATA_DIRECTORY + "\u0000" + forgedLine, BrokerLaunch.READY_FILE_VARIABLE);
+        refusesCarryingNothingOf(":not:an:address" + forgedLine, BrokerLaunch.BIND_ADDRESS_VARIABLE);
+        refusesCarryingNothingOf("sometimes" + forgedLine, BrokerLaunch.FLUSH_MODE_VARIABLE);
+    }
+
+    /**
+     * Sets one variable to a value chosen to be hostile, and walks everything the refusal is made of.
+     *
+     * @param hostileValue what to set the variable to, which must appear nowhere in the refusal
+     * @param variable     the variable to set it on, always beside a data directory that is fine, so
+     *                     that the refusal proved is the one this value earns
+     */
+    private static void refusesCarryingNothingOf(String hostileValue, String variable) {
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                variable, hostileValue);
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(variable),
+                "the sentence names the variable to fix: " + refusal.getMessage());
+        for (Throwable carried = refusal; carried != null; carried = carried.getCause()) {
+            String message = String.valueOf(carried.getMessage());
+            assertFalse(message.contains(hostileValue),
+                    variable + " carries the value it was given no further than the scrubber, here and all"
+                            + " the way down what caused it: " + message);
+            assertFalse(message.contains("\n"),
+                    variable + " carries no newline anywhere in that chain, so nothing an embedder prints"
+                            + " of it can forge a line: " + message);
+        }
     }
 
     @Test
