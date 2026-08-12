@@ -100,25 +100,39 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * own, which is the finding this paragraph exists for. A channel the JDK opened for itself registers a
  * cleaner that closes its descriptor once nothing references the channel, so a channel merely left alone
  * is closed by the next collection, and that close drops the lock exactly as an explicit one would. The
- * refusal therefore keeps the channel in {@link #PINNED_REFUSED_CHANNELS}, under the key its claim was
- * kept under, because a strong reference is the only thing that keeps a descriptor open in a
- * garbage-collected runtime. Anything else thrown out of the open or the lock is treated the same way: a
+ * refusal therefore keeps the channel — in {@link #PINNED_REFUSED_CHANNELS} under the lock file's own
+ * identity, or in {@link #PINNED_REFUSED_CHANNELS_WITH_NO_IDENTITY} where the file has none to give —
+ * because a strong reference is the only thing that keeps a descriptor open in a garbage-collected
+ * runtime. Anything else thrown out of the open or the lock is treated the same way: a
  * channel an {@link Error} left behind is on the same hazard as one an overlap left behind.
  *
- * <p><strong>What that costs is one descriptor per lock file, and a retry pays it once.</strong> A take
- * reads {@link #PINNED_REFUSED_CHANNELS} before it opens anything, so a start over a file this process
- * is already keeping a descriptor on opens none at all: it asks the descriptor already there for the
- * lock, and is refused by the same two answers as any other start, or granted the lock and handed that
- * descriptor with it. The bound that follows is exact rather than hopeful — one descriptor per lock
- * file, held until a start takes the lock through it or until this process ends, whichever comes first
- * — and what makes it exact is the claim: a take reads or writes the entry for a key only while it
- * holds the claim on that key, and a claim admits one holder at a time, so two takes cannot both be
- * opening a descriptor for one file. A supervisor retrying a start that a non-broker holder goes on
- * refusing therefore pays one descriptor for the whole loop rather than one for every turn of it, which
- * is the difference between a cost and a leak. It is not free, and the trade is written down rather than
- * hidden: a descriptor is held on a file this process was refused over, an operator can see it in
- * {@code lsof}, and one per lock file is slow and visible where a data directory two brokers are writing
- * to is neither.
+ * <p><strong>What that costs is one descriptor per lock file the filesystem can identify, and a retry
+ * pays it once.</strong> A take reads {@link #PINNED_REFUSED_CHANNELS} before it opens anything, so a
+ * start over a file this process is already keeping a descriptor on opens none at all: it asks the
+ * descriptor already there for the lock, and is refused by the same two answers as any other start, or
+ * granted the lock and handed that descriptor with it. The bound that follows is exact rather than
+ * hopeful — one descriptor per lock file wherever {@code fileKey()} answers, held until a start takes
+ * the lock through it or until this process ends, whichever comes first — and what makes it exact is
+ * the claim: a take reads or writes the entry for a key only while it holds the claim on that key, and
+ * a claim admits one holder at a time, so two takes cannot both be opening a descriptor for one file. A
+ * supervisor retrying a start that a non-broker holder goes on refusing therefore pays one descriptor
+ * for the whole loop rather than one for every turn of it, which is the difference between a cost and a
+ * leak. It is not free, and the trade is written down rather than hidden: a descriptor is held on a file
+ * this process was refused over, an operator can see it in {@code lsof}, and one per lock file is slow
+ * and visible where a data directory two brokers are writing to is neither.
+ *
+ * <p><strong>And it is asked for the lock only where the key is the file's own identity, which is the
+ * other half of that sentence.</strong> An identity <em>is</em> the device and inode, so a descriptor
+ * kept under one is open on the file the next start is asking about and on no other. A key that names a
+ * directory — every key on a filesystem with no {@code fileKey()} to give, and the key of a lock file
+ * that cannot be stat'ed — proves nothing of the sort: the file behind a descriptor kept under it may
+ * be an inode {@value #FILE_NAME} stopped naming since, and a start handed that one would hold a lock on
+ * an orphan without ever having opened {@value #FILE_NAME}, leaving it free for the next broker to take.
+ * So on that path nothing kept is ever asked, every take opens a descriptor of its own, and every
+ * descriptor a refusal leaves open is kept rather than one of them — refusing to reuse and keeping all
+ * of them are one change, because a channel kept nowhere is a channel the cleaner closes. The cost there
+ * is one descriptor per refused attempt, which is what this cost before the map above was keyed, and it
+ * is what a filesystem with no identity to give is charged for having none.
  *
  * <p>Nothing here deletes the lock file, on this path or any other: stopping a broker leaves the data
  * directory exactly as it found it, and an empty file that the next start reuses is cheaper than a
@@ -152,18 +166,21 @@ final class DataDirectoryLock implements Closeable {
     private static final Set<Object> CLAIMED_LOCK_FILES_AND_DIRECTORIES = ConcurrentHashMap.newKeySet();
 
     /**
-     * The channels a refusal opened and must not close, one to a lock file, kept reachable so that
-     * nothing else closes them either. A {@link FileChannel} the JDK opened for itself closes its
-     * descriptor from a cleaner once the channel is unreachable, and on this file that close is what
-     * drops a running broker's lock, so declining to close is only half of keeping it: the other half is
-     * the reference held here.
+     * The channels a refusal opened and must not close, one to a lock file wherever
+     * {@link BasicFileAttributes#fileKey() fileKey} answers, kept reachable so that nothing else closes
+     * them either. A {@link FileChannel} the JDK opened for itself closes its descriptor from a cleaner
+     * once the channel is unreachable, and on this file that close is what drops a running broker's
+     * lock, so declining to close is only half of keeping it: the other half is the reference held here.
      *
-     * <p>It is keyed by what the claim is keyed by rather than being a bare collection, because the
+     * <p>It is keyed by the lock file's own identity rather than being a bare collection, because the
      * entry is also what the next start over that file asks for the lock instead of opening a descriptor
-     * of its own. That is what holds this to one descriptor per lock file however many times a start is
-     * retried, and it is the whole of the difference between a bound and a leak. An entry is given up
-     * only to the start that finally takes the lock through it, which owns that channel from then on and
-     * closes it with the lock.
+     * of its own — and an identity is what makes that sound, since it is the device and inode the
+     * descriptor is open on. That is what holds this to one descriptor per lock file however many times
+     * a start is retried, and it is the whole of the difference between a bound and a leak. An entry is
+     * given up only to the start that finally takes the lock through it, which owns that channel from
+     * then on and closes it with the lock. A refusal with no identity to key on is kept in
+     * {@link #PINNED_REFUSED_CHANNELS_WITH_NO_IDENTITY} instead and never asked, which is where the
+     * other half of the bound is written down.
      *
      * <p>It is the second of the three static mutable fields PRINCIPLES §2 forbids and this class
      * documents, for the same reason as the first: an open descriptor is a fact about the process.
@@ -281,9 +298,14 @@ final class DataDirectoryLock implements Closeable {
                 // with it, which says this process was granted no whole-file lock on it: two processes
                 // cannot both have one. That is what closing here rests on, and being exact about what
                 // it does not rest on is the point of this comment. The overlap below not having been
-                // thrown proves less than it looks: the JVM's lock table holds its FileLocks weakly,
-                // so a lock in this process whose FileLock object has been collected is not in the
-                // table to be found, and a lock over some other range of this file would not have
+                // thrown proves less than it looks: the JVM's lock table holds its FileLocks weakly, so
+                // a lock in this process whose FileLock object has been collected is not in the table to
+                // be found. That is a narrower window than it reads as, and the width is worth having
+                // right: a FileLock cannot be collected while its channel is, because the channel's own
+                // FileLockTable keeps a strong Set of the locks taken through it, so dropping a FileLock
+                // and keeping its channel keeps the entry. What is left is the moment between a channel
+                // becoming unreachable and the cleaner that closes it running — and that close drops the
+                // very lock in question. A lock over some other range of this file would not have
                 // conflicted with the answer above either. Nothing in this codebase takes either kind,
                 // and the window that leaves is accepted rather than closed by keeping the descriptor:
                 // this is the ordinary refusal — a second broker on the machine — and it would be a
