@@ -282,6 +282,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return byDefault;
         }
         try {
+            requireAsciiDigits(named.get());
             return Integer.parseInt(named.get());
         } catch (NumberFormatException notANumber) {
             throw new IllegalArgumentException(variable + " must be a whole number from " + Integer.MIN_VALUE
@@ -299,10 +300,39 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return byDefault;
         }
         try {
+            requireAsciiDigits(named.get());
             return Long.parseLong(named.get());
         } catch (NumberFormatException notANumber) {
             throw new IllegalArgumentException(variable + " must be a whole number from " + Long.MIN_VALUE
                     + " to " + Long.MAX_VALUE + ", but was " + SafeName.quote(named.get()), notANumber);
+        }
+    }
+
+    /**
+     * Requires the text to be a whole number written the one way this broker reads one — ASCII digits,
+     * with at most one leading ASCII {@code '-'} and a digit after it — and fails the way the JDK's own
+     * parse fails when it is not, so a value this refuses is refused in the words a value the parse
+     * refuses has always been refused in. {@link Integer#parseInt} and {@link Long#parseLong} take a
+     * Unicode decimal digit from any script and a leading {@code '+'}: {@code Long.parseLong("٤٢")} is
+     * 42, so a setting written in Arabic-Indic digits would otherwise start this broker on a number no
+     * operator could have typed on purpose or read back out of the running configuration. The minus
+     * sign stays legal because {@code retention.ms} and {@code retention.bytes} are switched off with
+     * {@link LogConfig#RETENTION_DISABLED} and an operator sets that from the environment; the plus
+     * sign does not, because one spelling of a number is enough.
+     *
+     * @throws NumberFormatException if the text is anything but ASCII digits behind an optional single
+     *                               leading {@code '-'}
+     */
+    private static void requireAsciiDigits(String text) {
+        int firstDigit = !text.isEmpty() && text.charAt(0) == '-' ? 1 : 0;
+        if (firstDigit == text.length()) {
+            throw new NumberFormatException(text);
+        }
+        for (int i = firstDigit; i < text.length(); i++) {
+            char character = text.charAt(i);
+            if (character < '0' || character > '9') {
+                throw new NumberFormatException(text);
+            }
         }
     }
 
@@ -353,6 +383,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
 
     private static int port(String named) {
         try {
+            requireAsciiDigits(named);
             return Integer.parseInt(named);
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(PORT_VARIABLE + " must be a whole number from "

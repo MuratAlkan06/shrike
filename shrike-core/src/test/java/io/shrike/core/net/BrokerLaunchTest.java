@@ -38,6 +38,15 @@ class BrokerLaunchTest {
     /** One past the largest number an {@code int} holds, which is the value that tells the two apart. */
     private static final String ONE_PAST_AN_INT = String.valueOf(Integer.MAX_VALUE + 1L);
 
+    /** 42, written in the digits the JDK's own parse reads as 42 and an operator cannot read at all. */
+    private static final String FORTY_TWO_IN_ARABIC_INDIC_DIGITS = "٤٢";
+
+    /** One setting per place a number is read here: the int parser, the long parser, and the port. */
+    private static final List<String> SETTINGS_READ_AS_NUMBERS_OF_EVERY_KIND = List.of(
+            BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE,
+            BrokerLaunch.RETENTION_MS_VARIABLE,
+            BrokerLaunch.PORT_VARIABLE);
+
     /**
      * Every setting this launch reads into an {@code int} field, whichever record the field belongs to.
      * The port is not among them because it is read in a range of its own; it has its own test below.
@@ -296,6 +305,42 @@ class BrokerLaunchTest {
                 "a value too long to be a number is cut rather than echoed whole: " + refusal.getMessage());
         assertFalse(refusal.getMessage().contains(tenKilobytesOfDigits),
                 "the ten-kilobyte value never reaches the log line in full");
+    }
+
+    @Test
+    void refusesANumberWrittenInDigitsOfAnotherScriptRatherThanReadingItAsTheJdkWould() {
+        assertEquals(42L, Long.parseLong(FORTY_TWO_IN_ARABIC_INDIC_DIGITS),
+                "the JDK reads these as 42, which is why a value written in them has to be refused here "
+                        + "rather than parsed");
+
+        for (String variable : SETTINGS_READ_AS_NUMBERS_OF_EVERY_KIND) {
+            Map<String, String> anotherScript = Map.of(
+                    BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                    variable, FORTY_TWO_IN_ARABIC_INDIC_DIGITS);
+
+            IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                    () -> BrokerLaunch.from(NO_ARGUMENTS, anotherScript));
+
+            assertTrue(refusal.getMessage().contains(variable),
+                    "a value this broker will not read is refused naming the variable that set it: "
+                            + refusal.getMessage());
+            assertTrue(refusal.getMessage().contains("must be a whole number"),
+                    "and it is refused as the number it is not, rather than started on: " + refusal.getMessage());
+        }
+    }
+
+    @Test
+    void takesTheMinusOneThatSwitchesRetentionOff() {
+        Map<String, String> retentionOff = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.RETENTION_MS_VARIABLE, String.valueOf(LogConfig.RETENTION_DISABLED),
+                BrokerLaunch.RETENTION_BYTES_VARIABLE, String.valueOf(LogConfig.RETENTION_DISABLED));
+
+        LogConfig logConfig = BrokerLaunch.from(NO_ARGUMENTS, retentionOff).config().logConfig();
+
+        assertEquals(LogConfig.RETENTION_DISABLED, logConfig.retentionMs(),
+                "the minus sign is the one character besides a digit a number here is written with");
+        assertEquals(LogConfig.RETENTION_DISABLED, logConfig.retentionBytes());
     }
 
     @Test
