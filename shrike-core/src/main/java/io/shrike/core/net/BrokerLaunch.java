@@ -64,6 +64,20 @@ import java.util.Optional;
  * caller those records have. A refusal from one of them is caught here and rethrown with the variable
  * that set the field in front of it, which is possible because one variable sets one field.
  *
+ * <p><strong>A refusal carries the value only through {@link SafeName#quote}, and that goes for what
+ * it is caused by as well as for what it says.</strong> An environment value is chosen by whoever
+ * starts the process, so it can hold a newline that forges a log line or a megabyte that floods
+ * standard error, and every sentence built here echoes it through the scrubber for that reason. The
+ * exceptions the JDK throws while reading one do not: {@link Integer#parseInt} names the text in
+ * {@code For input string}, {@link java.nio.file.InvalidPathException} embeds it whole, and
+ * {@link UnknownHostException} is the raw name. {@link BrokerMain} prints only
+ * {@link Throwable#getMessage()}, so the shipped path was never affected — but this class is public
+ * api, and an embedder that logs a failure prints its causes. So a JDK failure read here is
+ * <em>translated</em> rather than chained: the sentence says which variable and what it was given, and
+ * nothing behind it carries the value a second time. That is deliberate rather than a swallowed
+ * exception under PRINCIPLES §3, and it is the whole of what is lost — the type of a failure whose one
+ * meaning the sentence already states.
+ *
  * @param config      the configuration the broker starts with
  * @param bindAddress the interface to listen on, which is the loopback address unless the environment
  *                    named another one
@@ -287,8 +301,11 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             requireAsciiDigits(named.get());
             return Integer.parseInt(named.get());
         } catch (NumberFormatException notANumber) {
+            // Translated rather than chained: ten thousand digits pass requireAsciiDigits and fail in
+            // Integer.parseInt, whose message would carry every one of them into the cause chain. See
+            // "A refusal carries the value only through SafeName.quote" on this class.
             throw new IllegalArgumentException(variable + " must be a whole number from " + Integer.MIN_VALUE
-                    + " to " + Integer.MAX_VALUE + ", but was " + SafeName.quote(named.get()), notANumber);
+                    + " to " + Integer.MAX_VALUE + ", but was " + SafeName.quote(named.get()));
         }
     }
 
@@ -305,8 +322,9 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             requireAsciiDigits(named.get());
             return Long.parseLong(named.get());
         } catch (NumberFormatException notANumber) {
+            // Translated rather than chained, for the reason the int above gives.
             throw new IllegalArgumentException(variable + " must be a whole number from " + Long.MIN_VALUE
-                    + " to " + Long.MAX_VALUE + ", but was " + SafeName.quote(named.get()), notANumber);
+                    + " to " + Long.MAX_VALUE + ", but was " + SafeName.quote(named.get()));
         }
     }
 
@@ -385,20 +403,24 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
 
     /**
      * The path a variable names, refused the way every other value here is when the text cannot be one.
-     * {@link Path#of} throws {@link InvalidPathException} — an unchecked exception — on a string no path
-     * can hold, whose own message embeds the raw text; caught here it becomes the one-sentence refusal
-     * naming the variable and echoing the value through {@link SafeName#quote}, so it stops the start on
-     * exit code {@value BrokerMain#STARTUP_FAILURE_EXIT_CODE} like any other bad value rather than
-     * escaping the exit path as a stack trace carrying the raw text. On POSIX the only such character is
-     * a {@code NUL}, which an environment variable cannot carry, so this is the refusal shape no real
-     * environment reaches — and the one that would otherwise bypass both the scrubber and the exit path.
+     *
+     * <p>{@link Path#of} throws {@link InvalidPathException} on a string no path can hold. That is an
+     * {@link IllegalArgumentException}, so it always stopped the start on exit code
+     * {@value BrokerMain#STARTUP_FAILURE_EXIT_CODE} like any other bad value — what it did not do was go
+     * through the scrubber: its message embeds the raw text, so a value chosen to carry a newline wrote
+     * a second line on standard error out of the one place here that had not been routed through
+     * {@link SafeName#quote}, and it named no variable to fix. Caught here it becomes the one sentence
+     * every other refusal is, and the exception behind it is dropped rather than chained, because that
+     * message is the raw text a second time. On POSIX the only character no path can hold is a
+     * {@code NUL}, which an environment variable cannot carry, so this is reachable through this class
+     * as api rather than through a real environment.
      */
     private static Path path(String named, String variable) {
         try {
             return Path.of(named);
         } catch (InvalidPathException notAPath) {
             throw new IllegalArgumentException(variable + " must name a path this broker can use, but "
-                    + SafeName.quote(named) + " is not one", notAPath);
+                    + SafeName.quote(named) + " is not one");
         }
     }
 
@@ -406,10 +428,11 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
         try {
             requireAsciiDigits(named);
             return Integer.parseInt(named);
-        } catch (NumberFormatException e) {
+        } catch (NumberFormatException notANumber) {
+            // Translated rather than chained, for the reason wholeNumber gives.
             throw new IllegalArgumentException(PORT_VARIABLE + " must be a whole number from "
                     + BrokerConfig.EPHEMERAL_PORT + " to " + BrokerConfig.MAX_PORT + ", but was "
-                    + SafeName.quote(named), e);
+                    + SafeName.quote(named));
         }
     }
 
@@ -420,10 +443,12 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
     private static InetAddress bindAddress(String named) {
         try {
             return InetAddress.getByName(named);
-        } catch (UnknownHostException e) {
+        } catch (UnknownHostException notAnAddress) {
+            // Translated rather than chained: an UnknownHostException's message is the name it was
+            // given, raw, which is the value this sentence has already scrubbed.
             throw new IllegalArgumentException(BIND_ADDRESS_VARIABLE
                     + " must be an address or a name this machine can resolve, but " + SafeName.quote(named)
-                    + " is neither", e);
+                    + " is neither");
         }
     }
 }
