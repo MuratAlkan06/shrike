@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -25,6 +26,12 @@ import java.util.Objects;
  *
  * <p>Not for the log's own segments: those are large, append-only, and forced in place. This is for
  * files small enough to rewrite whole.
+ *
+ * <p>The temporary file is <em>created</em> rather than opened over. A stale one — the kind a crash
+ * leaves behind — is deleted first, and the create then refuses a name anything at all still holds.
+ * {@link #replace(Path, byte[], StepObserver)} says why in full; the short of it is that the name
+ * {@code <target>.tmp} is one anybody who can write to the directory can guess, and this class writes
+ * into directories that are not always the broker's own.
  *
  * <p>Forcing a directory means opening it for reading, which POSIX allows and Windows does not. This
  * build is developed and tested on POSIX systems; on a platform that refuses, a write fails loudly
@@ -95,11 +102,22 @@ public final class DurableFile {
      * Replaces {@code target} with {@code contents}, durably, telling {@code observer} about each step
      * as it completes.
      *
+     * <p><strong>The temporary file is created, never written over.</strong> Whatever holds the name
+     * {@code <target>.tmp} is deleted first — deleting takes that name away and nothing else, so a
+     * symbolic link left there goes and the file it pointed at keeps every byte it had — and the
+     * temporary file is then created with {@link StandardOpenOption#CREATE_NEW}, which fails rather
+     * than opens if anything has taken the name back in the instant since. {@link LinkOption#NOFOLLOW_LINKS}
+     * says the same thing a second way. The one thing this must never do is open that name for writing
+     * and truncate what it finds: a name in a directory this process does not own is a name somebody
+     * else can point wherever they like, and the file at the end of it would be emptied and then filled
+     * with these contents before being moved onto the target.
+     *
      * @param target   the file to replace, whose parent directory must already exist
      * @param contents the bytes the file should hold
      * @param observer the seam described on {@link StepObserver}
      * @throws ShrikeIOException if any step fails, in which case the target still holds whatever it
-     *                           held before
+     *                           held before. That includes a temporary file this call could neither
+     *                           delete nor create
      */
     public static void replace(Path target, byte[] contents, StepObserver observer) {
         Objects.requireNonNull(target, "target");
@@ -115,8 +133,14 @@ public final class DurableFile {
         Path temporary = directory.resolve(target.getFileName() + TEMPORARY_SUFFIX);
 
         try {
-            try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+            // A stale temporary file is unlinked rather than emptied. Unlinking removes the name and
+            // leaves whatever was behind it alone, so a symbolic link planted here is what goes; a
+            // truncate would have followed it and emptied the file at the other end. CREATE_NEW then
+            // covers the instant between the two: a name something has taken back is a name this open
+            // refuses, and NOFOLLOW_LINKS refuses it a second way.
+            Files.deleteIfExists(temporary);
+            try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
                 ByteChannels.writeFully(channel, ByteBuffer.wrap(contents));
                 observer.completed(Step.WRITTEN);
                 channel.force(true);
