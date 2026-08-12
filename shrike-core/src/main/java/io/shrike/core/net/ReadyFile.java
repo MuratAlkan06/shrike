@@ -24,6 +24,14 @@ import java.nio.file.Path;
  * sees the whole file or no file, never a line and a half, and does not have to guess whether a file
  * it can see is finished.
  *
+ * <p>Writing it through {@link DurableFile} is also what keeps the temporary file it goes through from
+ * being a way into somebody else's file. This is the one path in this build whose destination is
+ * routinely a directory the broker does not own — a handshake artifact lives where the harness that
+ * starts the broker can read it, which is often a shared temporary directory — so the guess-able name
+ * {@code <path>.tmp} is a name another process may have got to first. See
+ * {@link DurableFile#replace(java.nio.file.Path, byte[], DurableFile.StepObserver)} for what happens
+ * to it.
+ *
  * <p>Stopping a broker leaves the file where it is. A stopped broker and a crashed one then look the
  * same from the outside, which is honest: the file says "a broker was listening here", and whoever
  * starts a broker owns the path and points it somewhere it does not mind overwriting.
