@@ -279,9 +279,11 @@ final class DataDirectoryLock implements Closeable {
             // holder is running on. A kept one is already where it belongs, and this take opened none.
             throw alreadyLocked(dataDirectory, lockFile, heldByThisJvm);
         } catch (IOException e) {
-            // Nothing in this JVM holds this file — an overlap would have arrived above — so closing
-            // what this failed take opened releases nothing anybody has. What it did not open, it does
-            // not close: a kept channel outlives every take that asks it for the lock.
+            // No lock of this process's was in the JVM's lock table when tryLock consulted it, or the
+            // overlap would have arrived above, so closing what this failed take opened releases
+            // nothing that table knows of. That is the same window the branch above names, and it is
+            // accepted here for the same reason. What this take did not open, it does not close: a
+            // kept channel outlives every take that asks it for the lock.
             closeQuietlyAfterFailedTake(opened);
             throw new ShrikeIOException("cannot lock the data directory " + dataDirectory + " through " + lockFile, e);
         } finally {
@@ -436,10 +438,12 @@ final class DataDirectoryLock implements Closeable {
     }
 
     /**
-     * The identity a claim falls back to: the directory with every link, {@code .}, and {@code ..}
-     * resolved, so that two names for one directory cannot become two claims on one lock file. The
-     * directory exists by now — {@link ShrikeBroker#start} creates it before it locks it — so this
-     * failing means the directory went away or cannot be read, which is a start that cannot happen.
+     * The second key of every claim, and the only key where a lock file has no identity to give: the
+     * directory with every link, {@code .}, and {@code ..} resolved, so that two names for one
+     * directory cannot become two claims on one lock file — and so that a lock file replaced under the
+     * broker holding it is still that broker's directory. The directory exists by now —
+     * {@link ShrikeBroker#start} creates it before it locks it — so this failing means the directory
+     * went away or cannot be read, which is a start that cannot happen.
      */
     private static Path realPathOf(Path dataDirectory, Path lockFile) {
         try {
