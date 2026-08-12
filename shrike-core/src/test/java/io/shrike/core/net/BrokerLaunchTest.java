@@ -248,6 +248,38 @@ class BrokerLaunchTest {
     }
 
     @Test
+    void refusesANumericValueWithANewlineOnOneScrubbedLineRatherThanLettingItForgeASecond() {
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE, "1048576\n2026-01-01 FATAL forged log line");
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE), refusal.getMessage());
+        assertFalse(refusal.getMessage().contains("\n"),
+                "a value carrying a newline is echoed on one line, so it cannot forge a second: "
+                        + refusal.getMessage());
+    }
+
+    @Test
+    void refusesAVeryLongNumericValueWithATruncatedMessageRatherThanFloodingStandardError() {
+        String tenKilobytesOfDigits = "9".repeat(10_000);
+        Map<String, String> environment = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE, tenKilobytesOfDigits);
+
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, environment));
+
+        assertTrue(refusal.getMessage().contains(BrokerLaunch.MAX_REQUEST_BYTES_VARIABLE), refusal.getMessage());
+        assertTrue(refusal.getMessage().contains("cut from 10000 characters"),
+                "a value too long to be a number is cut rather than echoed whole: " + refusal.getMessage());
+        assertFalse(refusal.getMessage().contains(tenKilobytesOfDigits),
+                "the ten-kilobyte value never reaches the log line in full");
+    }
+
+    @Test
     void refusesASettingOutsideItsRangeNamingTheVariableThatSetItAndKeepingTheRecordsSentence() {
         Map<String, String> environment = Map.of(
                 BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,

@@ -2,6 +2,7 @@ package io.shrike.core.net;
 
 import io.shrike.core.log.FlushMode;
 import io.shrike.core.log.LogConfig;
+import io.shrike.core.log.SafeName;
 import io.shrike.core.protocol.RequestReader;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -284,7 +285,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return Integer.parseInt(named.get());
         } catch (NumberFormatException notANumber) {
             throw new IllegalArgumentException(variable + " must be a whole number from " + Integer.MIN_VALUE
-                    + " to " + Integer.MAX_VALUE + ", but was \"" + named.get() + "\"", notANumber);
+                    + " to " + Integer.MAX_VALUE + ", but was " + SafeName.quote(named.get()), notANumber);
         }
     }
 
@@ -301,7 +302,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return Long.parseLong(named.get());
         } catch (NumberFormatException notANumber) {
             throw new IllegalArgumentException(variable + " must be a whole number from " + Long.MIN_VALUE
-                    + " to " + Long.MAX_VALUE + ", but was \"" + named.get() + "\"", notANumber);
+                    + " to " + Long.MAX_VALUE + ", but was " + SafeName.quote(named.get()), notANumber);
         }
     }
 
@@ -315,7 +316,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             case "per-record" -> FlushMode.PER_RECORD;
             case "interval" -> FlushMode.INTERVAL;
             default -> throw new IllegalArgumentException(FLUSH_MODE_VARIABLE
-                    + " must be \"per-record\" or \"interval\", but was \"" + named + "\"");
+                    + " must be \"per-record\" or \"interval\", but was " + SafeName.quote(named));
         };
     }
 
@@ -330,7 +331,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             case "true" -> true;
             case "false" -> false;
             default -> throw new IllegalArgumentException(FETCH_ZERO_COPY_VARIABLE
-                    + " must be \"true\" or \"false\", but was \"" + named + "\"");
+                    + " must be \"true\" or \"false\", but was " + SafeName.quote(named));
         };
     }
 
@@ -355,7 +356,8 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return Integer.parseInt(named);
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(PORT_VARIABLE + " must be a whole number from "
-                    + BrokerConfig.EPHEMERAL_PORT + " to " + BrokerConfig.MAX_PORT + ", but was \"" + named + "\"", e);
+                    + BrokerConfig.EPHEMERAL_PORT + " to " + BrokerConfig.MAX_PORT + ", but was "
+                    + SafeName.quote(named), e);
         }
     }
 
@@ -368,7 +370,8 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return InetAddress.getByName(named);
         } catch (UnknownHostException e) {
             throw new IllegalArgumentException(BIND_ADDRESS_VARIABLE
-                    + " must be an address or a name this machine can resolve, but \"" + named + "\" is neither", e);
+                    + " must be an address or a name this machine can resolve, but " + SafeName.quote(named)
+                    + " is neither", e);
         }
     }
 }
