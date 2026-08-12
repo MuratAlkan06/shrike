@@ -244,8 +244,18 @@ final class DataDirectoryLock implements Closeable {
             FileChannel channel = kept != null ? kept : opened;
             FileLock lock = channel.tryLock();
             if (lock == null) {
-                // Another process holds it, so this process holds no lock on this file — an overlap
-                // would have arrived below instead — and closing the channel releases nothing of ours.
+                // The kernel refused this lock, which says another process holds one that conflicts
+                // with it, which says this process was granted no whole-file lock on it: two processes
+                // cannot both have one. That is what closing here rests on, and being exact about what
+                // it does not rest on is the point of this comment. The overlap below not having been
+                // thrown proves less than it looks: the JVM's lock table holds its FileLocks weakly,
+                // so a lock in this process whose FileLock object has been collected is not in the
+                // table to be found, and a lock over some other range of this file would not have
+                // conflicted with the answer above either. Nothing in this codebase takes either kind,
+                // and the window that leaves is accepted rather than closed by keeping the descriptor:
+                // this is the ordinary refusal — a second broker on the machine — and it would be a
+                // descriptor kept on a file the kernel has just said this process holds nothing on.
+                //
                 // Only a channel this take opened is this take's to close: a kept one belongs to the
                 // backstop, and closing that is the damage this class exists to not do.
                 if (opened != null) {

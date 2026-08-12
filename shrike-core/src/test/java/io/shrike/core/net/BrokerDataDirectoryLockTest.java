@@ -443,12 +443,19 @@ class BrokerDataDirectoryLockTest {
      *
      * <p>Nothing here sleeps, which §4 and §6 of PRINCIPLES.md both forbid, and nothing here asserts a
      * duration. Each round drops a canary nothing references, asks for a collection, and waits on a
-     * {@link ReferenceQueue} until that canary's phantom reference is enqueued — a bounded wait on the
-     * very event this is about, since a {@link java.nio.channels.FileChannel} the JDK opened for itself
-     * is closed by a cleaner driven by exactly that phantom-reachability. It is rounds rather than one
-     * pass because a reference an earlier frame happened to leave on the stack survives the first
-     * collection and not the tenth, and because a cleaner runs its action on a thread of its own once
-     * the reference has been enqueued rather than in the collection that enqueued it.
+     * {@link ReferenceQueue} until that canary's phantom reference is enqueued. It is rounds rather
+     * than one pass because a reference an earlier frame happened to leave on the stack survives the
+     * first collection and not the tenth.
+     *
+     * <p>What the canary witnesses is worth stating exactly, because it is less than it reads as. Its
+     * enqueue says a reference-processing pass has happened; it orders nothing about the cleaner that
+     * closes an unreferenced {@link java.nio.channels.FileChannel}, which runs its action on a thread
+     * of its own after the reference is enqueued and could always run later still. So an unlucky
+     * schedule makes the assertion after this pass for a reason it did not mean to — the descriptor is
+     * open because nothing has got round to closing it yet rather than because something is holding it
+     * — and that is a false pass rather than a flake. The direction that matters is the other one: this
+     * cannot fail for a schedule, so a failure here is a descriptor that was closed, which is what the
+     * bug was.
      *
      * @throws InterruptedException if this thread is interrupted while waiting for a collection
      */
