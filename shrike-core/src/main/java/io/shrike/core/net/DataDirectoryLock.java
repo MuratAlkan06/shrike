@@ -11,6 +11,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * One broker's claim on one data directory, held for as long as that broker is running.
@@ -47,7 +48,19 @@ import java.util.concurrent.ConcurrentHashMap;
  * broker's lock as a side effect. What that left was a broker still serving over a data directory it no
  * longer held, and an outside process free to take the lock and start over it. So a start claims the
  * directory in this JVM first, and a start that cannot have the claim is refused without opening
- * anything: the descriptor whose closing did the damage is never created.
+ * anything: on that path the descriptor whose closing did the damage is never created, and that is
+ * where every retry over a directory this JVM already holds now ends.
+ *
+ * <p><strong>What the claim cannot see, and what the refusal does about it.</strong> A claim is kept
+ * under the data directory's real path; the JVM's own lock table is kept under the lock file's device
+ * and inode. Two directories whose {@value #FILE_NAME} is one file — a hard link, a bind mount, a
+ * symbolic link to the lock file rather than to the directory holding it — are therefore two claims
+ * over one lock, and a start over the second of them takes its claim, opens a channel, and meets the
+ * lock the first broker is holding. So that refusal closes nothing at all: the channel it opened stays
+ * open until this process ends, deliberately, because closing any descriptor on that file is exactly
+ * what drops the running broker's lock. The cost is one descriptor per aliased start attempt, and it is
+ * the cheaper half of the trade — descriptors run out slowly and visibly, and a data directory two
+ * brokers are writing to does neither.
  *
  * <p>Nothing here deletes the lock file, on this path or any other: stopping a broker leaves the data
  * directory exactly as it found it, and an empty file that the next start reuses is cheaper than a
@@ -80,6 +93,14 @@ final class DataDirectoryLock implements Closeable {
     /** The entry in {@link #CLAIMED_DIRECTORIES} this lock owns, given back by {@link #close()}. */
     private final Path claimedDirectory;
 
+    /**
+     * Whether the entry above has already gone back, so that closing this lock twice gives it back
+     * once. The entry is a path and says nothing about who put it there, so a second close — after
+     * another broker had started over the same directory — would otherwise take that broker's claim.
+     */
+    // guarded by: its own atomicity — read and written only by the compare-and-set in close().
+    private final AtomicBoolean claimReleased = new AtomicBoolean();
+
     private final FileChannel channel;
     private final FileLock lock;
 
@@ -108,29 +129,42 @@ final class DataDirectoryLock implements Closeable {
             // paragraph: a channel opened here and closed again would drop the running broker's lock.
             throw alreadyLocked(dataDirectory, lockFile, null);
         }
+        boolean taken = false;
         FileChannel channel = null;
         try {
             channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             FileLock lock = channel.tryLock();
             if (lock == null) {
-                // Another process holds it, so this process holds no lock on this file — the claim
-                // above is the proof — and closing the channel therefore releases nothing of ours.
+                // Another process holds it, so this process holds no lock on this file — an overlap
+                // would have arrived below instead — and closing the channel releases nothing of ours.
                 channel.close();
-                CLAIMED_DIRECTORIES.remove(claimedDirectory);
                 throw alreadyLocked(dataDirectory, lockFile, null);
             }
-            return new DataDirectoryLock(lockFile, claimedDirectory, channel, lock);
+            DataDirectoryLock held = new DataDirectoryLock(lockFile, claimedDirectory, channel, lock);
+            taken = true;
+            return held;
         } catch (OverlappingFileLockException heldByThisJvm) {
-            // Not a second broker, which the claim already refused, but something else in this JVM
-            // holding this file: the sentence is the same, and the claim goes back so that a start
-            // after that holder lets go is not refused by a claim nothing is behind.
-            closeQuietlyAfterFailedTake(channel);
-            CLAIMED_DIRECTORIES.remove(claimedDirectory);
+            // Something in this JVM holds a lock on this very file: not a second start over the same
+            // path, which the claim already refused, but a second start over a directory whose lock
+            // file is the same file as another's, or a holder that is not a broker at all. The channel
+            // this take opened is deliberately left open — closing any descriptor on that file would
+            // drop the lock its real holder is running on, which is the whole hazard this class exists
+            // for, so a refusal here leaks one descriptor rather than unlocking a live data directory.
             throw alreadyLocked(dataDirectory, lockFile, heldByThisJvm);
         } catch (IOException e) {
+            // Nothing in this JVM holds this file — an overlap would have arrived above — so closing
+            // what this failed take opened releases nothing anybody has.
             closeQuietlyAfterFailedTake(channel);
-            CLAIMED_DIRECTORIES.remove(claimedDirectory);
             throw new ShrikeIOException("cannot lock the data directory " + dataDirectory + " through " + lockFile, e);
+        } finally {
+            // The claim goes back on every way out that is not the one success above: the two refusals,
+            // an IOException, and equally an Error from opening or locking under memory pressure. A
+            // claim left behind by a take that failed is worse than the failure that left it, because
+            // the entry is a path and nothing else: every later start over that directory in this JVM
+            // would be refused for the life of the process by a claim with no broker behind it.
+            if (!taken) {
+                CLAIMED_DIRECTORIES.remove(claimedDirectory);
+            }
         }
     }
 
@@ -148,8 +182,12 @@ final class DataDirectoryLock implements Closeable {
         } finally {
             // In a finally because a release that failed still ends this broker's claim on the
             // directory: leaving the entry behind would refuse every later start in this JVM over a
-            // directory the operating system had already let go of.
-            CLAIMED_DIRECTORIES.remove(claimedDirectory);
+            // directory the operating system had already let go of. Once, because the entry names the
+            // directory rather than this lock: a second close of an instance that has already given
+            // its claim back would take away whatever broker holds that directory now.
+            if (claimReleased.compareAndSet(false, true)) {
+                CLAIMED_DIRECTORIES.remove(claimedDirectory);
+            }
         }
     }
 
@@ -180,8 +218,10 @@ final class DataDirectoryLock implements Closeable {
 
     /**
      * Closes the channel a failed {@link #take(Path)} had opened, so a start that does not happen does
-     * not leak a file handle. A close that fails here is dropped: the start is already failing, and the
-     * exception it is failing with is the useful one.
+     * not leak a file handle. It is called from the one failure path where closing is safe — an
+     * {@link IOException}, which means no lock on this file is this process's to lose — and never from
+     * the overlap path, where closing is the damage. A close that fails here is dropped: the start is
+     * already failing, and the exception it is failing with is the useful one.
      */
     private static void closeQuietlyAfterFailedTake(FileChannel channel) {
         if (channel == null) {

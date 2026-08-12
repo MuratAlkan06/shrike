@@ -6,10 +6,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.abort;
 
 import io.shrike.core.log.ShrikeIOException;
 import io.shrike.core.protocol.CreateTopicRequest;
 import io.shrike.core.protocol.ResponseDecoding;
+import java.io.IOException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -41,6 +44,13 @@ class BrokerDataDirectoryLockTest {
 
     @TempDir
     Path dataDirectory;
+
+    /**
+     * A second data directory of its own, whose lock file is made the very file {@link #dataDirectory}
+     * already holds — the aliasing a claim keyed on a directory cannot see.
+     */
+    @TempDir
+    Path aliasedDataDirectory;
 
     /** Where a probe's output goes, kept out of the data directory a broker is running over. */
     @TempDir
@@ -102,6 +112,46 @@ class BrokerDataDirectoryLockTest {
                         + " and not this test's");
     }
 
+    /**
+     * The same question as above, asked where the claim cannot answer it: two data directories that
+     * are genuinely different directories, whose {@code shrike.lock} is one and the same file.
+     *
+     * <p>A claim is kept under a directory's real path and the JVM's lock table is kept under the lock
+     * file's device and inode, so a hard link — or a bind mount, or a symbolic link to the lock file
+     * rather than to the directory — puts the two out of step. The second start gets a claim nobody
+     * else holds, opens a channel, and only then meets the running broker's lock, which is the branch
+     * that used to close what it had opened. On POSIX that closes the <em>running</em> broker's lock
+     * with it, so the refusal that was meant to protect a data directory was the thing that gave it
+     * away, and the probe below answered {@code FREE} while a broker was still serving over it.
+     *
+     * <p>So that branch closes nothing now, and the last block is the other half of the price: the
+     * refusal has to leave the claim it took behind it, or a directory refused once would be refused
+     * for the life of this JVM by an entry with no broker behind it.
+     */
+    @Test
+    void keepsTheRunningBrokersLockWhenRefusingAStartOverADirectoryThatSharesItsLockFile() throws Exception {
+        try (ShrikeBroker running = BrokerHarness.start(dataDirectory)) {
+            makeTheAliasedDirectorysLockFileTheRunningBrokersOwn();
+
+            ShrikeIOException refused = assertThrows(ShrikeIOException.class,
+                    () -> BrokerHarness.start(aliasedDataDirectory));
+
+            assertTrue(refused.getMessage().contains(aliasedDataDirectory.toString()),
+                    "the refusal names the directory that was asked for: " + refused.getMessage());
+            assertEquals(DataDirectoryLockProbe.HELD, whatAnotherProcessFindsOfTheLock("aliased"),
+                    "and refusing it left the running broker's lock where it was, so nothing outside"
+                            + " this JVM can start a broker over the directory it is serving");
+        }
+
+        try (ShrikeBroker overTheAlias = BrokerHarness.start(aliasedDataDirectory);
+             WireClient client = WireClient.connectTo(overTheAlias)) {
+            assertInstanceOf(ResponseDecoding.Answered.class,
+                    client.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
+                    "and a start refused once is not refused for ever: the claim that refusal took went"
+                            + " back with it, so this directory is startable the moment the lock is free");
+        }
+    }
+
     @Test
     void startsOverTheSameDataDirectoryOnceTheBrokerHoldingItHasStoppedCleanly() throws Exception {
         try (ShrikeBroker first = BrokerHarness.start(dataDirectory);
@@ -130,6 +180,27 @@ class BrokerDataDirectoryLockTest {
                     client.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
                     "a lock file nobody holds is a file and not a claim, so it costs the next start nothing"
                             + " and there is nothing to delete by hand");
+        }
+    }
+
+    /**
+     * Hard-links {@link #aliasedDataDirectory}'s lock file onto the one the running broker is holding,
+     * so that two real directories share one inode and one entry in the JVM's lock table.
+     *
+     * <p>A hard link is the cheapest of the several ways to arrive there — a bind mount and a symbolic
+     * link to the lock file are the others — and it is the only one a test can build without root. A
+     * filesystem that refuses links has nothing to say about this branch, so the test aborts rather
+     * than passing on nothing; both operating systems this project is built on make them.
+     */
+    private void makeTheAliasedDirectorysLockFileTheRunningBrokersOwn() throws IOException {
+        Path lockFile = dataDirectory.resolve(DataDirectoryLock.FILE_NAME);
+        assertTrue(Files.isRegularFile(lockFile),
+                "the running broker made the lock file this alias is about to become another name for");
+        try {
+            Files.createLink(aliasedDataDirectory.resolve(DataDirectoryLock.FILE_NAME), lockFile);
+        } catch (UnsupportedOperationException | FileSystemException linksRefused) {
+            abort("this filesystem will not make a hard link, so one lock file under two directories"
+                    + " cannot be built here: " + linksRefused);
         }
     }
 
