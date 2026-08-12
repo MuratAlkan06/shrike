@@ -63,6 +63,13 @@ class BrokerDataDirectoryLockTest {
     /** How many of those blocks a round makes: 64 MiB, which is a collection's worth on any heap. */
     private static final int GARBAGE_BLOCKS_PER_ROUND = 1024;
 
+    /**
+     * How many times a start already refused once is retried, which is the loop a supervisor is: enough
+     * that one descriptor per attempt would be plain in the count, and few enough that a run of it
+     * costs a test nothing.
+     */
+    private static final int REFUSED_STARTS_A_SUPERVISOR_RETRIES = 25;
+
     @TempDir
     Path dataDirectory;
 
@@ -245,6 +252,71 @@ class BrokerDataDirectoryLockTest {
                     client.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
                     "and the claim that refusal took went back with it, so the directory is startable the"
                             + " moment the holder that was not a broker lets go");
+        }
+    }
+
+    /**
+     * What the backstop costs when the start it refuses is retried, which is a number rather than the
+     * shape of a branch.
+     *
+     * <p>A start that meets a holder no claim knows about opens a descriptor before it finds out, and
+     * that descriptor can never be closed while this process may hold a lock on the file — so it is
+     * kept. The question this asks is how many of them a supervisor can make: something in this JVM
+     * that is not a broker holds {@code shrike.lock} and does not let go, and a start is retried
+     * against it {@link #REFUSED_STARTS_A_SUPERVISOR_RETRIES} times over. Keeping one per attempt is a
+     * process that runs out of descriptors — the first thing to fail is not this broker but whatever
+     * else in it needs to open a segment or accept a socket — so what is asserted is that the count is
+     * flat after the first: the descriptor already kept for that file is the one every later attempt
+     * asks for the lock through, and asking opens nothing.
+     *
+     * <p>The last block is the other half of the bound. A descriptor kept for ever would be the same
+     * leak spelled differently, so the start that finally gets the lock gets it <em>through</em> the
+     * kept descriptor and takes it over: the count goes back to where it started, and closing it is
+     * that broker's business from then on.
+     */
+    @Test
+    void keepsOneDescriptorPerLockFileHoweverManyStartsANonBrokerHolderRefuses() throws Exception {
+        Path lockFile = dataDirectory.resolve(DataDirectoryLock.FILE_NAME);
+        int keptBeforeAnyOfThis = DataDirectoryLock.pinnedChannelCount();
+
+        try (FileChannel holderInThisJvm = FileChannel.open(lockFile, StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE)) {
+            FileLock heldByNoBroker = holderInThisJvm.tryLock();
+            assertNotNull(heldByNoBroker,
+                    "the arrangement: this JVM holds the lock file without any start having claimed it,"
+                            + " which is the one holder a claim cannot see");
+
+            assertThrows(ShrikeIOException.class, () -> BrokerHarness.start(dataDirectory));
+
+            int keptAfterTheFirstRefusal = DataDirectoryLock.pinnedChannelCount();
+            assertEquals(keptBeforeAnyOfThis + 1, keptAfterTheFirstRefusal,
+                    "the first start to meet that holder opens one descriptor and keeps it, because"
+                            + " closing it would drop the holder's lock");
+
+            for (int retry = 0; retry < REFUSED_STARTS_A_SUPERVISOR_RETRIES; retry++) {
+                assertThrows(ShrikeIOException.class, () -> BrokerHarness.start(dataDirectory));
+            }
+
+            assertEquals(keptAfterTheFirstRefusal, DataDirectoryLock.pinnedChannelCount(),
+                    REFUSED_STARTS_A_SUPERVISOR_RETRIES + " more refusals over the same file opened"
+                            + " nothing at all: what is kept is one descriptor per lock file, not one"
+                            + " per attempt, or a supervisor retrying a start it is meant to be refused"
+                            + " would spend this process's descriptors on being refused");
+            assertTrue(heldByNoBroker.isValid(),
+                    "and every one of them was refused for a holder that still holds it, so they were"
+                            + " the retries this bounds rather than starts that found the file free");
+            Reference.reachabilityFence(heldByNoBroker);
+        }
+
+        try (ShrikeBroker afterwards = BrokerHarness.start(dataDirectory);
+             WireClient client = WireClient.connectTo(afterwards)) {
+            assertEquals(keptBeforeAnyOfThis, DataDirectoryLock.pinnedChannelCount(),
+                    "and the descriptor that was kept is handed to the start that can finally use it,"
+                            + " which takes the lock through it rather than opening a second one: what"
+                            + " the backstop holds is given back rather than held for ever");
+            assertInstanceOf(ResponseDecoding.Answered.class,
+                    client.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
+                    "and the broker that took it over that directory serves");
         }
     }
 

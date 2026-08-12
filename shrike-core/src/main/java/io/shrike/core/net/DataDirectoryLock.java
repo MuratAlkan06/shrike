@@ -14,6 +14,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -90,18 +91,25 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * own, which is the finding this paragraph exists for. A channel the JDK opened for itself registers a
  * cleaner that closes its descriptor once nothing references the channel, so a channel merely left alone
  * is closed by the next collection, and that close drops the lock exactly as an explicit one would. The
- * refusal therefore puts the channel in {@link #PINNED_REFUSED_CHANNELS}, where it stays for the life of
- * this process, because a strong reference is the only thing that keeps a descriptor open in a
+ * refusal therefore keeps the channel in {@link #PINNED_REFUSED_CHANNELS}, under the key its claim was
+ * kept under, because a strong reference is the only thing that keeps a descriptor open in a
  * garbage-collected runtime. Anything else thrown out of the open or the lock is treated the same way: a
  * channel an {@link Error} left behind is on the same hazard as one an overlap left behind.
  *
- * <p>The cost is one descriptor each time that happens, held until the process ends. What bounds it is
- * that the path is rare, not that anything gives the descriptor back: a retry over a directory this JVM
- * holds — that directory, or any alias of it — is refused by the claim without opening a thing, so a
- * supervisor restarting a broker in a loop pays nothing here at all. What pays is a genuine race with
- * another thread of this JVM, or a lock on {@value #FILE_NAME} taken by something in this process that
- * is not a broker, and neither is a thing a retry repeats. That is the trade written down: a descriptor
- * per occurrence is slow and visible, and a data directory two brokers are writing to is neither.
+ * <p><strong>What that costs is one descriptor per lock file, and a retry pays it once.</strong> A take
+ * reads {@link #PINNED_REFUSED_CHANNELS} before it opens anything, so a start over a file this process
+ * is already keeping a descriptor on opens none at all: it asks the descriptor already there for the
+ * lock, and is refused by the same two answers as any other start, or granted the lock and handed that
+ * descriptor with it. The bound that follows is exact rather than hopeful — one descriptor per lock
+ * file, held until a start takes the lock through it or until this process ends, whichever comes first
+ * — and what makes it exact is the claim: a take reads or writes the entry for a key only while it
+ * holds the claim on that key, and a claim admits one holder at a time, so two takes cannot both be
+ * opening a descriptor for one file. A supervisor retrying a start that a non-broker holder goes on
+ * refusing therefore pays one descriptor for the whole loop rather than one for every turn of it, which
+ * is the difference between a cost and a leak. It is not free, and the trade is written down rather than
+ * hidden: a descriptor is held on a file this process was refused over, an operator can see it in
+ * {@code lsof}, and one per lock file is slow and visible where a data directory two brokers are writing
+ * to is neither.
  *
  * <p>Nothing here deletes the lock file, on this path or any other: stopping a broker leaves the data
  * directory exactly as it found it, and an empty file that the next start reuses is cheaper than a
@@ -132,19 +140,27 @@ final class DataDirectoryLock implements Closeable {
     private static final Set<Object> CLAIMED_LOCK_FILES = ConcurrentHashMap.newKeySet();
 
     /**
-     * The channels a refusal opened and must not close, kept reachable so that nothing else closes them
-     * either. A {@link FileChannel} the JDK opened for itself closes its descriptor from a cleaner once
-     * the channel is unreachable, and on this file that close is what drops a running broker's lock, so
-     * declining to close is only half of keeping it: the other half is the reference held here, for the
-     * life of this process, deliberately and without any way of giving it back.
+     * The channels a refusal opened and must not close, one to a lock file, kept reachable so that
+     * nothing else closes them either. A {@link FileChannel} the JDK opened for itself closes its
+     * descriptor from a cleaner once the channel is unreachable, and on this file that close is what
+     * drops a running broker's lock, so declining to close is only half of keeping it: the other half is
+     * the reference held here.
+     *
+     * <p>It is keyed by what the claim is keyed by rather than being a bare collection, because the
+     * entry is also what the next start over that file asks for the lock instead of opening a descriptor
+     * of its own. That is what holds this to one descriptor per lock file however many times a start is
+     * retried, and it is the whole of the difference between a bound and a leak. An entry is given up
+     * only to the start that finally takes the lock through it, which owns that channel from then on and
+     * closes it with the lock.
      *
      * <p>It is the second of the two static mutable fields PRINCIPLES §2 forbids and this class
-     * documents, for the same reason as the first: an open descriptor is a fact about the process. What
-     * bounds it is above — the claim refuses an alias before anything is opened, so nothing a retry does
-     * arrives here.
+     * documents, for the same reason as the first: an open descriptor is a fact about the process.
      */
-    // guarded by: its own concurrency — a set backed by a ConcurrentHashMap, only ever added to.
-    private static final Set<FileChannel> PINNED_REFUSED_CHANNELS = ConcurrentHashMap.newKeySet();
+    // guarded by: the claim on the same key, and by its own concurrency for the rest. A take reads or
+    // writes the entry for a key only while it holds that key in CLAIMED_LOCK_FILES, which admits one
+    // holder of a key at a time, so the read that decides whether to open a descriptor and the write
+    // that keeps the one it opened cannot interleave with another take's over the same file.
+    private static final ConcurrentMap<Object, FileChannel> PINNED_REFUSED_CHANNELS = new ConcurrentHashMap<>();
 
     private final Path lockFile;
 
@@ -189,31 +205,48 @@ final class DataDirectoryLock implements Closeable {
             throw alreadyLocked(dataDirectory, lockFile, null);
         }
         boolean taken = false;
-        FileChannel channel = null;
+        FileChannel opened = null;
         try {
-            channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            // A descriptor the backstop is already keeping on this file is the one to ask, because
+            // opening a second is the thing a retry must not be allowed to repeat. Reading the entry
+            // here is safe without any lock of this class's own: this take holds the claim on the key,
+            // and nothing else can be filling or emptying that entry while it does.
+            FileChannel kept = PINNED_REFUSED_CHANNELS.get(claim);
+            if (kept == null) {
+                opened = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            }
+            FileChannel channel = kept != null ? kept : opened;
             FileLock lock = channel.tryLock();
             if (lock == null) {
                 // Another process holds it, so this process holds no lock on this file — an overlap
                 // would have arrived below instead — and closing the channel releases nothing of ours.
-                channel.close();
+                // Only a channel this take opened is this take's to close: a kept one belongs to the
+                // backstop, and closing that is the damage this class exists to not do.
+                if (opened != null) {
+                    opened.close();
+                }
                 throw alreadyLocked(dataDirectory, lockFile, null);
             }
             DataDirectoryLock held = new DataDirectoryLock(lockFile, claim, channel, lock);
             taken = true;
+            // A kept channel that has just been granted the lock is this lock's own from here: it
+            // leaves the map so that close() is free to close it, and so that the next start over this
+            // file opens one of its own rather than asking a descriptor this broker has closed.
+            PINNED_REFUSED_CHANNELS.remove(claim, channel);
             return held;
         } catch (OverlappingFileLockException heldByThisJvm) {
             // Something in this JVM holds a lock on this very file, which the claim above did not see:
             // a lock taken between the identity being read and the file being opened, or a holder in
-            // this process that is not a broker at all. The channel is neither closed nor let go of —
-            // the finally below pins it — because closing any descriptor on that file, whether this
-            // code closes it or the collector's cleaner does, drops the lock its real holder is
-            // running on.
+            // this process that is not a broker at all. A channel this take opened is neither closed
+            // nor let go of — the finally below keeps it — because closing any descriptor on that file,
+            // whether this code closes it or the collector's cleaner does, drops the lock its real
+            // holder is running on. A kept one is already where it belongs, and this take opened none.
             throw alreadyLocked(dataDirectory, lockFile, heldByThisJvm);
         } catch (IOException e) {
             // Nothing in this JVM holds this file — an overlap would have arrived above — so closing
-            // what this failed take opened releases nothing anybody has.
-            closeQuietlyAfterFailedTake(channel);
+            // what this failed take opened releases nothing anybody has. What it did not open, it does
+            // not close: a kept channel outlives every take that asks it for the lock.
+            closeQuietlyAfterFailedTake(opened);
             throw new ShrikeIOException("cannot lock the data directory " + dataDirectory + " through " + lockFile, e);
         } finally {
             // Both of a failed take's leavings go back here, on every way out that is not the one
@@ -221,13 +254,15 @@ final class DataDirectoryLock implements Closeable {
             // locking under memory pressure.
             //
             // A channel still open is a channel one of those paths could not safely close, so it is
-            // pinned rather than dropped; the two paths where closing is safe have closed it already,
-            // and a channel that is closed is not pinned. A claim left behind by a take that failed is
-            // worse than the failure that left it, because the entry names a file and nothing else:
-            // every later start over that file in this JVM would be refused for the life of the
-            // process by a claim with no broker behind it.
+            // kept rather than dropped; the two paths where closing is safe have closed it already,
+            // and a channel that is closed is not kept. It is kept before the claim goes back, and that
+            // order is load-bearing: the claim is the only thing keeping the next take from opening a
+            // second descriptor on this file, so the entry has to be there before that take can look.
+            // A claim left behind by a take that failed is worse than the failure that left it, because
+            // the entry names a file and nothing else: every later start over that file in this JVM
+            // would be refused for the life of the process by a claim with no broker behind it.
             if (!taken) {
-                pinIfAFailedTakeLeftItOpen(channel);
+                pinIfAFailedTakeLeftItOpen(claim, opened);
                 CLAIMED_LOCK_FILES.remove(claim);
             }
         }
@@ -259,6 +294,22 @@ final class DataDirectoryLock implements Closeable {
     @Override
     public String toString() {
         return "DataDirectoryLock[" + lockFile + "]";
+    }
+
+    /**
+     * How many descriptors the backstop is keeping open in this process, which is what turns the bound
+     * above from a sentence into a number: one per lock file, whatever a supervisor retries.
+     *
+     * <p>It is here for
+     * {@code BrokerDataDirectoryLockTest#keepsOneDescriptorPerLockFileHoweverManyStartsANonBrokerHolderRefuses},
+     * which counts them across a run of refused starts, because a cost nobody counts is a cost nobody
+     * knows has changed. Nothing in the broker reads it.
+     *
+     * @return how many channels refusals are keeping open, across every lock file this process has been
+     *         refused over
+     */
+    static int pinnedChannelCount() {
+        return PINNED_REFUSED_CHANNELS.size();
     }
 
     /**
@@ -323,21 +374,31 @@ final class DataDirectoryLock implements Closeable {
     }
 
     /**
-     * Keeps a channel a failed {@link #take(Path)} could not safely close from being closed by anything
-     * else, for the life of this process.
+     * Keeps a channel a failed {@link #take(Path)} opened and could not safely close from being closed
+     * by anything else, under the claim that take was refused over.
      *
      * <p>Being left alone is not the same as being kept: a {@link FileChannel} the JDK opened for itself
      * registers a cleaner that closes its descriptor once nothing references the channel, and on this
      * file that close drops whatever lock this process holds on it — which, on the path that gets here,
      * is a lock a running broker is serving on. So the reference in {@link #PINNED_REFUSED_CHANNELS} is
-     * the thing that keeps it, and it is never given back.
+     * the thing that keeps it, and the only take that gets it back is the one that ends up holding the
+     * lock through it.
      *
-     * <p>A channel that is already closed is not pinned: the two failure paths where closing is safe
-     * have closed it by the time this runs, and a descriptor that is gone cannot be dropped twice.
+     * <p>A channel that is already closed is not kept: the two failure paths where closing is safe have
+     * closed it by the time this runs, and a descriptor that is gone cannot be dropped twice. Nor is one
+     * this take never opened, because a take that was given a kept channel opened nothing.
+     *
+     * <p>It is {@code putIfAbsent} rather than {@code put} because the entry a take found empty is the
+     * entry it is filling, and the claim it holds is what says those are the same entry. A {@code put}
+     * would read as though overwriting were allowed, and overwriting here means dropping the last
+     * reference to a descriptor that must not be closed.
+     *
+     * @param claim  the key this take was refused over, which is what the descriptor is kept under
+     * @param opened the channel this take opened, or null if it was given one that was already kept
      */
-    private static void pinIfAFailedTakeLeftItOpen(FileChannel channel) {
-        if (channel != null && channel.isOpen()) {
-            PINNED_REFUSED_CHANNELS.add(channel);
+    private static void pinIfAFailedTakeLeftItOpen(Object claim, FileChannel opened) {
+        if (opened != null && opened.isOpen()) {
+            PINNED_REFUSED_CHANNELS.putIfAbsent(claim, opened);
         }
     }
 
@@ -351,9 +412,10 @@ final class DataDirectoryLock implements Closeable {
      * Closes the channel a failed {@link #take(Path)} had opened, so a start that does not happen does
      * not keep a file handle for ever. It is called from the one failure path where closing is safe —
      * an {@link IOException}, which means no lock on this file is this process's to lose — and never
-     * from the overlap path, where closing is the damage and the channel is pinned instead. A close
-     * that fails here is dropped: the start is already failing, and the exception it is failing with is
-     * the useful one.
+     * from the overlap path, where closing is the damage and the channel is kept instead. It is given
+     * only what that take opened, never a channel it was handed from {@link #PINNED_REFUSED_CHANNELS},
+     * which no take closes. A close that fails here is dropped: the start is already failing, and the
+     * exception it is failing with is the useful one.
      */
     private static void closeQuietlyAfterFailedTake(FileChannel channel) {
         if (channel == null) {
