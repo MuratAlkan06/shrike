@@ -4,6 +4,8 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.abort;
@@ -12,9 +14,16 @@ import io.shrike.core.log.ShrikeIOException;
 import io.shrike.core.protocol.CreateTopicRequest;
 import io.shrike.core.protocol.ResponseDecoding;
 import java.io.IOException;
+import java.lang.ref.PhantomReference;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -41,6 +50,18 @@ class BrokerDataDirectoryLockTest {
 
     /** Long enough that reaching it means the probe is stuck rather than slow. */
     private static final long PROBE_TIMEOUT_SECONDS = 60L;
+
+    /** How many collections are asked for before the test decides the collector has had its chance. */
+    private static final int COLLECTION_ROUNDS = 10;
+
+    /** Long enough that reaching it means a collection is not coming rather than that it is slow. */
+    private static final long COLLECTION_TIMEOUT_MILLIS = 5_000L;
+
+    /** One block of a round's garbage, sized so that a round is allocation rather than a rounding error. */
+    private static final int GARBAGE_BLOCK_BYTES = 64 * 1024;
+
+    /** How many of those blocks a round makes: 64 MiB, which is a collection's worth on any heap. */
+    private static final int GARBAGE_BLOCKS_PER_ROUND = 1024;
 
     @TempDir
     Path dataDirectory;
@@ -113,20 +134,23 @@ class BrokerDataDirectoryLockTest {
     }
 
     /**
-     * The same question as above, asked where the claim cannot answer it: two data directories that
-     * are genuinely different directories, whose {@code shrike.lock} is one and the same file.
+     * The same question as above, asked of two data directories that are genuinely two directories
+     * whose {@code shrike.lock} is one and the same file — a hard link, a bind mount, a symbolic link
+     * to the lock file rather than to the directory holding it.
      *
-     * <p>A claim is kept under a directory's real path and the JVM's lock table is kept under the lock
-     * file's device and inode, so a hard link — or a bind mount, or a symbolic link to the lock file
-     * rather than to the directory — puts the two out of step. The second start gets a claim nobody
-     * else holds, opens a channel, and only then meets the running broker's lock, which is the branch
-     * that used to close what it had opened. On POSIX that closes the <em>running</em> broker's lock
-     * with it, so the refusal that was meant to protect a data directory was the thing that gave it
-     * away, and the probe below answered {@code FREE} while a broker was still serving over it.
+     * <p>This is where a claim kept under a directory's real path could not answer, because the JVM's
+     * own lock table is kept under the lock file's device and inode: the second start took a claim
+     * nobody else held, opened a channel, and only then met the running broker's lock. Closing that
+     * channel dropped the running broker's lock with it, so the refusal meant to protect a data
+     * directory was the thing that gave it away — and <em>not</em> closing it only moved when that
+     * happened, because a channel nothing references is closed by its cleaner at the next collection.
+     * So the claim is kept under the lock file's own identity now, and the two assertions this test
+     * gained are the two halves of that: the refusal has opened nothing to be cleaned up after, and
+     * the lock is still the running broker's on the far side of a collection.
      *
-     * <p>So that branch closes nothing now, and the last block is the other half of the price: the
-     * refusal has to leave the claim it took behind it, or a directory refused once would be refused
-     * for the life of this JVM by an entry with no broker behind it.
+     * <p>The last block is the other half of the price: the refusal has to leave the claim it took
+     * behind it, or a directory refused once would be refused for the life of this JVM by an entry
+     * with no broker behind it.
      */
     @Test
     void keepsTheRunningBrokersLockWhenRefusingAStartOverADirectoryThatSharesItsLockFile() throws Exception {
@@ -138,9 +162,29 @@ class BrokerDataDirectoryLockTest {
 
             assertTrue(refused.getMessage().contains(aliasedDataDirectory.toString()),
                     "the refusal names the directory that was asked for: " + refused.getMessage());
+            assertNull(whatTheRefusalHadAlreadyOpenedAChannelOver(refused),
+                    "and the claim refused it before a descriptor on that lock file existed: a refusal"
+                            + " carrying an OverlappingFileLockException is one that had opened a channel"
+                            + " on the file a broker is holding, which is the thing there is no safe way"
+                            + " to be left with");
             assertEquals(DataDirectoryLockProbe.HELD, whatAnotherProcessFindsOfTheLock("aliased"),
                     "and refusing it left the running broker's lock where it was, so nothing outside"
                             + " this JVM can start a broker over the directory it is serving");
+
+            ShrikeIOException refusedAgain = assertThrows(ShrikeIOException.class,
+                    () -> BrokerHarness.start(aliasedDataDirectory));
+            assertNull(whatTheRefusalHadAlreadyOpenedAChannelOver(refusedAgain),
+                    "a second aliased start is refused the same way rather than by opening a channel of"
+                            + " its own, so a supervisor retrying one costs this process nothing per"
+                            + " attempt: " + refusedAgain.getMessage());
+
+            collectWhatNothingIsHoldingOnToAnyMore();
+
+            assertEquals(DataDirectoryLockProbe.HELD, whatAnotherProcessFindsOfTheLock("collected"),
+                    "and it is still the running broker's once the collector has run, which is what a"
+                            + " refusal that merely declines to close cannot promise: the JDK closes an"
+                            + " unreferenced channel's descriptor from a cleaner, and that close drops"
+                            + " this lock exactly as an explicit one would");
         }
 
         try (ShrikeBroker overTheAlias = BrokerHarness.start(aliasedDataDirectory);
@@ -149,6 +193,58 @@ class BrokerDataDirectoryLockTest {
                     client.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
                     "and a start refused once is not refused for ever: the claim that refusal took went"
                             + " back with it, so this directory is startable the moment the lock is free");
+        }
+    }
+
+    /**
+     * The one branch a claim cannot answer, and what a refusal that lands in it has to keep.
+     *
+     * <p>A claim is taken by starts, so a lock on {@code shrike.lock} that no start took is a lock no
+     * claim knows about: something in this JVM that is not a broker holding it, or — the same shape,
+     * without a way to build it in a test — a lock taken in the moment between a start reading the
+     * file's identity and opening it. A start then reaches {@code FileChannel.open} with somebody's
+     * lock on the other side, which is the branch that must not close what it opened.
+     *
+     * <p>Not closing it is not enough, and that is what this test is for. A channel nothing references
+     * is closed by the cleaner the JDK registered with it, and that close drops every lock this process
+     * holds on the file exactly as an explicit one would — so the refusal keeps a reference to the
+     * channel for the life of the process, and the collection below is what tells the two apart. The
+     * cost of that is one descriptor per time this happens, which is the trade this branch exists to
+     * make; the block after it is the other half, that the claim went back so the refusal is not for
+     * ever.
+     */
+    @Test
+    void keepsTheLockOfANonBrokerHolderInThisJvmWhenTheStartThatMetItIsRefused() throws Exception {
+        Path lockFile = dataDirectory.resolve(DataDirectoryLock.FILE_NAME);
+        try (FileChannel holderInThisJvm = FileChannel.open(lockFile, StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE)) {
+            FileLock heldByNoBroker = holderInThisJvm.tryLock();
+            assertNotNull(heldByNoBroker,
+                    "the arrangement: this JVM holds the lock file without any start having claimed it");
+
+            ShrikeIOException refused = assertThrows(ShrikeIOException.class,
+                    () -> BrokerHarness.start(dataDirectory));
+
+            assertInstanceOf(OverlappingFileLockException.class,
+                    whatTheRefusalHadAlreadyOpenedAChannelOver(refused),
+                    "which is refused by the branch that has already opened a channel, because a claim"
+                            + " nobody took cannot refuse anything: " + refused.getMessage());
+
+            collectWhatNothingIsHoldingOnToAnyMore();
+
+            assertEquals(DataDirectoryLockProbe.HELD, whatAnotherProcessFindsOfTheLock("backstop"),
+                    "and the channel that refusal opened is still open once the collector has run,"
+                            + " because the refusal kept a reference to it: a channel nothing references"
+                            + " is closed by its cleaner, and closing any descriptor on this file drops"
+                            + " the lock this JVM is holding on it");
+        }
+
+        try (ShrikeBroker afterwards = BrokerHarness.start(dataDirectory);
+             WireClient client = WireClient.connectTo(afterwards)) {
+            assertInstanceOf(ResponseDecoding.Answered.class,
+                    client.call(FIRST_CORRELATION_ID, new CreateTopicRequest(TOPIC, ONLY_PARTITION_COUNT)),
+                    "and the claim that refusal took went back with it, so the directory is startable the"
+                            + " moment the holder that was not a broker lets go");
         }
     }
 
@@ -202,6 +298,72 @@ class BrokerDataDirectoryLockTest {
             abort("this filesystem will not make a hard link, so one lock file under two directories"
                     + " cannot be built here: " + linksRefused);
         }
+    }
+
+    /**
+     * Which branch of {@link DataDirectoryLock#take} a refusal came out of, read off the exception it
+     * came out with. Both refusals say the same sentence on purpose — an operator can do nothing
+     * different about either — but only the one that has already opened a channel on the lock file has
+     * an {@link java.nio.channels.OverlappingFileLockException} behind its cause, because that is the
+     * exception a channel it opened threw. So a null here is the refusal that opened nothing.
+     *
+     * @param refused what a start was refused with
+     * @return the overlap that refusal caught, or null if it never opened a channel to catch one from
+     */
+    private static Throwable whatTheRefusalHadAlreadyOpenedAChannelOver(ShrikeIOException refused) {
+        return refused.getCause() == null ? null : refused.getCause().getCause();
+    }
+
+    /**
+     * Waits until this JVM's collector has reclaimed objects nothing is holding on to any more, so that
+     * the question asked after it is asked on the far side of a collection rather than the near side.
+     *
+     * <p>Nothing here sleeps, which §4 and §6 of PRINCIPLES.md both forbid, and nothing here asserts a
+     * duration. Each round drops a canary nothing references, asks for a collection, and waits on a
+     * {@link ReferenceQueue} until that canary's phantom reference is enqueued — a bounded wait on the
+     * very event this is about, since a {@link java.nio.channels.FileChannel} the JDK opened for itself
+     * is closed by a cleaner driven by exactly that phantom-reachability. It is rounds rather than one
+     * pass because a reference an earlier frame happened to leave on the stack survives the first
+     * collection and not the tenth, and because a cleaner runs its action on a thread of its own once
+     * the reference has been enqueued rather than in the collection that enqueued it.
+     *
+     * @throws InterruptedException if this thread is interrupted while waiting for a collection
+     */
+    private static void collectWhatNothingIsHoldingOnToAnyMore() throws InterruptedException {
+        int collections = 0;
+        long garbageBytes = 0;
+        for (int round = 0; round < COLLECTION_ROUNDS; round++) {
+            ReferenceQueue<Object> collected = new ReferenceQueue<>();
+            PhantomReference<Object> canary = new PhantomReference<>(new Object(), collected);
+
+            garbageBytes += makeGarbage();
+            System.gc();
+            if (collected.remove(COLLECTION_TIMEOUT_MILLIS) != null) {
+                collections++;
+            }
+            Reference.reachabilityFence(canary);
+        }
+
+        assertTrue(collections > 0, "the collector reclaimed something after " + (garbageBytes >> 20)
+                + " MB of allocation and " + COLLECTION_ROUNDS + " requests, so what is asserted below"
+                + " is asserted about a process that has collected rather than one that never did");
+    }
+
+    /**
+     * Allocates and drops a round's worth of garbage, so that a collection has something to collect as
+     * well as a request to run. The bytes are summed and the sum is used, because allocation nobody
+     * looks at is allocation the compiler is entitled to decide never happened.
+     *
+     * @return how many bytes were allocated and dropped
+     */
+    private static long makeGarbage() {
+        long allocated = 0;
+        for (int block = 0; block < GARBAGE_BLOCKS_PER_ROUND; block++) {
+            byte[] garbage = new byte[GARBAGE_BLOCK_BYTES];
+            garbage[block % GARBAGE_BLOCK_BYTES] = (byte) block;
+            allocated += garbage.length;
+        }
+        return allocated;
     }
 
     /**
