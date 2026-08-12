@@ -6,6 +6,7 @@ import io.shrike.core.log.SafeName;
 import io.shrike.core.protocol.RequestReader;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
@@ -192,9 +193,10 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
                 .orElseThrow(() -> new IllegalArgumentException(DATA_DIRECTORY_VARIABLE
                         + " names the directory this broker stores everything under, and it has no default"));
 
-        Path dataDirectory = Path.of(namedDataDirectory);
+        Path dataDirectory = path(namedDataDirectory, DATA_DIRECTORY_VARIABLE);
         int port = value(environment, PORT_VARIABLE).map(BrokerLaunch::port).orElse(DEFAULT_PORT);
-        Path readyFilePath = value(environment, READY_FILE_VARIABLE).map(Path::of)
+        Path readyFilePath = value(environment, READY_FILE_VARIABLE)
+                .map(named -> path(named, READY_FILE_VARIABLE))
                 .orElseGet(() -> dataDirectory.resolve(DEFAULT_READY_FILE_NAME));
         InetAddress bindAddress = value(environment, BIND_ADDRESS_VARIABLE)
                 .map(BrokerLaunch::bindAddress)
@@ -326,12 +328,12 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
     private static void requireAsciiDigits(String text) {
         int firstDigit = !text.isEmpty() && text.charAt(0) == '-' ? 1 : 0;
         if (firstDigit == text.length()) {
-            throw new NumberFormatException(text);
+            throw new NumberFormatException(SafeName.quote(text));
         }
         for (int i = firstDigit; i < text.length(); i++) {
             char character = text.charAt(i);
             if (character < '0' || character > '9') {
-                throw new NumberFormatException(text);
+                throw new NumberFormatException(SafeName.quote(text));
             }
         }
     }
@@ -379,6 +381,25 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
         }
         return new IllegalArgumentException(variable + " was set to a value this broker cannot use: " + sentence,
                 refusal);
+    }
+
+    /**
+     * The path a variable names, refused the way every other value here is when the text cannot be one.
+     * {@link Path#of} throws {@link InvalidPathException} — an unchecked exception — on a string no path
+     * can hold, whose own message embeds the raw text; caught here it becomes the one-sentence refusal
+     * naming the variable and echoing the value through {@link SafeName#quote}, so it stops the start on
+     * exit code {@value BrokerMain#STARTUP_FAILURE_EXIT_CODE} like any other bad value rather than
+     * escaping the exit path as a stack trace carrying the raw text. On POSIX the only such character is
+     * a {@code NUL}, which an environment variable cannot carry, so this is the refusal shape no real
+     * environment reaches — and the one that would otherwise bypass both the scrubber and the exit path.
+     */
+    private static Path path(String named, String variable) {
+        try {
+            return Path.of(named);
+        } catch (InvalidPathException notAPath) {
+            throw new IllegalArgumentException(variable + " must name a path this broker can use, but "
+                    + SafeName.quote(named) + " is not one", notAPath);
+        }
     }
 
     private static int port(String named) {

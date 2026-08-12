@@ -307,6 +307,48 @@ class BrokerLaunchTest {
                 "the ten-kilobyte value never reaches the log line in full");
     }
 
+    /**
+     * The data directory and the ready file are the two settings read into a {@link Path}, and
+     * {@link java.nio.file.Path#of} throws an unchecked {@code InvalidPathException} — whose own
+     * message embeds the raw text — on a string no path can hold. On POSIX that is a {@code NUL},
+     * which a real environment variable cannot carry, so the map is crafted here rather than reached
+     * through the JVM's own environment. The refusal must be the shape every other bad value gets: an
+     * {@link IllegalArgumentException} naming the variable, echoing the value through the scrubber, on
+     * one line — not a {@code RuntimeException} that escapes the start's catch and prints the raw
+     * text with a stack.
+     */
+    @Test
+    void refusesAPathVariableHoldingACharacterNoPathCanCarryNamingItOnOneScrubbedLine() {
+        String pathNoPathCanHold = DATA_DIRECTORY + "\u0000\n2026-01-01 FATAL forged log line";
+        Map<String, String> badDataDirectory = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, pathNoPathCanHold);
+
+        IllegalArgumentException dataRefusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, badDataDirectory));
+
+        assertTrue(dataRefusal.getMessage().contains(BrokerLaunch.DATA_DIRECTORY_VARIABLE),
+                dataRefusal.getMessage());
+        assertFalse(dataRefusal.getMessage().contains("\u0000"),
+                "the NUL no path can hold is scrubbed to '?' rather than carried into the refusal: "
+                        + dataRefusal.getMessage());
+        assertFalse(dataRefusal.getMessage().contains("\n"),
+                "and the value is echoed on one line, so it cannot forge a second: "
+                        + dataRefusal.getMessage());
+
+        Map<String, String> badReadyFile = Map.of(
+                BrokerLaunch.DATA_DIRECTORY_VARIABLE, DATA_DIRECTORY,
+                BrokerLaunch.READY_FILE_VARIABLE, pathNoPathCanHold);
+
+        IllegalArgumentException readyRefusal = assertThrows(IllegalArgumentException.class,
+                () -> BrokerLaunch.from(NO_ARGUMENTS, badReadyFile));
+
+        assertTrue(readyRefusal.getMessage().contains(BrokerLaunch.READY_FILE_VARIABLE),
+                readyRefusal.getMessage());
+        assertFalse(readyRefusal.getMessage().contains("\u0000"),
+                "the ready-file path is named and scrubbed the same way the data directory is: "
+                        + readyRefusal.getMessage());
+    }
+
     @Test
     void refusesANumberWrittenInDigitsOfAnotherScriptRatherThanReadingItAsTheJdkWould() {
         assertEquals(42L, Long.parseLong(FORTY_TWO_IN_ARABIC_INDIC_DIGITS),
@@ -326,6 +368,9 @@ class BrokerLaunchTest {
                             + refusal.getMessage());
             assertTrue(refusal.getMessage().contains("must be a whole number"),
                     "and it is refused as the number it is not, rather than started on: " + refusal.getMessage());
+            assertFalse(refusal.getMessage().contains(FORTY_TWO_IN_ARABIC_INDIC_DIGITS),
+                    "the hostile value itself is gone, scrubbed to '?' on the way into the refusal: "
+                            + refusal.getMessage());
         }
     }
 
