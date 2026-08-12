@@ -57,6 +57,13 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>The partitions this broker will hold open are budgeted by
  * {@link BrokerConfig#maxTotalPartitions()}, counted across every topic, because each one costs a
  * directory and two open file handles for as long as the broker runs.
+ *
+ * <p><strong>Memory never disagrees with the device about which topics exist, or with how many
+ * partitions.</strong> The registry file's atomic move is what makes a topic exist, so a create that
+ * failed before the move is dropped from memory and a create that failed after it is kept — kept at the
+ * partition count the file lists, whether or not its logs ever opened, because the file is what the
+ * next start reads and what every later rewrite of it is built from. See "What a failed create rolls
+ * back is decided by the move, the same as a commit" in DESIGN.md.
  */
 final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
 
@@ -75,6 +82,9 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
     private final Path registryFile;
     private final TimeSource timeSource;
 
+    /** Watches the steps every create's registry write takes. See {@link DurableFile.StepObserver}. */
+    private final DurableFile.StepObserver observer;
+
     /** Held for the whole of a create: the check, the file rewrite, and the publish are one step. */
     private final ReentrantLock createLock = new ReentrantLock();
 
@@ -87,10 +97,11 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
     // concurrent map: a produce or a fetch must not queue behind somebody's create.
     private final Map<String, Topic> topicsByFoldedName = new ConcurrentHashMap<>();
 
-    private TopicRegistry(BrokerConfig config, TimeSource timeSource) {
+    private TopicRegistry(BrokerConfig config, TimeSource timeSource, DurableFile.StepObserver observer) {
         this.config = config;
         this.registryFile = config.dataDirectory().resolve(FILE_NAME);
         this.timeSource = timeSource;
+        this.observer = observer;
     }
 
     /**
@@ -109,10 +120,27 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
      *                           only in case, or a log cannot be opened
      */
     static TopicRegistry open(BrokerConfig config, TimeSource timeSource) {
+        return open(config, timeSource, DurableFile.StepObserver.IGNORED);
+    }
+
+    /**
+     * Opens the registry with a seam watching the steps every create's registry write takes. See
+     * {@link DurableFile.StepObserver}: what a failed create rolls back is decided by which of them ran,
+     * and this is how a test can stand a device that fails at a chosen one.
+     *
+     * @param config     where things live and how much of them there may be
+     * @param timeSource the clock that stamps appended records and times fetch waits
+     * @param observer   the seam
+     * @return the open registry
+     * @throws ShrikeIOException if the file cannot be read, does not parse, lists two names that differ
+     *                           only in case, or a log cannot be opened
+     */
+    static TopicRegistry open(BrokerConfig config, TimeSource timeSource, DurableFile.StepObserver observer) {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(timeSource, "timeSource");
+        Objects.requireNonNull(observer, "observer");
 
-        TopicRegistry registry = new TopicRegistry(config, timeSource);
+        TopicRegistry registry = new TopicRegistry(config, timeSource, observer);
         Map<String, Integer> partitionCounts = registry.readRegistryFile();
         registry.warnIfPastTheBudget(partitionCounts);
         try {
@@ -137,7 +165,14 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
      * @throws TopicAlreadyExistsException  if a topic whose name folds onto this one is already here
      * @throws TooManyPartitionsException   if this create would push the broker past
      *                                      {@link BrokerConfig#maxTotalPartitions()}
-     * @throws ShrikeIOException            if the registry file or a partition log cannot be written
+     * @throws ShrikeIOException            if the registry file or a partition log cannot be written,
+     *                                      in which case this registry holds whatever the device does. A
+     *                                      failure before the registry file took its new contents leaves
+     *                                      the broker without the topic, and a later create of that name
+     *                                      is served. A failure after it keeps the topic, at the
+     *                                      partition count the file lists, so a later create of that
+     *                                      name is refused and no rewrite of that file can shrink it —
+     *                                      and this create still fails, because nothing confirmed it
      */
     void create(String name, int partitionCount) {
         SafeName.require(name, "name");
@@ -161,12 +196,48 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
 
             Map<String, Integer> partitionCounts = currentPartitionCounts();
             partitionCounts.put(name, partitionCount);
-            DurableFile.replace(registryFile, render(partitionCounts));
-
-            topicsByFoldedName.put(SafeName.fold(name), openTopic(name, partitionCount));
+            StepsTaken steps = new StepsTaken(observer);
+            try {
+                DurableFile.replace(registryFile, render(partitionCounts), steps);
+                topicsByFoldedName.put(SafeName.fold(name), openTopic(name, partitionCount));
+            } catch (RuntimeException e) {
+                // The registry file is what says which topics exist, so what a failure rolls back is
+                // decided by the move and by nothing else. Before it, nothing on the device carries the
+                // topic's name and the map was never touched, so there is nothing to undo. At it, the
+                // file every later reader finds lists this topic — including the next rewrite of that
+                // file, which is built from the map — so the map has to list it too, whether what failed
+                // afterwards was forcing the directory or opening the logs.
+                if (steps.hasMoved()) {
+                    keepTheTopicTheRegistryNames(name, partitionCount);
+                }
+                throw e;
+            }
         } finally {
             createLock.unlock();
         }
+    }
+
+    /**
+     * Holds a topic whose registry file was moved into place by a create that then failed, at the
+     * partition count that file lists and with no partition log open behind it — the logs either never
+     * opened or were closed again by the open that failed.
+     *
+     * <p>Nothing here retries and nothing here deletes. Rewriting the file to take the topic back out
+     * would be two more operations on a device that has just refused one, and a rewrite that failed
+     * halfway is the divergence again with a wasted attempt in front of it. What the next start does is
+     * the recovery: it reads the file, opens every partition it lists, and creates the directories that
+     * are not there yet.
+     *
+     * @param name           the topic the registry file now names
+     * @param partitionCount the count it lists against that name
+     */
+    // guarded by: createLock, the only place that calls it
+    private void keepTheTopicTheRegistryNames(String name, int partitionCount) {
+        topicsByFoldedName.put(SafeName.fold(name), new Topic(name, partitionCount, List.of()));
+        LOGGER.log(System.Logger.Level.WARNING, () -> "the topic registry " + registryFile + " now lists topic="
+                + name + " with " + partitionCount + " partitions, but the create that wrote it failed before"
+                + " every log behind it was open; the topic is held as one this broker serves no partition of,"
+                + " a create naming it again is refused, and the next start opens it in full");
     }
 
     /**
@@ -279,8 +350,10 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
     }
 
     /**
-     * @return how many partitions this broker holds open, counted across every topic. Each one costs a
-     *         directory and two open file handles, which is what the budget is about
+     * @return how many partitions this broker holds, counted across every topic. Each one costs a
+     *         directory and two open file handles, which is what the budget is about — and a partition
+     *         the registry file lists costs them at the next start whether or not its log is open now,
+     *         so a topic kept by a failed create is counted like any other
      */
     // guarded by: createLock, the only place that asks
     private long openPartitionCount() {
@@ -323,8 +396,10 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
     }
 
     /**
-     * @return the partition count of every open topic, ordered by name so that a rewritten file lists
-     *         its topics the same way whatever order they were created in
+     * @return the partition count of every topic this broker holds, ordered by name so that a rewritten
+     *         file lists its topics the same way whatever order they were created in. A topic whose
+     *         create failed after its registry file was moved counts here for the count that file lists,
+     *         which is what keeps the next rewrite from shrinking it
      */
     private Map<String, Integer> currentPartitionCounts() {
         Map<String, Integer> partitionCounts = new TreeMap<>();
@@ -445,5 +520,42 @@ final class TopicRegistry implements Closeable, SegmentDeletion, LogFlush {
         List<Topic> topics = new ArrayList<>(topicsByFoldedName.values());
         topics.sort(Comparator.comparing(Topic::name));
         return topics;
+    }
+
+    /**
+     * How far one create's registry write got, which is the only thing that says what a failure has to
+     * undo: the atomic move is what puts the new list of topics under the name every reader of this
+     * directory opens, so a failure before it left the old list there and a failure after it did not.
+     *
+     * <p>It records the step before passing it on, and the order is the point: a step is reported once
+     * it has run, so an observer that throws is standing in for a device that failed <em>after</em> that
+     * step — and a move that ran is a move this registry must not pretend away.
+     */
+    private static final class StepsTaken implements DurableFile.StepObserver {
+
+        private final DurableFile.StepObserver watching;
+
+        // confined to: the thread inside create that made it, which holds createLock for the whole write
+        private boolean hasMoved;
+
+        StepsTaken(DurableFile.StepObserver watching) {
+            this.watching = watching;
+        }
+
+        @Override
+        public void completed(DurableFile.Step step) {
+            if (step == DurableFile.Step.MOVED) {
+                hasMoved = true;
+            }
+            watching.completed(step);
+        }
+
+        /**
+         * @return whether the registry file has taken its new contents, so that what every later reader
+         *         of this directory finds is the list this create wrote rather than the one before it
+         */
+        boolean hasMoved() {
+            return hasMoved;
+        }
     }
 }
