@@ -210,7 +210,7 @@ public final class ShrikeBroker implements AutoCloseable {
     };
 
     /**
-     * The third test seam, and the last field here production code never writes. It is where the WARN a
+     * The third test seam, and one more field here production code never writes. It is where the WARN a
      * failed handoff earns is written, so that a test can make the writing of that line throw the way it
      * would under the memory pressure that failed the handoff in the first place — which is the whole
      * reason {@link #warnHandoffFailed(String, Throwable)} runs after the unwind rather than before it.
@@ -219,6 +219,19 @@ public final class ShrikeBroker implements AutoCloseable {
     // volatile because a test installs it from its own thread and shrike-acceptor is what reads it.
     private volatile BiConsumer<String, Throwable> handoffFailureLog =
             (message, failure) -> LOGGER.log(System.Logger.Level.WARNING, message, failure);
+
+    /**
+     * The fourth test seam, and the last field here production code never writes. It runs on the
+     * acceptor as a handoff that failed begins to give back what it took, so that a test can make the
+     * unwind itself throw the way closing a socket or removing a map entry can under the same memory
+     * pressure that failed the handoff to begin with — which is what
+     * {@link #abandon(Connection, SocketChannel)} has to survive, because a throwable escaping it would
+     * end the accept loop and leave a place under the cap taken for the life of the process. Production
+     * leaves it doing nothing.
+     */
+    // volatile because a test installs it from its own thread and shrike-acceptor is what reads it.
+    private volatile Runnable connectionAbandoned = () -> {
+    };
 
     /**
      * The one accepting thread. Not final because it starts after the broker is built, since a thread
@@ -474,6 +487,18 @@ public final class ShrikeBroker implements AutoCloseable {
         handoffFailureLog = seam;
     }
 
+    /**
+     * Installs the test seam described on {@link #connectionAbandoned}. Package-private for the same
+     * reason as {@link #onConnectionReserved(Runnable)}: there is no way to ask over a socket for the
+     * close of that socket to fail.
+     *
+     * @param seam what to run on the acceptor as a failed handoff gives back what it took
+     */
+    void onConnectionAbandoned(Runnable seam) {
+        Objects.requireNonNull(seam, "seam");
+        connectionAbandoned = seam;
+    }
+
     private void startAccepting() {
         acceptor = new Thread(this::acceptConnections, ACCEPTOR_THREAD_NAME);
         acceptor.start();
@@ -595,6 +620,12 @@ public final class ShrikeBroker implements AutoCloseable {
             // connection, and neither can leave it open with nobody left to close it.
             openConnections.put(connection, thread);
             if (stopping.get()) {
+                // Forgotten before it is given back, not after: while `reserved` still named this
+                // connection, a throwable out of this unwind would reach the catch below and unwind the
+                // same connection a second time, giving its place under the cap back twice and raising
+                // the cap by one for as long as this broker ran. Nothing is lost by forgetting it here,
+                // because the unwind on the next line is the one this connection gets.
+                reserved = null;
                 abandon(connection, socket);
                 return true;
             }
@@ -649,22 +680,44 @@ public final class ShrikeBroker implements AutoCloseable {
 
     /**
      * Gives back everything {@link #serveOrClose(SocketChannel)} took for a connection that will not be
-     * served: its map entry, its place under the cap, and its socket. It runs at most once per
-     * connection, because the thread that would otherwise give those back either never started or is
-     * not going to.
+     * served: its map entry, its place under the cap, and its socket. It runs once and only once per
+     * connection — the thread that would otherwise give those back either never started or is not going
+     * to — and it throws nothing at all.
+     *
+     * <p><strong>The place under the cap goes back in a {@code finally}, and nothing here escapes.</strong>
+     * Both are the same reason the guard around the handoff exists at all. The failure this runs under is
+     * terminal memory pressure, which is the one condition where removing a map entry or closing a socket
+     * can itself throw an {@code OutOfMemoryError} — and a throwable from this unwind used to leave the
+     * place under the cap taken and then travel out of {@code serveOrClose} and end the accept loop, while
+     * the port stayed bound and the ready file stayed where it was. That is a broker that is up and deaf,
+     * arriving from the code written to prevent it, and it contradicted the whole of "no throwable from a
+     * handoff ends the accept loop". So the count is decremented however this ends, and what is caught here
+     * is dropped: this <em>is</em> the path that gives things back, so there is nothing left to give the
+     * failure to, and the WARN the handoff earns is written immediately afterwards and names the connection
+     * that was not served. That exception to PRINCIPLES §3 is the one
+     * {@link #warnHandoffFailed(String, Throwable)} already documents, in the same DESIGN.md entry. What a
+     * throwing close costs is the socket: it stays open until this process ends, which is the cheaper half
+     * of a trade whose other half is an accept loop that is gone.
      *
      * @param connection the connection, or null when the handoff failed before there was one, in which
      *                   case there is no map entry and the socket is what there is to close
      * @param socket     the accepted socket
      */
     private void abandon(Connection connection, SocketChannel socket) {
-        if (connection == null) {
-            closeQuietly(socket, "a connection this broker could not hand to a thread");
-        } else {
-            openConnections.remove(connection);
-            connection.close();
+        try {
+            connectionAbandoned.run();
+            if (connection == null) {
+                closeQuietly(socket, "a connection this broker could not hand to a thread");
+            } else {
+                openConnections.remove(connection);
+                connection.close();
+            }
+        } catch (Throwable unwindFailed) {
+            // Dropped on purpose: see above. The place under the cap goes back in the finally below,
+            // which is the one thing here that a later connection depends on.
+        } finally {
+            openConnectionCount.decrementAndGet();
         }
-        openConnectionCount.decrementAndGet();
     }
 
     /**
