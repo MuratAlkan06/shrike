@@ -9,6 +9,8 @@ import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * One broker's claim on one data directory, held for as long as that broker is running.
@@ -32,10 +34,20 @@ import java.util.Objects;
  *
  * <p><strong>Two ways to be refused, one sentence for both.</strong> Another process holding the lock
  * makes {@link FileChannel#tryLock()} answer null; this same JVM already holding it — an application
- * that embeds two brokers, or a test starting a second one — makes the same call throw
- * {@link OverlappingFileLockException}, because a lock is held per JVM rather than per channel. Neither
- * is a condition an operator can act on differently, so both arrive as one {@link ShrikeIOException}
- * naming the directory and saying it is another broker's.
+ * that embeds two brokers, or a test starting a second one — is refused by {@link #CLAIMED_DIRECTORIES}
+ * before a channel is opened at all. Neither is a condition an operator can act on differently, so both
+ * arrive as one {@link ShrikeIOException} naming the directory and saying it is another broker's.
+ *
+ * <p><strong>Why the same-JVM refusal is answered before a second descriptor is opened.</strong> The
+ * JDK implements {@link FileLock} with POSIX {@code fcntl} record locks, and POSIX drops <em>every</em>
+ * lock a process holds on a file the moment that process closes <em>any</em> descriptor on it. Asking
+ * for the lock a second time in one JVM throws {@link OverlappingFileLockException} out of the JVM's own
+ * lock table before a system call is made, so the second attempt never held anything — but closing the
+ * channel it had opened, which a refusal must do or leak a descriptor, released the <em>running</em>
+ * broker's lock as a side effect. What that left was a broker still serving over a data directory it no
+ * longer held, and an outside process free to take the lock and start over it. So a start claims the
+ * directory in this JVM first, and a start that cannot have the claim is refused without opening
+ * anything: the descriptor whose closing did the damage is never created.
  *
  * <p>Nothing here deletes the lock file, on this path or any other: stopping a broker leaves the data
  * directory exactly as it found it, and an empty file that the next start reuses is cheaper than a
@@ -46,12 +58,34 @@ final class DataDirectoryLock implements Closeable {
     /** The file the lock is taken on, directly under the data directory. It stays empty. */
     static final String FILE_NAME = "shrike.lock";
 
+    /**
+     * The data directories this JVM is holding, each under the real path it resolves to, so that two
+     * spellings of one directory — a relative one, a symbolic link, a {@code ..} on the way — are one
+     * entry rather than two claims on one lock file.
+     *
+     * <p>This is the one piece of static mutable state in this codebase, and PRINCIPLES §2 forbids it,
+     * so the exception is written down here and in DESIGN.md as the preamble to those rules requires.
+     * What it holds is a fact about the process rather than about any object in it — the JDK's own
+     * {@code FileLockTable} is static for the same reason — and there is nowhere to inject it from:
+     * {@link ShrikeBroker#start} is what takes a lock, and an embedder starting a second broker is
+     * exactly the caller that must be refused, so a registry it could hand in would be a registry it
+     * could hand in a second copy of.
+     */
+    // guarded by: its own concurrency — a set backed by a ConcurrentHashMap, entered only through the
+    // atomic add below and left only through the removals in take() and close().
+    private static final Set<Path> CLAIMED_DIRECTORIES = ConcurrentHashMap.newKeySet();
+
     private final Path lockFile;
+
+    /** The entry in {@link #CLAIMED_DIRECTORIES} this lock owns, given back by {@link #close()}. */
+    private final Path claimedDirectory;
+
     private final FileChannel channel;
     private final FileLock lock;
 
-    private DataDirectoryLock(Path lockFile, FileChannel channel, FileLock lock) {
+    private DataDirectoryLock(Path lockFile, Path claimedDirectory, FileChannel channel, FileLock lock) {
         this.lockFile = lockFile;
+        this.claimedDirectory = claimedDirectory;
         this.channel = channel;
         this.lock = lock;
     }
@@ -68,20 +102,34 @@ final class DataDirectoryLock implements Closeable {
         Objects.requireNonNull(dataDirectory, "dataDirectory");
 
         Path lockFile = dataDirectory.resolve(FILE_NAME);
+        Path claimedDirectory = realPathOf(dataDirectory, lockFile);
+        if (!CLAIMED_DIRECTORIES.add(claimedDirectory)) {
+            // Refused without opening a thing, which is the whole of the class comment's third
+            // paragraph: a channel opened here and closed again would drop the running broker's lock.
+            throw alreadyLocked(dataDirectory, lockFile, null);
+        }
         FileChannel channel = null;
         try {
             channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             FileLock lock = channel.tryLock();
             if (lock == null) {
+                // Another process holds it, so this process holds no lock on this file — the claim
+                // above is the proof — and closing the channel therefore releases nothing of ours.
                 channel.close();
+                CLAIMED_DIRECTORIES.remove(claimedDirectory);
                 throw alreadyLocked(dataDirectory, lockFile, null);
             }
-            return new DataDirectoryLock(lockFile, channel, lock);
+            return new DataDirectoryLock(lockFile, claimedDirectory, channel, lock);
         } catch (OverlappingFileLockException heldByThisJvm) {
+            // Not a second broker, which the claim already refused, but something else in this JVM
+            // holding this file: the sentence is the same, and the claim goes back so that a start
+            // after that holder lets go is not refused by a claim nothing is behind.
             closeQuietlyAfterFailedTake(channel);
+            CLAIMED_DIRECTORIES.remove(claimedDirectory);
             throw alreadyLocked(dataDirectory, lockFile, heldByThisJvm);
         } catch (IOException e) {
             closeQuietlyAfterFailedTake(channel);
+            CLAIMED_DIRECTORIES.remove(claimedDirectory);
             throw new ShrikeIOException("cannot lock the data directory " + dataDirectory + " through " + lockFile, e);
         }
     }
@@ -97,12 +145,31 @@ final class DataDirectoryLock implements Closeable {
     public void close() throws IOException {
         try (FileChannel releasing = channel) {
             lock.release();
+        } finally {
+            // In a finally because a release that failed still ends this broker's claim on the
+            // directory: leaving the entry behind would refuse every later start in this JVM over a
+            // directory the operating system had already let go of.
+            CLAIMED_DIRECTORIES.remove(claimedDirectory);
         }
     }
 
     @Override
     public String toString() {
         return "DataDirectoryLock[" + lockFile + "]";
+    }
+
+    /**
+     * The identity a claim is kept under: the directory with every link, {@code .}, and {@code ..}
+     * resolved, so that two names for one directory cannot become two claims on one lock file. The
+     * directory exists by now — {@link ShrikeBroker#start} creates it before it locks it — so this
+     * failing means the directory went away or cannot be read, which is a start that cannot happen.
+     */
+    private static Path realPathOf(Path dataDirectory, Path lockFile) {
+        try {
+            return dataDirectory.toRealPath();
+        } catch (IOException e) {
+            throw new ShrikeIOException("cannot lock the data directory " + dataDirectory + " through " + lockFile, e);
+        }
     }
 
     private static ShrikeIOException alreadyLocked(Path dataDirectory, Path lockFile, Throwable heldByThisJvm) {
