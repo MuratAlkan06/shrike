@@ -145,8 +145,9 @@ final class ConnectionReaper implements AutoCloseable {
     /**
      * Writes the WARN a failed pass earns, and drops a throwable from the writing of it.
      *
-     * <p>That is the one thing this codebase drops, and it is dropped here for the reason the class
-     * comment gives: what has just failed may be the logger itself, so there is nowhere left to report
+     * <p>That is the same drop {@link ShrikeBroker}'s own WARN guard takes, and the two of them are the
+     * whole of what this codebase drops from a line it is writing. It is dropped here for the reason the
+     * class comment gives: what has just failed may be the logger itself, so there is nowhere left to report
      * the failure of reporting, and this thread is the only thing enforcing either bound. A reaper that
      * ended because it could not write one line would leave every stalled connection on this broker
      * holding its place under the cap until the process ended.

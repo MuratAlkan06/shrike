@@ -660,8 +660,9 @@ public final class ShrikeBroker implements AutoCloseable {
      * condition under which formatting a message and appending a line can themselves throw: logging
      * first would leave the place under the cap taken, the socket open, and this thread dead — the
      * three losses the unwind exists to prevent, arriving from the line that was meant to report them.
-     * <strong>And a throwable from the logging is dropped here</strong>, which is the one place in this
-     * codebase that drops one. What just failed is the logger, so there is nothing left to report the
+     * <strong>And a throwable from the logging is dropped here</strong>, as it is in the one other place
+     * that writes a line it cannot afford to be stopped by, {@link ConnectionReaper}'s guard around its
+     * own WARN. What just failed is the logger, so there is nothing left to report the
      * failure to; the connection's place, its map entry, and its socket are already back; and a broker
      * that stopped accepting because it could not write a line about one socket would be a far larger
      * outage than the missing line. That exception to PRINCIPLES §3 is written down in DESIGN.md, under
