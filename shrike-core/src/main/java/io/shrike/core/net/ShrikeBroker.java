@@ -49,17 +49,20 @@ import java.util.concurrent.atomic.AtomicLong;
  * connection whether it has spent longer than {@code read.timeout.ms} reading one request, or longer
  * than {@code write.timeout.ms} writing an answer no byte of is moving.
  *
- * <p><strong>Starting.</strong> The topic registry and every partition log are opened and recovered
- * first, then the committed offsets are loaded, then the socket binds, then the acceptor, the
- * retention thread, the flush thread, and the connection reaper start, and only then is the
- * {@link ReadyFile} written. A reader that can see the ready file can connect.
+ * <p><strong>Starting.</strong> The {@link DataDirectoryLock} is taken first, so that nothing below is
+ * ever done to a data directory another broker is already running over. Then the topic registry and
+ * every partition log are opened and recovered, then the committed offsets are loaded, then the socket
+ * binds, then the acceptor, the retention thread, the flush thread, and the connection reaper start,
+ * and only then is the {@link ReadyFile} written. A reader that can see the ready file can connect. A
+ * start that fails anywhere after the lock releases it on its way out.
  *
  * <p><strong>Stopping.</strong> Stop accepting, stop retention, the flush interval, and the reaper and
  * wait for a pass of each in flight, wake every fetch that is waiting on a partition, close the open
  * connections so their threads come out of their blocking reads, join those threads under a bounded
- * deadline, and close every log — which forces the segment it was still writing. Nothing is deleted on
- * the way out, including the ready file: what retention deletes it deletes while the broker is running
- * and says so in the log.
+ * deadline, close every log — which forces the segment it was still writing — and let go of the data
+ * directory last of all, since it is another broker's to take the instant this one does. Nothing is
+ * deleted on the way out, including the ready file and the lock file: what retention deletes it deletes
+ * while the broker is running and says so in the log.
  *
  * <p><strong>Durability.</strong> What a produce promises is decided by {@code flush.mode} and by
  * nothing else. Under {@link io.shrike.core.log.FlushMode#PER_RECORD} a produce is acknowledged only
@@ -114,6 +117,10 @@ public final class ShrikeBroker implements AutoCloseable {
     private static final long ACCEPT_BACKOFF_MILLIS = 100L;
 
     private final BrokerConfig config;
+
+    /** This broker's claim on its data directory, held from before the first log opens until close. */
+    private final DataDirectoryLock dataDirectoryLock;
+
     private final ServerSocketChannel serverChannel;
     private final TopicRegistry topics;
     private final GroupOffsetStore groupOffsets;
@@ -208,10 +215,11 @@ public final class ShrikeBroker implements AutoCloseable {
      */
     private volatile Thread acceptor;
 
-    private ShrikeBroker(BrokerConfig config, ServerSocketChannel serverChannel, TopicRegistry topics,
-                         GroupOffsetStore groupOffsets, TimeSource timeSource, MonotonicTimeSource monotonicTime,
-                         int port) {
+    private ShrikeBroker(BrokerConfig config, DataDirectoryLock dataDirectoryLock, ServerSocketChannel serverChannel,
+                         TopicRegistry topics, GroupOffsetStore groupOffsets, TimeSource timeSource,
+                         MonotonicTimeSource monotonicTime, int port) {
         this.config = config;
+        this.dataDirectoryLock = dataDirectoryLock;
         this.serverChannel = serverChannel;
         this.topics = topics;
         this.groupOffsets = groupOffsets;
@@ -292,15 +300,27 @@ public final class ShrikeBroker implements AutoCloseable {
             throw new ShrikeIOException("cannot create the data directory " + dataDirectory, e);
         }
 
-        TopicRegistry topics = TopicRegistry.open(config, timeSource);
+        // Before the registry, before the logs, and before the group offsets are migrated onto their
+        // folded names: everything below this line assumes one writer, and this is what makes that so.
+        DataDirectoryLock dataDirectoryLock = DataDirectoryLock.take(dataDirectory);
+
+        TopicRegistry topics;
+        try {
+            topics = TopicRegistry.open(config, timeSource);
+        } catch (RuntimeException e) {
+            releaseQuietly(dataDirectoryLock, dataDirectory);
+            throw e;
+        }
+
         ShrikeBroker broker;
         try {
             GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory, config.maxTotalGroups());
             ServerSocketChannel serverChannel = bind(config, bindAddress);
-            broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, timeSource, monotonicTime,
-                    boundPort(serverChannel));
+            broker = new ShrikeBroker(config, dataDirectoryLock, serverChannel, topics, groupOffsets, timeSource,
+                    monotonicTime, boundPort(serverChannel));
         } catch (RuntimeException e) {
             topics.close();
+            releaseQuietly(dataDirectoryLock, dataDirectory);
             throw e;
         }
 
@@ -369,7 +389,14 @@ public final class ShrikeBroker implements AutoCloseable {
         }
 
         LOGGER.log(System.Logger.Level.INFO, () -> "shrike stopped listening on port " + port);
-        topics.close();
+        try {
+            topics.close();
+        } finally {
+            // Last, and after every file this broker had open, on whichever way out: the data directory
+            // is the next broker's the instant this one lets go of it, and a log still being closed
+            // under a broker that has already started is the state the lock exists to prevent.
+            releaseQuietly(dataDirectoryLock, config.dataDirectory());
+        }
     }
 
     /**
@@ -671,6 +698,15 @@ public final class ShrikeBroker implements AutoCloseable {
             LOGGER.log(System.Logger.Level.WARNING, () -> thread.getName() + " did not stop within " + timeoutMillis
                     + "ms, so this broker stopped waiting for it");
         }
+    }
+
+    /**
+     * Lets go of the data directory, however the start or the stop that took it ended. A release that
+     * fails is a WARN and nothing else: the lock is the operating system's to drop when this process
+     * ends, and a broker on its way out has nothing better to do about it.
+     */
+    private static void releaseQuietly(DataDirectoryLock dataDirectoryLock, Path dataDirectory) {
+        closeQuietly(dataDirectoryLock, "the lock on the data directory " + dataDirectory);
     }
 
     private static void closeQuietly(Closeable closeable, String what) {
