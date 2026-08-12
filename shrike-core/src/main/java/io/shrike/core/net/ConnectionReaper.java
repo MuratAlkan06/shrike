@@ -2,7 +2,7 @@ package io.shrike.core.net;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
-import io.shrike.core.time.TimeSource;
+import io.shrike.core.time.MonotonicTimeSource;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -17,9 +17,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * after the rest of an interval, and nothing here polls anything.
  *
  * <p><strong>Time.</strong> Which connections are stalled is decided from the injected
- * {@link TimeSource}, and {@link #runOnce()} is the whole of that decision, taken synchronously on the
- * caller's thread. So a test advances a clock and calls {@code runOnce()}; the only thing measured in
- * real time is how often production asks.
+ * {@link MonotonicTimeSource}, and {@link #runOnce()} is the whole of that decision, taken
+ * synchronously on the caller's thread. So a test advances a clock and calls {@code runOnce()}; the
+ * only thing measured in real time is how often production asks. The clock is the elapsed-time one
+ * rather than the wall clock on purpose: a deadline is an amount of time that has to pass, and a host
+ * whose date is stepped forward an hour by a time-synchronization daemon must not thereby close every
+ * connection it is serving — nor keep a stalled one for an hour when the step goes the other way.
  *
  * <p><strong>How often it asks.</strong> Once per bound. A connection is therefore closed on the first
  * pass after it crosses the bound, which is between one and two bounds after it last made progress —
@@ -46,7 +49,7 @@ final class ConnectionReaper implements AutoCloseable {
     private static final long STOP_TIMEOUT_MILLIS = 10_000L;
 
     private final StalledConnections connections;
-    private final TimeSource timeSource;
+    private final MonotonicTimeSource monotonicTime;
     private final long checkIntervalMillis;
 
     /** Read by the reaping thread on every pass and set once by {@link #close()}. */
@@ -68,16 +71,16 @@ final class ConnectionReaper implements AutoCloseable {
 
     /**
      * @param connections         what a pass does
-     * @param timeSource          the clock every read phase is measured against
+     * @param monotonicTime       the elapsed-time clock every read phase is measured against
      * @param checkIntervalMillis how long to wait between passes, which is {@code read.timeout.ms}:
      *                            asking exactly as often as the bound keeps a stalled connection's
      *                            overshoot at one bound rather than at several
      * @throws IllegalArgumentException if the interval is not at least one millisecond, which would be
      *                                  a thread walking every connection as fast as it can
      */
-    ConnectionReaper(StalledConnections connections, TimeSource timeSource, long checkIntervalMillis) {
+    ConnectionReaper(StalledConnections connections, MonotonicTimeSource monotonicTime, long checkIntervalMillis) {
         this.connections = Objects.requireNonNull(connections, "connections");
-        this.timeSource = Objects.requireNonNull(timeSource, "timeSource");
+        this.monotonicTime = Objects.requireNonNull(monotonicTime, "monotonicTime");
         if (checkIntervalMillis < 1L) {
             throw new IllegalArgumentException("checkIntervalMillis must be at least 1, but was "
                     + checkIntervalMillis);
@@ -101,7 +104,7 @@ final class ConnectionReaper implements AutoCloseable {
      * interval to pass.
      */
     void runOnce() {
-        connections.closeStalledConnections(timeSource.currentTimeMillis());
+        connections.closeStalledConnections(monotonicTime.elapsedNanos());
     }
 
     /**

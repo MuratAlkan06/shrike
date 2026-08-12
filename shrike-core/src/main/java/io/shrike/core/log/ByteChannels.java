@@ -30,8 +30,37 @@ public final class ByteChannels {
      * @throws IOException if the channel fails mid-write
      */
     public static void writeFully(WritableByteChannel channel, ByteBuffer buffer) throws IOException {
+        writeFully(channel, buffer, WriteProgress.UNWATCHED);
+    }
+
+    /**
+     * The same loop, telling {@code progress} each time bytes have actually gone. A caller that has a
+     * deadline for a write which is making no headway needs to know when the last headway was, and
+     * this is the only place that knows: the loop is inside a call that has not returned.
+     *
+     * <p>No single call asks for more than {@link WriteProgress#MAX_BYTES_BETWEEN_REPORTS}, because a
+     * blocking write of a whole four-mebibyte answer is one call that says nothing until all four have
+     * gone. The buffer is walked through views of that size; what reaches the channel, and in what
+     * order, is the same either way.
+     *
+     * @param channel  destination channel
+     * @param buffer   source buffer, drained to its limit
+     * @param progress told what left, each time some of it does; a write that moved nothing is not
+     *                 progress and is not reported
+     * @throws IOException if the channel fails mid-write
+     */
+    public static void writeFully(WritableByteChannel channel, ByteBuffer buffer, WriteProgress progress)
+            throws IOException {
         while (buffer.hasRemaining()) {
-            channel.write(buffer);
+            int askBytes = (int) Math.min(buffer.remaining(), WriteProgress.MAX_BYTES_BETWEEN_REPORTS);
+            ByteBuffer ask = buffer.slice(buffer.position(), askBytes);
+            while (ask.hasRemaining()) {
+                int bytesWritten = channel.write(ask);
+                if (bytesWritten > 0) {
+                    progress.advanced(bytesWritten);
+                }
+            }
+            buffer.position(buffer.position() + askBytes);
         }
     }
 

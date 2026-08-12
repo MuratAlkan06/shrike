@@ -8,11 +8,14 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import io.shrike.core.time.TimeSource;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -151,6 +154,27 @@ class SegmentedLogRangeTest {
         }
     }
 
+    @Test
+    void tellsWriteProgressWhatOfTheRangeHasGoneAsItGoes() throws IOException {
+        try (SegmentedLog log = SegmentedLog.open(dataDirectory, TOPIC, PARTITION, FIXED_CLOCK)) {
+            log.append(recordNumber(0));
+            log.append(recordNumber(1));
+
+            List<Long> reported = new ArrayList<>();
+            OneBytePerCallChannel destination = new OneBytePerCallChannel();
+            try (RecordRange range = log.openRange(0L, log.nextOffset(), PLENTY_OF_BYTES)) {
+                range.transferTo(destination, reported::add);
+
+                assertEquals(range.lengthBytes(), reported.size(),
+                        "a transfer that moved a byte at a time is a transfer that got somewhere that many times");
+                assertEquals(range.lengthBytes(), reported.stream().mapToLong(Long::longValue).sum(),
+                        "and what a bounded write is told adds up to the range it was promised");
+            }
+            assertArrayEquals(Files.readAllBytes(logFileOf(0L)), destination.received(),
+                    "the bytes are the segment's own, whoever was watching them go");
+        }
+    }
+
     /**
      * Asserts that the two ways of serving one range cover the same bytes of the same file.
      *
@@ -177,6 +201,41 @@ class SegmentedLogRangeTest {
 
     private static ProducedRecord recordNumber(int record) {
         return new ProducedRecord(null, "payload-%02d".formatted(record).getBytes(UTF_8));
+    }
+
+    /**
+     * Takes one byte per call, which a channel is allowed to do and which turns a transfer into as
+     * many reports as there are bytes — the shape a caller bounding a slow write has to survive.
+     */
+    private static final class OneBytePerCallChannel implements WritableByteChannel {
+
+        private final ByteArrayOutputStream received = new ByteArrayOutputStream();
+
+        // confined to: the test thread that created this stub
+        private boolean open = true;
+
+        @Override
+        public int write(ByteBuffer source) {
+            if (!source.hasRemaining()) {
+                return 0;
+            }
+            received.write(source.get());
+            return 1;
+        }
+
+        @Override
+        public boolean isOpen() {
+            return open;
+        }
+
+        @Override
+        public void close() {
+            open = false;
+        }
+
+        byte[] received() {
+            return received.toByteArray();
+        }
     }
 
     private Path logFileOf(long baseOffset) {

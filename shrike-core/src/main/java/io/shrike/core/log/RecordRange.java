@@ -108,17 +108,39 @@ public final class RecordRange implements Closeable {
      *                     channel open, and is reported rather than looped on if it ever does
      */
     public void transferTo(WritableByteChannel destination) throws IOException {
+        transferTo(destination, WriteProgress.UNWATCHED);
+    }
+
+    /**
+     * The same transfer, telling {@code progress} each time bytes have actually gone — which for a
+     * fetch is how the broker tells a peer that is reading slowly from one that has stopped reading
+     * at all, since both of them look like a call that has not returned from in here.
+     *
+     * <p>No single transfer asks for more than {@link WriteProgress#MAX_BYTES_BETWEEN_REPORTS}, for
+     * the reason that constant gives: a blocking transfer of a whole range is one call that returns
+     * when the last byte of it has gone, and a peer taking that range slowly would be indistinguishable
+     * from one that stopped until it did.
+     *
+     * @param destination where the bytes go, which for a fetch is the client's socket
+     * @param progress    told what left, each time some of it does
+     * @throws IOException if the file or the destination fails, or if the file ends before the range
+     *                     it was located as does
+     */
+    public void transferTo(WritableByteChannel destination, WriteProgress progress) throws IOException {
         Objects.requireNonNull(destination, "destination");
+        Objects.requireNonNull(progress, "progress");
 
         long readPositionBytes = positionBytes;
         long remainingBytes = lengthBytes;
         while (remainingBytes > 0) {
-            long transferredBytes = channel.transferTo(readPositionBytes, remainingBytes, destination);
+            long askBytes = Math.min(remainingBytes, WriteProgress.MAX_BYTES_BETWEEN_REPORTS);
+            long transferredBytes = channel.transferTo(readPositionBytes, askBytes, destination);
             if (transferredBytes <= 0) {
                 throw new IOException("the segment " + logFile + " gave " + (lengthBytes - remainingBytes)
                         + " of the " + lengthBytes + " bytes the range from position " + positionBytes
                         + " declared");
             }
+            progress.advanced(transferredBytes);
             readPositionBytes += transferredBytes;
             remainingBytes -= transferredBytes;
         }

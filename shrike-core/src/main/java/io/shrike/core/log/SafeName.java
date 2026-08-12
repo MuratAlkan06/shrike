@@ -89,11 +89,17 @@ public final class SafeName {
     }
 
     /**
-     * Quotes a rejected name for a message. A rejected name is hostile input on its way into a log
-     * line, so it is cut to the length the rule allows and anything that could forge a line of its
-     * own is replaced rather than printed.
+     * Quotes a rejected name — or any hostile string on its way into a refusal — for a log line. It is
+     * cut to {@link #MAX_LENGTH_CHARS} characters and anything that could forge a line of its own is
+     * replaced with {@code '?'} rather than printed, so a value chosen to carry a newline writes no
+     * second line and a value chosen to be a mebibyte long floods nothing. {@code BrokerLaunch} echoes
+     * every raw environment value in a startup refusal through here for that reason, which is why this
+     * is visible past its own package rather than private to the name rule.
+     *
+     * @param name the rejected input, as it arrived, or {@code null}
+     * @return the input quoted, bounded, and stripped of anything that is not printable ASCII
      */
-    private static String quote(String name) {
+    public static String quote(String name) {
         if (name == null) {
             return "null";
         }

@@ -8,6 +8,8 @@ import io.shrike.core.group.GroupOffsetStore;
 import io.shrike.core.log.ShrikeIOException;
 import io.shrike.core.protocol.RequestReader;
 import io.shrike.core.retention.RetentionSweep;
+import io.shrike.core.time.MonotonicTimeSource;
+import io.shrike.core.time.SystemMonotonicTimeSource;
 import io.shrike.core.time.TimeSource;
 import java.io.Closeable;
 import java.io.IOException;
@@ -27,6 +29,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 
 /**
  * The broker: a listening socket, a thread per connection, and the partitions and committed offsets
@@ -44,19 +47,23 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code shrike-flush} does nothing but ask each partition to force the records that have sat unforced
  * for {@code flush.interval.ms} — in {@code per-record} mode it asks and there is nothing to do,
  * because the append already forced — and {@code shrike-conn-reaper} does nothing but ask each open
- * connection whether it has spent longer than {@code read.timeout.ms} reading one request.
+ * connection whether it has spent longer than {@code read.timeout.ms} reading one request, or longer
+ * than {@code write.timeout.ms} writing an answer no byte of is moving.
  *
- * <p><strong>Starting.</strong> The topic registry and every partition log are opened and recovered
- * first, then the committed offsets are loaded, then the socket binds, then the acceptor, the
- * retention thread, the flush thread, and the connection reaper start, and only then is the
- * {@link ReadyFile} written. A reader that can see the ready file can connect.
+ * <p><strong>Starting.</strong> The {@link DataDirectoryLock} is taken first, so that nothing below is
+ * ever done to a data directory another broker is already running over. Then the topic registry and
+ * every partition log are opened and recovered, then the committed offsets are loaded, then the socket
+ * binds, then the acceptor, the retention thread, the flush thread, and the connection reaper start,
+ * and only then is the {@link ReadyFile} written. A reader that can see the ready file can connect. A
+ * start that fails anywhere after the lock releases it on its way out.
  *
  * <p><strong>Stopping.</strong> Stop accepting, stop retention, the flush interval, and the reaper and
  * wait for a pass of each in flight, wake every fetch that is waiting on a partition, close the open
  * connections so their threads come out of their blocking reads, join those threads under a bounded
- * deadline, and close every log — which forces the segment it was still writing. Nothing is deleted on
- * the way out, including the ready file: what retention deletes it deletes while the broker is running
- * and says so in the log.
+ * deadline, close every log — which forces the segment it was still writing — and let go of the data
+ * directory last of all, since it is another broker's to take the instant this one does. Nothing is
+ * deleted on the way out, including the ready file and the lock file: what retention deletes it deletes
+ * while the broker is running and says so in the log.
  *
  * <p><strong>Durability.</strong> What a produce promises is decided by {@code flush.mode} and by
  * nothing else. Under {@link io.shrike.core.log.FlushMode#PER_RECORD} a produce is acknowledged only
@@ -74,15 +81,20 @@ import java.util.concurrent.atomic.AtomicLong;
  * security, so a port it listens on past loopback is a port anything that can reach it may write to,
  * and a caller that names a wider address is saying it has arranged that reachability itself.
  *
- * <p><strong>Reading and idling are bounded; serving is not.</strong> A connection may spend at most
+ * <p><strong>Idling, reading, and writing are each bounded.</strong> A connection may spend at most
  * {@link BrokerConfig#readTimeoutMs()} in one read phase — sitting idle between requests, or part way
- * through a request frame — and {@code shrike-conn-reaper} closes it when it spends more, which is what
- * brings its thread out of the blocking read and gives its place under
- * {@link BrokerConfig#connectionCap()} back. {@code SO_TIMEOUT} is not what does it: that bounds reads
- * on a socket's streams and not on the {@code SocketChannel} this broker reads through. The bound is
- * deliberately not a bound on the connection: a fetch held open for {@code max.fetch.wait.ms} is this
- * broker waiting to write rather than a client failing to speak, and it is never closed for it.
- * Authentication is still not here, and #9 is still where the rest of that is tracked.
+ * through a request frame — and at most {@link BrokerConfig#writeTimeoutMs()} writing an answer with no
+ * byte of it leaving. {@code shrike-conn-reaper} closes it when it crosses either, which is what brings
+ * its thread out of the blocking call and gives its place under {@link BrokerConfig#connectionCap()}
+ * back. {@code SO_TIMEOUT} is not what does either: it bounds reads on a socket's streams, not on the
+ * {@code SocketChannel} this broker reads through, and there is no send-side equivalent to bound a
+ * write with at all. Neither bound is a bound on the connection: a fetch held open for
+ * {@code max.fetch.wait.ms} is this broker waiting to write rather than a client failing to speak, and
+ * a peer draining a large answer slowly but steadily is making progress; neither is closed. Both are
+ * measured on elapsed time — {@link MonotonicTimeSource} — and not on the wall clock, so a host whose
+ * date is stepped keeps the bounds it was configured with rather than the ones the step chose.
+ * What none of them is, is access control: this build has no authentication, and the loopback default
+ * is what stands in for it.
  */
 public final class ShrikeBroker implements AutoCloseable {
 
@@ -106,6 +118,10 @@ public final class ShrikeBroker implements AutoCloseable {
     private static final long ACCEPT_BACKOFF_MILLIS = 100L;
 
     private final BrokerConfig config;
+
+    /** This broker's claim on its data directory, held from before the first log opens until close. */
+    private final DataDirectoryLock dataDirectoryLock;
+
     private final ServerSocketChannel serverChannel;
     private final TopicRegistry topics;
     private final GroupOffsetStore groupOffsets;
@@ -123,13 +139,20 @@ public final class ShrikeBroker implements AutoCloseable {
 
     /**
      * The {@code shrike-conn-reaper} thread and its schedule; built here, started by {@link #start}. It
-     * asks exactly as often as {@code read.timeout.ms}, so a connection that stalls holds its slot for
-     * between one and two bounds rather than for as long as its client stays connected.
+     * asks exactly as often as the shorter of {@code read.timeout.ms} and {@code write.timeout.ms}, so
+     * a connection that stalls either way holds its slot for between one and two of its own bounds
+     * rather than for as long as its client stays connected.
      */
     private final ConnectionReaper reaper;
 
-    /** Handed to each connection, so every read phase is stamped from the clock this broker was given. */
+    /** The wall clock: what a record's timestamp is stamped from and what a fetch's wait expires on. */
     private final TimeSource timeSource;
+
+    /**
+     * The elapsed-time clock, handed to each connection and to the reaper, so that every deadline this
+     * broker holds is an amount of time that has to pass rather than a date that can be stepped.
+     */
+    private final MonotonicTimeSource monotonicTime;
 
     private final int port;
 
@@ -187,15 +210,28 @@ public final class ShrikeBroker implements AutoCloseable {
     };
 
     /**
+     * The third test seam, and the last field here production code never writes. It is where the WARN a
+     * failed handoff earns is written, so that a test can make the writing of that line throw the way it
+     * would under the memory pressure that failed the handoff in the first place — which is the whole
+     * reason {@link #warnHandoffFailed(String, Throwable)} runs after the unwind rather than before it.
+     * Production leaves it writing the line.
+     */
+    // volatile because a test installs it from its own thread and shrike-acceptor is what reads it.
+    private volatile BiConsumer<String, Throwable> handoffFailureLog =
+            (message, failure) -> LOGGER.log(System.Logger.Level.WARNING, message, failure);
+
+    /**
      * The one accepting thread. Not final because it starts after the broker is built, since a thread
      * handed a half-built broker would be the worse trade; volatile because {@link #close()} may be
      * called from a thread that never watched it being set.
      */
     private volatile Thread acceptor;
 
-    private ShrikeBroker(BrokerConfig config, ServerSocketChannel serverChannel, TopicRegistry topics,
-                         GroupOffsetStore groupOffsets, TimeSource timeSource, int port) {
+    private ShrikeBroker(BrokerConfig config, DataDirectoryLock dataDirectoryLock, ServerSocketChannel serverChannel,
+                         TopicRegistry topics, GroupOffsetStore groupOffsets, TimeSource timeSource,
+                         MonotonicTimeSource monotonicTime, int port) {
         this.config = config;
+        this.dataDirectoryLock = dataDirectoryLock;
         this.serverChannel = serverChannel;
         this.topics = topics;
         this.groupOffsets = groupOffsets;
@@ -203,10 +239,12 @@ public final class ShrikeBroker implements AutoCloseable {
         this.retention = new RetentionSweep(topics, timeSource, RetentionSweep.DEFAULT_CHECK_INTERVAL_MILLIS);
         this.flush = new FlushSweep(topics, timeSource, config.logConfig().flushIntervalMs());
         this.timeSource = timeSource;
+        this.monotonicTime = monotonicTime;
         this.port = port;
         // Last, and holding a method of a broker that is one statement from being built: the reaper only
         // stores it here, and the thread that would call it does not exist until start().
-        this.reaper = new ConnectionReaper(this::closeStalledConnections, timeSource, config.readTimeoutMs());
+        this.reaper = new ConnectionReaper(this::closeStalledConnections, monotonicTime,
+                Math.min(config.readTimeoutMs(), config.writeTimeoutMs()));
     }
 
     /**
@@ -242,9 +280,30 @@ public final class ShrikeBroker implements AutoCloseable {
      *                           opened or written
      */
     public static ShrikeBroker start(BrokerConfig config, TimeSource timeSource, InetAddress bindAddress) {
+        return start(config, timeSource, bindAddress, new SystemMonotonicTimeSource());
+    }
+
+    /**
+     * The same start again, against an elapsed-time clock the caller names instead of the host's.
+     *
+     * <p>Package-private because it is a seam for this package's own tests and not a setting. There is
+     * exactly one elapsed-time clock in production — the host's, which no operator configures and no
+     * daemon steps — so an overload that let a caller name another would be a public way to stop every
+     * deadline this broker holds. What it buys inside the package is that a test crosses a bound by
+     * moving a clock instead of by waiting for one.
+     *
+     * @param config        where things live and how much of them there may be
+     * @param timeSource    the wall clock that stamps appended records and bounds every fetch's wait
+     * @param bindAddress   the interface to listen on
+     * @param monotonicTime the elapsed-time clock every connection deadline is measured against
+     * @return the running broker, which the caller closes
+     */
+    static ShrikeBroker start(BrokerConfig config, TimeSource timeSource, InetAddress bindAddress,
+                              MonotonicTimeSource monotonicTime) {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(timeSource, "timeSource");
         Objects.requireNonNull(bindAddress, "bindAddress");
+        Objects.requireNonNull(monotonicTime, "monotonicTime");
 
         Path dataDirectory = config.dataDirectory();
         try {
@@ -253,15 +312,27 @@ public final class ShrikeBroker implements AutoCloseable {
             throw new ShrikeIOException("cannot create the data directory " + dataDirectory, e);
         }
 
-        TopicRegistry topics = TopicRegistry.open(config, timeSource);
+        // Before the registry, before the logs, and before the group offsets are migrated onto their
+        // folded names: everything below this line assumes one writer, and this is what makes that so.
+        DataDirectoryLock dataDirectoryLock = DataDirectoryLock.take(dataDirectory);
+
+        TopicRegistry topics;
+        try {
+            topics = TopicRegistry.open(config, timeSource);
+        } catch (RuntimeException e) {
+            releaseQuietly(dataDirectoryLock, dataDirectory);
+            throw e;
+        }
+
         ShrikeBroker broker;
         try {
             GroupOffsetStore groupOffsets = GroupOffsetStore.open(dataDirectory, config.maxTotalGroups());
             ServerSocketChannel serverChannel = bind(config, bindAddress);
-            broker = new ShrikeBroker(config, serverChannel, topics, groupOffsets, timeSource,
-                    boundPort(serverChannel));
+            broker = new ShrikeBroker(config, dataDirectoryLock, serverChannel, topics, groupOffsets, timeSource,
+                    monotonicTime, boundPort(serverChannel));
         } catch (RuntimeException e) {
             topics.close();
+            releaseQuietly(dataDirectoryLock, dataDirectory);
             throw e;
         }
 
@@ -330,7 +401,14 @@ public final class ShrikeBroker implements AutoCloseable {
         }
 
         LOGGER.log(System.Logger.Level.INFO, () -> "shrike stopped listening on port " + port);
-        topics.close();
+        try {
+            topics.close();
+        } finally {
+            // Last, and after every file this broker had open, on whichever way out: the data directory
+            // is the next broker's the instant this one lets go of it, and a log still being closed
+            // under a broker that has already started is the state the lock exists to prevent.
+            releaseQuietly(dataDirectoryLock, config.dataDirectory());
+        }
     }
 
     /**
@@ -382,6 +460,18 @@ public final class ShrikeBroker implements AutoCloseable {
     void onConnectionEnded(Runnable seam) {
         Objects.requireNonNull(seam, "seam");
         connectionEnded = seam;
+    }
+
+    /**
+     * Installs the test seam described on {@link #handoffFailureLog}. Package-private for the same
+     * reason as {@link #onConnectionReserved(Runnable)}: where this broker writes its log lines is not
+     * a setting, and a way to redirect them from outside would be a way to silence them.
+     *
+     * @param seam what to write the WARN about a failed handoff with, given the line and what failed
+     */
+    void logHandoffFailuresThrough(BiConsumer<String, Throwable> seam) {
+        Objects.requireNonNull(seam, "seam");
+        handoffFailureLog = seam;
     }
 
     private void startAccepting() {
@@ -454,7 +544,8 @@ public final class ShrikeBroker implements AutoCloseable {
      * {@code OutOfMemoryError} under exactly the pressure where a leaked place under the cap, a leaked
      * map entry, or a leaked socket costs the most — and a throwable that reached the accept loop would
      * end the one thread this broker accepts on while its port stayed bound and its ready file stayed
-     * where it was, which is a broker that is up and deaf.
+     * where it was, which is a broker that is up and deaf. The unwind runs <em>before</em> the WARN that
+     * reports it, for the reason {@link #warnHandoffFailed(String, Throwable)} sets out.
      *
      * @param socket the accepted socket
      * @return whether the next socket may be accepted straight away. False means the handoff failed for
@@ -485,7 +576,7 @@ public final class ShrikeBroker implements AutoCloseable {
             socket.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
 
             Connection connection = new Connection(name, socket, new RequestReader(config.maxRequestBytes()),
-                    dispatcher, timeSource);
+                    dispatcher, monotonicTime);
             reserved = connection;
             Thread thread = new Thread(() -> {
                 try {
@@ -516,16 +607,43 @@ public final class ShrikeBroker implements AutoCloseable {
         } catch (IOException e) {
             // About this socket rather than about this broker — the peer went away between the accept
             // and here — so the next one is worth accepting at once.
-            LOGGER.log(System.Logger.Level.WARNING, name + " could not be configured, so it was closed", e);
             abandon(reserved, socket);
+            warnHandoffFailed(name + " could not be configured, so it was closed", e);
             return true;
         } catch (Throwable e) {
             // Out of memory, out of native threads: the pressure case this unwinding exists for, at the
             // moment a place under the cap and a socket are worth most. Everything this connection took
             // goes back, and the acceptor stays alive to serve the connections that are already open.
-            LOGGER.log(System.Logger.Level.WARNING, name + " could not be handed a thread, so it was closed", e);
             abandon(reserved, socket);
+            warnHandoffFailed(name + " could not be handed a thread, so it was closed", e);
             return false;
+        }
+    }
+
+    /**
+     * Writes the WARN a failed handoff earns, once the unwind has already given back everything that
+     * handoff took.
+     *
+     * <p>Both of those are deliberate and neither is habit. <strong>The unwind runs first</strong>
+     * because the failure this whole guard exists for is terminal memory pressure, which is the one
+     * condition under which formatting a message and appending a line can themselves throw: logging
+     * first would leave the place under the cap taken, the socket open, and this thread dead — the
+     * three losses the unwind exists to prevent, arriving from the line that was meant to report them.
+     * <strong>And a throwable from the logging is dropped here</strong>, which is the one place in this
+     * codebase that drops one. What just failed is the logger, so there is nothing left to report the
+     * failure to; the connection's place, its map entry, and its socket are already back; and a broker
+     * that stopped accepting because it could not write a line about one socket would be a far larger
+     * outage than the missing line. That exception to PRINCIPLES §3 is written down in DESIGN.md, under
+     * "One acceptor, one platform thread per connection, and a hard cap".
+     *
+     * @param message what to say about the connection that was not served
+     * @param failure what stopped it being served
+     */
+    private void warnHandoffFailed(String message, Throwable failure) {
+        try {
+            handoffFailureLog.accept(message, failure);
+        } catch (Throwable loggingFailed) {
+            // Dropped on purpose: see above. There is nowhere to report the failure of reporting.
         }
     }
 
@@ -550,22 +668,25 @@ public final class ShrikeBroker implements AutoCloseable {
     }
 
     /**
-     * One pass of the read bound: close every open connection that has spent at least
-     * {@code read.timeout.ms} in one read phase, and leave the rest alone. It is what
-     * {@code shrike-conn-reaper} calls on its own thread, and what a test calls directly with a clock it
-     * advanced, because when a pass happens is not what the bound means.
+     * One pass of both bounds: close every open connection that has spent at least
+     * {@code read.timeout.ms} in one read phase or at least {@code write.timeout.ms} writing an answer
+     * that no byte of has moved, and leave the rest alone. It is what {@code shrike-conn-reaper} calls
+     * on its own thread, and what a test calls directly with a clock it advanced, because when a pass
+     * happens is not what either bound means.
      *
      * <p>Nothing here gives a slot back. Closing the socket is what brings a connection's own thread out
-     * of its blocking read, and that thread removes its map entry and its place under the cap on the way
-     * out, exactly as it does for a client that hung up.
+     * of its blocking read or its blocking write, and that thread removes its map entry and its place
+     * under the cap on the way out, exactly as it does for a client that hung up.
      *
-     * @param nowMillis the epoch millisecond every read phase's age is measured against
+     * @param nowNanos the reading of the elapsed-time clock every read phase's age is measured against
      * @return how many connections this pass closed
      */
-    int closeStalledConnections(long nowMillis) {
+    int closeStalledConnections(long nowNanos) {
+        long readTimeoutNanos = MILLISECONDS.toNanos(config.readTimeoutMs());
+        long writeTimeoutNanos = MILLISECONDS.toNanos(config.writeTimeoutMs());
         int closed = 0;
         for (Connection connection : openConnections.keySet()) {
-            if (connection.closeIfStalled(nowMillis, config.readTimeoutMs())) {
+            if (connection.closeIfStalled(nowNanos, readTimeoutNanos, writeTimeoutNanos)) {
                 closed++;
             }
         }
@@ -629,6 +750,15 @@ public final class ShrikeBroker implements AutoCloseable {
             LOGGER.log(System.Logger.Level.WARNING, () -> thread.getName() + " did not stop within " + timeoutMillis
                     + "ms, so this broker stopped waiting for it");
         }
+    }
+
+    /**
+     * Lets go of the data directory, however the start or the stop that took it ended. A release that
+     * fails is a WARN and nothing else: the lock is the operating system's to drop when this process
+     * ends, and a broker on its way out has nothing better to do about it.
+     */
+    private static void releaseQuietly(DataDirectoryLock dataDirectoryLock, Path dataDirectory) {
+        closeQuietly(dataDirectoryLock, "the lock on the data directory " + dataDirectory);
     }
 
     private static void closeQuietly(Closeable closeable, String what) {

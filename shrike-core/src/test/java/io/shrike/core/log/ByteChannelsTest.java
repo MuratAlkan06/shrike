@@ -12,7 +12,9 @@ import java.nio.channels.WritableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -44,6 +46,34 @@ class ByteChannelsTest {
         }
 
         assertArrayEquals(Files.readAllBytes(file), stubbornChannel.received());
+    }
+
+    @Test
+    void tellsWriteProgressWhatWentEachTimeSomeOfItDoes() throws IOException {
+        OneBytePerCallChannel channel = new OneBytePerCallChannel();
+        List<Long> reported = new ArrayList<>();
+
+        ByteChannels.writeFully(channel, ByteBuffer.wrap(PAYLOAD), reported::add);
+
+        assertEquals(PAYLOAD.length, reported.size(),
+                "a caller bounding a write needs to hear from every call that moved a byte");
+        assertEquals(PAYLOAD.length, reported.stream().mapToLong(Long::longValue).sum(),
+                "and what it hears must add up to what was written");
+    }
+
+    @Test
+    void saysNothingForACallThatMovedNoBytesAtAll() throws IOException {
+        int silentCalls = 3;
+        OneBytePerCallChannel channel = new OneBytePerCallChannel(silentCalls);
+        List<Long> reported = new ArrayList<>();
+
+        ByteChannels.writeFully(channel, ByteBuffer.wrap(PAYLOAD), reported::add);
+
+        assertArrayEquals(PAYLOAD, channel.received());
+        assertEquals(PAYLOAD.length + silentCalls, channel.writeCalls(), "the loop met the calls that wrote nothing");
+        assertEquals(PAYLOAD.length, reported.size(),
+                "a write that moved nothing is not progress: a channel that accepts nothing for ever must not "
+                        + "keep a bound on that write alive for ever");
     }
 
     @Test
@@ -82,14 +112,25 @@ class ByteChannelsTest {
 
         private final ByteArrayOutputStream received = new ByteArrayOutputStream();
 
+        /** How many of the first calls take nothing at all, which a channel is also allowed to do. */
+        private final int silentCalls;
+
         // confined to: the test thread that created this stub
         private int writeCalls;
         private boolean open = true;
 
+        OneBytePerCallChannel() {
+            this(0);
+        }
+
+        OneBytePerCallChannel(int silentCalls) {
+            this.silentCalls = silentCalls;
+        }
+
         @Override
         public int write(ByteBuffer source) {
             writeCalls++;
-            if (!source.hasRemaining()) {
+            if (!source.hasRemaining() || writeCalls <= silentCalls) {
                 return 0;
             }
             received.write(source.get());

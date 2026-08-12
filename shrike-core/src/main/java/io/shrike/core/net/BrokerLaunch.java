@@ -2,9 +2,11 @@ package io.shrike.core.net;
 
 import io.shrike.core.log.FlushMode;
 import io.shrike.core.log.LogConfig;
+import io.shrike.core.log.SafeName;
 import io.shrike.core.protocol.RequestReader;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
@@ -17,7 +19,7 @@ import java.util.Optional;
  *
  * <p>{@link BrokerConfig} is what a broker is built from; this is how a process comes to hold one. It
  * is read from environment variables and nothing else — no configuration file, no working-directory
- * lookup, no path this process guesses at. Nineteen variables, of which one is required, and one rule
+ * lookup, no path this process guesses at. Twenty variables, of which one is required, and one rule
  * names them: a setting's variable is {@code SHRIKE_} followed by the name {@link LogConfig} and
  * {@link BrokerConfig} give the field in their javadoc, upper-cased with each dot an underscore, so
  * {@code retention.ms} is read from {@code SHRIKE_RETENTION_MS}.
@@ -39,6 +41,7 @@ import java.util.Optional;
  * SHRIKE_MAX_FETCH_WAIT_MS    max.fetch.wait.ms
  * SHRIKE_MAX_REQUEST_BYTES    max.request.bytes
  * SHRIKE_READ_TIMEOUT_MS      read.timeout.ms
+ * SHRIKE_WRITE_TIMEOUT_MS     write.timeout.ms
  * SHRIKE_FETCH_ZERO_COPY      fetch.zero.copy, written true or false in whatever letters
  * SHRIKE_CONNECTION_CAP       connectionCap, which has no dotted name of its own
  * SHRIKE_MAX_TOTAL_PARTITIONS maxTotalPartitions, which has no dotted name of its own
@@ -47,7 +50,7 @@ import java.util.Optional;
  *
  * <p>A variable that is not set, or set to nothing at all, is one the default answers for — which is
  * what {@code docker run -e SHRIKE_PORT=} passes and what an operator means by it. Each of the
- * fifteen settings below the first four defaults to what {@link LogConfig#defaults()} and
+ * sixteen settings below the first four defaults to what {@link LogConfig#defaults()} and
  * {@link BrokerConfig#defaults(Path, int, Path)} give the field it sets, so a process that names none
  * of them starts the broker every deployment before them started. The data directory has no default
  * because a default would be a path this process picked rather than one somebody chose, and every
@@ -109,8 +112,11 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
     /** {@code max.request.bytes}. */
     public static final String MAX_REQUEST_BYTES_VARIABLE = "SHRIKE_MAX_REQUEST_BYTES";
 
-    /** {@code read.timeout.ms}, which bounds reading and idling and never bounds serving. */
+    /** {@code read.timeout.ms}, which bounds reading and idling and never bounds writing. */
     public static final String READ_TIMEOUT_MS_VARIABLE = "SHRIKE_READ_TIMEOUT_MS";
+
+    /** {@code write.timeout.ms}, which bounds a write making no progress and never a slow one. */
+    public static final String WRITE_TIMEOUT_MS_VARIABLE = "SHRIKE_WRITE_TIMEOUT_MS";
 
     /** {@code fetch.zero.copy}: {@code true} or {@code false}, in whatever letters. */
     public static final String FETCH_ZERO_COPY_VARIABLE = "SHRIKE_FETCH_ZERO_COPY";
@@ -143,6 +149,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             Map.entry("maxFetchWaitMs", MAX_FETCH_WAIT_MS_VARIABLE),
             Map.entry("maxRequestBytes", MAX_REQUEST_BYTES_VARIABLE),
             Map.entry("readTimeoutMs", READ_TIMEOUT_MS_VARIABLE),
+            Map.entry("writeTimeoutMs", WRITE_TIMEOUT_MS_VARIABLE),
             Map.entry("connectionCap", CONNECTION_CAP_VARIABLE),
             Map.entry("maxTotalPartitions", MAX_TOTAL_PARTITIONS_VARIABLE),
             Map.entry("maxTotalGroups", MAX_TOTAL_GROUPS_VARIABLE));
@@ -186,9 +193,10 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
                 .orElseThrow(() -> new IllegalArgumentException(DATA_DIRECTORY_VARIABLE
                         + " names the directory this broker stores everything under, and it has no default"));
 
-        Path dataDirectory = Path.of(namedDataDirectory);
+        Path dataDirectory = path(namedDataDirectory, DATA_DIRECTORY_VARIABLE);
         int port = value(environment, PORT_VARIABLE).map(BrokerLaunch::port).orElse(DEFAULT_PORT);
-        Path readyFilePath = value(environment, READY_FILE_VARIABLE).map(Path::of)
+        Path readyFilePath = value(environment, READY_FILE_VARIABLE)
+                .map(named -> path(named, READY_FILE_VARIABLE))
                 .orElseGet(() -> dataDirectory.resolve(DEFAULT_READY_FILE_NAME));
         InetAddress bindAddress = value(environment, BIND_ADDRESS_VARIABLE)
                 .map(BrokerLaunch::bindAddress)
@@ -213,6 +221,8 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
         int connectionCap = wholeNumber(environment, CONNECTION_CAP_VARIABLE, BrokerConfig.DEFAULT_CONNECTION_CAP);
         int readTimeoutMs = wholeNumber(environment, READ_TIMEOUT_MS_VARIABLE,
                 BrokerConfig.DEFAULT_READ_TIMEOUT_MILLIS);
+        int writeTimeoutMs = wholeNumber(environment, WRITE_TIMEOUT_MS_VARIABLE,
+                BrokerConfig.DEFAULT_WRITE_TIMEOUT_MILLIS);
         int maxTotalPartitions = wholeNumber(environment, MAX_TOTAL_PARTITIONS_VARIABLE,
                 BrokerConfig.DEFAULT_MAX_TOTAL_PARTITIONS);
         int maxTotalGroups = wholeNumber(environment, MAX_TOTAL_GROUPS_VARIABLE,
@@ -221,7 +231,8 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
 
         try {
             return new BrokerConfig(dataDirectory, port, maxRequestBytes, maxFetchWaitMs, zeroCopyFetch,
-                    connectionCap, readTimeoutMs, maxTotalPartitions, maxTotalGroups, readyFilePath, logConfig);
+                    connectionCap, readTimeoutMs, writeTimeoutMs, maxTotalPartitions, maxTotalGroups, readyFilePath,
+                    logConfig);
         } catch (IllegalArgumentException refusal) {
             throw refusalNamingTheVariable(refusal);
         }
@@ -273,10 +284,11 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return byDefault;
         }
         try {
+            requireAsciiDigits(named.get());
             return Integer.parseInt(named.get());
         } catch (NumberFormatException notANumber) {
             throw new IllegalArgumentException(variable + " must be a whole number from " + Integer.MIN_VALUE
-                    + " to " + Integer.MAX_VALUE + ", but was \"" + named.get() + "\"", notANumber);
+                    + " to " + Integer.MAX_VALUE + ", but was " + SafeName.quote(named.get()), notANumber);
         }
     }
 
@@ -290,10 +302,39 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return byDefault;
         }
         try {
+            requireAsciiDigits(named.get());
             return Long.parseLong(named.get());
         } catch (NumberFormatException notANumber) {
             throw new IllegalArgumentException(variable + " must be a whole number from " + Long.MIN_VALUE
-                    + " to " + Long.MAX_VALUE + ", but was \"" + named.get() + "\"", notANumber);
+                    + " to " + Long.MAX_VALUE + ", but was " + SafeName.quote(named.get()), notANumber);
+        }
+    }
+
+    /**
+     * Requires the text to be a whole number written the one way this broker reads one — ASCII digits,
+     * with at most one leading ASCII {@code '-'} and a digit after it — and fails the way the JDK's own
+     * parse fails when it is not, so a value this refuses is refused in the words a value the parse
+     * refuses has always been refused in. {@link Integer#parseInt} and {@link Long#parseLong} take a
+     * Unicode decimal digit from any script and a leading {@code '+'}: {@code Long.parseLong("٤٢")} is
+     * 42, so a setting written in Arabic-Indic digits would otherwise start this broker on a number no
+     * operator could have typed on purpose or read back out of the running configuration. The minus
+     * sign stays legal because {@code retention.ms} and {@code retention.bytes} are switched off with
+     * {@link LogConfig#RETENTION_DISABLED} and an operator sets that from the environment; the plus
+     * sign does not, because one spelling of a number is enough.
+     *
+     * @throws NumberFormatException if the text is anything but ASCII digits behind an optional single
+     *                               leading {@code '-'}
+     */
+    private static void requireAsciiDigits(String text) {
+        int firstDigit = !text.isEmpty() && text.charAt(0) == '-' ? 1 : 0;
+        if (firstDigit == text.length()) {
+            throw new NumberFormatException(SafeName.quote(text));
+        }
+        for (int i = firstDigit; i < text.length(); i++) {
+            char character = text.charAt(i);
+            if (character < '0' || character > '9') {
+                throw new NumberFormatException(SafeName.quote(text));
+            }
         }
     }
 
@@ -307,7 +348,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             case "per-record" -> FlushMode.PER_RECORD;
             case "interval" -> FlushMode.INTERVAL;
             default -> throw new IllegalArgumentException(FLUSH_MODE_VARIABLE
-                    + " must be \"per-record\" or \"interval\", but was \"" + named + "\"");
+                    + " must be \"per-record\" or \"interval\", but was " + SafeName.quote(named));
         };
     }
 
@@ -322,7 +363,7 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             case "true" -> true;
             case "false" -> false;
             default -> throw new IllegalArgumentException(FETCH_ZERO_COPY_VARIABLE
-                    + " must be \"true\" or \"false\", but was \"" + named + "\"");
+                    + " must be \"true\" or \"false\", but was " + SafeName.quote(named));
         };
     }
 
@@ -342,12 +383,33 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
                 refusal);
     }
 
+    /**
+     * The path a variable names, refused the way every other value here is when the text cannot be one.
+     * {@link Path#of} throws {@link InvalidPathException} — an unchecked exception — on a string no path
+     * can hold, whose own message embeds the raw text; caught here it becomes the one-sentence refusal
+     * naming the variable and echoing the value through {@link SafeName#quote}, so it stops the start on
+     * exit code {@value BrokerMain#STARTUP_FAILURE_EXIT_CODE} like any other bad value rather than
+     * escaping the exit path as a stack trace carrying the raw text. On POSIX the only such character is
+     * a {@code NUL}, which an environment variable cannot carry, so this is the refusal shape no real
+     * environment reaches — and the one that would otherwise bypass both the scrubber and the exit path.
+     */
+    private static Path path(String named, String variable) {
+        try {
+            return Path.of(named);
+        } catch (InvalidPathException notAPath) {
+            throw new IllegalArgumentException(variable + " must name a path this broker can use, but "
+                    + SafeName.quote(named) + " is not one", notAPath);
+        }
+    }
+
     private static int port(String named) {
         try {
+            requireAsciiDigits(named);
             return Integer.parseInt(named);
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(PORT_VARIABLE + " must be a whole number from "
-                    + BrokerConfig.EPHEMERAL_PORT + " to " + BrokerConfig.MAX_PORT + ", but was \"" + named + "\"", e);
+                    + BrokerConfig.EPHEMERAL_PORT + " to " + BrokerConfig.MAX_PORT + ", but was "
+                    + SafeName.quote(named), e);
         }
     }
 
@@ -360,7 +422,8 @@ public record BrokerLaunch(BrokerConfig config, InetAddress bindAddress) {
             return InetAddress.getByName(named);
         } catch (UnknownHostException e) {
             throw new IllegalArgumentException(BIND_ADDRESS_VARIABLE
-                    + " must be an address or a name this machine can resolve, but \"" + named + "\" is neither", e);
+                    + " must be an address or a name this machine can resolve, but " + SafeName.quote(named)
+                    + " is neither", e);
         }
     }
 }
