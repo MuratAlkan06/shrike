@@ -17,13 +17,17 @@ import java.io.IOException;
 import java.lang.ref.PhantomReference;
 import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -70,6 +74,13 @@ class BrokerDataDirectoryLockTest {
      */
     private static final int REFUSED_STARTS_A_SUPERVISOR_RETRIES = 25;
 
+    /**
+     * What {@code identityOf} answers for a lock file it cannot stat, spelled rather than written as a
+     * bare null at the two call sites that hand it to {@link DataDirectoryLock}: the argument is the
+     * whole arrangement in both of those tests, so it is worth a name.
+     */
+    private static final Object NO_IDENTITY_TO_KEEP_IT_UNDER = null;
+
     @TempDir
     Path dataDirectory;
 
@@ -83,6 +94,14 @@ class BrokerDataDirectoryLockTest {
     /** Where a probe's output goes, kept out of the data directory a broker is running over. */
     @TempDir
     Path probeOutputDirectory;
+
+    /**
+     * Somewhere for the files the two fallback tests below open that is not a data directory: the file a
+     * {@code shrike.lock} symbolic link names, and the files the descriptors a refusal leaves behind are
+     * open on. A data directory is a thing a start may create files in, and none of these are its.
+     */
+    @TempDir
+    Path filesOutsideAnyDataDirectory;
 
     @Test
     void refusesToStartOverADataDirectoryABrokerIsAlreadyRunningOverAndLeavesThatBrokerServing() throws Exception {
@@ -321,6 +340,115 @@ class BrokerDataDirectoryLockTest {
     }
 
     /**
+     * The descriptor a start is <em>not</em> allowed to be handed: one kept for a lock file this process
+     * could not identify.
+     *
+     * <p>What makes asking a kept descriptor sound is the key it is kept under. An identity is the
+     * device and inode, so a descriptor kept under one is open on the file the next start is asking
+     * about and on no other. A filesystem with no {@code fileKey()} to give, and a lock file that cannot
+     * be stat'ed — the symbolic link to a name that is not there, which this test builds — leave a key
+     * that names the data directory instead, and a directory says nothing about which file is on the far
+     * side of the descriptor. Handing that one over is a broker granted a lock on a file nobody is
+     * asking about, having never opened {@code shrike.lock} at all: the next start over the directory
+     * finds it free and takes it, which is the two brokers this class exists to refuse.
+     *
+     * <p>So a take with no identity opens its own descriptor and asks nothing, and the three assertions
+     * are that from three sides: the file the link names exists, which only the open could have created;
+     * an outside process finds that file locked; and the file the kept descriptor was open on is not
+     * locked at all.
+     *
+     * <p>What this test cannot do is reach the keeping through a refusal, and that is worth saying
+     * plainly rather than leaving to be noticed. A refusal that keeps a descriptor is one whose open
+     * landed on an inode this JVM already holds a lock on, and on a filesystem that answers
+     * {@code fileKey()} the two cannot be arranged together: a lock file that can be stat'ed is one with
+     * an identity, and one that cannot is one whose open creates a fresh inode nobody can be holding.
+     * What is left is the same race the backstop exists for, in the moment between the stat and the
+     * open, and a filesystem with no identities at all — neither of them a thing a test builds. So this
+     * hands {@code DataDirectoryLock} exactly what such a refusal hands it, and asserts what a take does
+     * with it afterwards.
+     */
+    @Test
+    void opensItsOwnDescriptorRatherThanAskingOneKeptForALockFileItCannotIdentify() throws Exception {
+        Path lockFile = dataDirectory.resolve(DataDirectoryLock.FILE_NAME);
+        Path whatTheLockFileNames = filesOutsideAnyDataDirectory.resolve("the-file-shrike-lock-names");
+        makeTheLockFileNameAFileThatIsNotThere(lockFile, whatTheLockFileNames);
+        Path whatTheRefusalHadOpen = filesOutsideAnyDataDirectory.resolve("what-the-refusal-had-open");
+        DataDirectoryLock.pinIfAFailedTakeLeftItOpen(NO_IDENTITY_TO_KEEP_IT_UNDER, dataDirectory.toRealPath(),
+                FileChannel.open(whatTheRefusalHadOpen, StandardOpenOption.CREATE, StandardOpenOption.WRITE));
+
+        try (DataDirectoryLock taken = DataDirectoryLock.take(dataDirectory)) {
+
+            assertTrue(Files.isRegularFile(whatTheLockFileNames),
+                    "the take opened the lock file itself, which is the only thing that could have"
+                            + " created the file that link names: a take handed the kept descriptor"
+                            + " instead would have opened nothing, and " + taken + " would be holding a"
+                            + " lock on a file its own data directory does not name");
+            assertEquals(DataDirectoryLockProbe.HELD, whatAnotherProcessFindsOfTheLock(lockFile, "named"),
+                    "so what it holds is the lock on the file shrike.lock names, which is the file the"
+                            + " next start over this directory asks about");
+            assertEquals(DataDirectoryLockProbe.FREE,
+                    whatAnotherProcessFindsOfTheLock(whatTheRefusalHadOpen, "kept"),
+                    "and not the lock on whatever file the kept descriptor was open on: a lock there is"
+                            + " a lock on a file nobody asks about, and it leaves shrike.lock free for a"
+                            + " second broker to take");
+        }
+    }
+
+    /**
+     * What a refusal keeps where there is no identity to keep it under, which is one descriptor per
+     * refusal rather than one per lock file — and why that is the answer rather than the cost of a
+     * mistake.
+     *
+     * <p>The bound the map above holds to is one descriptor per lock file, and it is bought by handing
+     * the kept one to the next start. That trade is not available here: a key that names a directory
+     * cannot say which file a descriptor is open on, so nothing kept under one is ever asked for a lock,
+     * so a second refusal cannot be answered by the first refusal's descriptor. Keeping one per key
+     * anyway would be the worse of the two mistakes rather than a tighter bound — every later refusal's
+     * channel would be referenced by nothing, and a channel nothing references is closed by the cleaner
+     * the JDK registered with it, which is the close that drops this process's lock on that file. That
+     * is the bug the whole branch exists to prevent, arriving through the code meant to bound it.
+     *
+     * <p>So the count grows, and the collection is what says the growth is descriptors that are still
+     * open rather than a number in a map. Nothing here holds a channel: the loop drops each one, and
+     * what the assertions read them through is a {@link WeakReference}, which resolves only while
+     * something else is holding on.
+     */
+    @Test
+    void keepsEveryRefusedDescriptorWhereTheLockFileHasNoIdentityToBoundThemBy() throws Exception {
+        int keptBeforeAnyOfThis = DataDirectoryLock.pinnedChannelCount();
+        Path directoryPath = dataDirectory.toRealPath();
+        List<WeakReference<FileChannel>> keptByRefusalsWithNoIdentity = new ArrayList<>();
+
+        for (int refusal = 0; refusal < REFUSED_STARTS_A_SUPERVISOR_RETRIES; refusal++) {
+            FileChannel whatTheRefusalHadOpen = FileChannel.open(
+                    filesOutsideAnyDataDirectory.resolve("what-refusal-" + refusal + "-had-open"),
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+            DataDirectoryLock.pinIfAFailedTakeLeftItOpen(NO_IDENTITY_TO_KEEP_IT_UNDER, directoryPath,
+                    whatTheRefusalHadOpen);
+            keptByRefusalsWithNoIdentity.add(new WeakReference<>(whatTheRefusalHadOpen));
+            whatTheRefusalHadOpen = null;
+        }
+
+        assertEquals(keptBeforeAnyOfThis + REFUSED_STARTS_A_SUPERVISOR_RETRIES,
+                DataDirectoryLock.pinnedChannelCount(),
+                "every one of those refusals is keeping the descriptor it left open, because none of"
+                        + " them can be answered by another's: one per refusal is the honest bound where"
+                        + " a lock file has no identity, and keeping fewer would mean dropping the last"
+                        + " reference to a descriptor that must not be closed");
+
+        collectWhatNothingIsHoldingOnToAnyMore();
+
+        for (WeakReference<FileChannel> kept : keptByRefusalsWithNoIdentity) {
+            FileChannel stillKept = kept.get();
+            assertNotNull(stillKept, "and something is still holding every one of them on the far side"
+                    + " of a collection, which is the whole of what keeping a descriptor open means in a"
+                    + " garbage-collected runtime");
+            assertTrue(stillKept.isOpen(), "so the collector closed none of them, and no lock this"
+                    + " process holds on those files went with a close nobody asked for");
+        }
+    }
+
+    /**
      * The refusal a lock file's identity cannot make on its own: {@code shrike.lock} deleted out from
      * under the broker holding it, and a second start over that very data directory.
      *
@@ -424,6 +552,32 @@ class BrokerDataDirectoryLockTest {
     }
 
     /**
+     * Makes {@code shrike.lock} a symbolic link to a file that is not there, which is the one lock file
+     * a test can build on a filesystem that has identities to give whose identity cannot be read: a stat
+     * of it fails where an open of it succeeds, creating what it names.
+     *
+     * <p>A filesystem that refuses symbolic links has nothing to say about this path, so the test aborts
+     * rather than passing on nothing; both operating systems this project is built on make them.
+     *
+     * @param lockFile           the {@code shrike.lock} to make a link
+     * @param whatTheLockFileNames the file it names, which must not exist
+     */
+    private static void makeTheLockFileNameAFileThatIsNotThere(Path lockFile, Path whatTheLockFileNames)
+            throws IOException {
+        try {
+            Files.createSymbolicLink(lockFile, whatTheLockFileNames);
+        } catch (UnsupportedOperationException | FileSystemException linksRefused) {
+            abort("this filesystem will not make a symbolic link, so a lock file whose identity cannot"
+                    + " be read cannot be built here: " + linksRefused);
+        }
+
+        assertThrows(NoSuchFileException.class,
+                () -> Files.readAttributes(lockFile, BasicFileAttributes.class),
+                "the arrangement: the lock file cannot be stat'ed, so a take over this directory has no"
+                        + " identity to key on and falls back to the directory's own path");
+    }
+
+    /**
      * Which branch of {@link DataDirectoryLock#take} a refusal came out of, read off the exception it
      * came out with. Both refusals say the same sentence on purpose — an operator can do nothing
      * different about either — but only the one that has already opened a channel on the lock file has
@@ -509,7 +663,20 @@ class BrokerDataDirectoryLockTest {
      * @return {@link DataDirectoryLockProbe#HELD} or {@link DataDirectoryLockProbe#FREE}
      */
     private String whatAnotherProcessFindsOfTheLock(String when) throws Exception {
-        Path lockFile = dataDirectory.resolve(DataDirectoryLock.FILE_NAME);
+        return whatAnotherProcessFindsOfTheLock(dataDirectory.resolve(DataDirectoryLock.FILE_NAME), when);
+    }
+
+    /**
+     * The same question asked about a named file rather than about this test's own lock file, which the
+     * two tests over a lock file with no identity need: one of them asks about the file the lock file
+     * names and about the file a kept descriptor was open on, and the whole point of that pair is that
+     * they are two different files.
+     *
+     * @param lockFile the file to ask about
+     * @param when     what to call this probe's output file, so a failed run says which one it was
+     * @return {@link DataDirectoryLockProbe#HELD} or {@link DataDirectoryLockProbe#FREE}
+     */
+    private String whatAnotherProcessFindsOfTheLock(Path lockFile, String when) throws Exception {
         Path outputFile = probeOutputDirectory.resolve("probe-" + when + ".out");
         Process probe = new ProcessBuilder(List.of(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),

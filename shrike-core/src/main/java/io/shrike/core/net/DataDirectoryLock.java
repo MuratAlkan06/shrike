@@ -16,6 +16,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -138,7 +139,7 @@ final class DataDirectoryLock implements Closeable {
      * broker holding it. Where a filesystem has no identity to give, the real path is the only key and
      * is still one entry for every spelling of one directory.
      *
-     * <p>This is one of the two pieces of static mutable state in this codebase, and PRINCIPLES §2
+     * <p>This is one of the three pieces of static mutable state in this codebase, and PRINCIPLES §2
      * forbids it, so the exception is written down here and in DESIGN.md as the preamble to those rules
      * requires. What it holds is a fact about the process rather than about any object in it — the JDK's
      * own {@code FileLockTable} is static for the same reason — and there is nowhere to inject it from:
@@ -164,16 +165,46 @@ final class DataDirectoryLock implements Closeable {
      * only to the start that finally takes the lock through it, which owns that channel from then on and
      * closes it with the lock.
      *
-     * <p>It is the second of the two static mutable fields PRINCIPLES §2 forbids and this class
+     * <p>It is the second of the three static mutable fields PRINCIPLES §2 forbids and this class
      * documents, for the same reason as the first: an open descriptor is a fact about the process.
      */
     // guarded by: the claim on the same key, and by its own concurrency for the rest. A take reads or
     // writes the entry for a key only while it holds that key in CLAIMED_LOCK_FILES_AND_DIRECTORIES,
     // which admits one holder of a key at a time, so the read that decides whether to open a descriptor
     // and the write that keeps the one it opened cannot interleave with another take's over the same
-    // file. The key is the lock file's identity where there is one, so what an entry is kept under is
-    // always one of the keys the take holding it claimed.
+    // file. The key is always the lock file's identity, which is one of the keys the take holding it
+    // claimed.
     private static final ConcurrentMap<Object, FileChannel> PINNED_REFUSED_CHANNELS = new ConcurrentHashMap<>();
+
+    /**
+     * The channels a refusal opened over a lock file this process could not identify: kept for the life
+     * of the process like the ones above, and unlike them never asked for a lock.
+     *
+     * <p>Asking one of them would be unsound, which is the whole reason this field is separate. An
+     * identity <em>is</em> the device and inode, so a descriptor kept under one is open on the file the
+     * next start is asking about and on no other; a key that names a directory says only which directory
+     * somebody was refused over, and the file behind the descriptor kept under it may be an inode
+     * {@value #FILE_NAME} stopped naming since. A start handed that descriptor would be granted a lock on
+     * an orphan and would never open {@value #FILE_NAME} at all — so the next start over the directory
+     * would find that file free and take it, which is two brokers over one data directory, the thing
+     * this class exists to refuse.
+     *
+     * <p>A list per key rather than the one slot the map above holds, and that is load-bearing rather
+     * than tidy. Keeping one and refusing to reuse it would leave every later refusal's channel
+     * referenced by nothing, and a channel nothing references is closed by its cleaner — which is the
+     * close that drops this process's lock on that file. Refusing to reuse and keeping every one of them
+     * are therefore one change and not two. What it costs is a descriptor per refused attempt rather
+     * than per lock file, which is what this cost before the map above was keyed, and it is the price of
+     * a filesystem that has no identity to give.
+     *
+     * <p>It is the third of the three static mutable fields PRINCIPLES §2 forbids and this class
+     * documents, for the reason the other two carry: an open descriptor is a fact about the process.
+     */
+    // guarded by: the claim on the same key, and by its own concurrency for the rest — the same guard
+    // as the map above and for the same reason, since a take adds to the list for a key only while it
+    // holds that key. Nothing reads it for a lock, so there is no read to order a write against.
+    private static final ConcurrentMap<Path, List<FileChannel>> PINNED_REFUSED_CHANNELS_WITH_NO_IDENTITY =
+            new ConcurrentHashMap<>();
 
     private final Path lockFile;
 
@@ -218,10 +249,6 @@ final class DataDirectoryLock implements Closeable {
         createLockFileIfAbsent(dataDirectory, lockFile);
         Object fileIdentity = identityOf(lockFile);
         Path directoryPath = realPathOf(dataDirectory, lockFile);
-        // What the descriptor kept for a refusal is kept under: the file's identity is what the hazard
-        // is about, since POSIX drops the locks of an inode rather than of a name, and the directory is
-        // the best a filesystem with no identity to give leaves to key on.
-        Object identity = fileIdentity != null ? fileIdentity : directoryPath;
         List<Object> claims = fileIdentity != null ? List.of(fileIdentity, directoryPath) : List.of(directoryPath);
 
         if (!claimAllOrNone(claims)) {
@@ -234,10 +261,16 @@ final class DataDirectoryLock implements Closeable {
         FileChannel opened = null;
         try {
             // A descriptor the backstop is already keeping on this file is the one to ask, because
-            // opening a second is the thing a retry must not be allowed to repeat. Reading the entry
-            // here is safe without any lock of this class's own: this take holds the claim on the key,
-            // and nothing else can be filling or emptying that entry while it does.
-            FileChannel kept = PINNED_REFUSED_CHANNELS.get(identity);
+            // opening a second is the thing a retry must not be allowed to repeat. It is asked only
+            // where the key is the lock file's own identity, and that is a soundness condition rather
+            // than an optimisation: an identity is the device and inode, so a descriptor kept under one
+            // is provably open on the file this take is asking about. A key that names a directory
+            // proves nothing of the sort — the file behind a descriptor kept under it may be an inode
+            // shrike.lock stopped naming since — so a take that has no identity to ask by opens its own
+            // and asks nothing. Reading the entry here is safe without any lock of this class's own:
+            // this take holds the claim on the key, and nothing else can be filling or emptying that
+            // entry while it does.
+            FileChannel kept = fileIdentity == null ? null : PINNED_REFUSED_CHANNELS.get(fileIdentity);
             if (kept == null) {
                 opened = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             }
@@ -267,8 +300,12 @@ final class DataDirectoryLock implements Closeable {
             taken = true;
             // A kept channel that has just been granted the lock is this lock's own from here: it
             // leaves the map so that close() is free to close it, and so that the next start over this
-            // file opens one of its own rather than asking a descriptor this broker has closed.
-            PINNED_REFUSED_CHANNELS.remove(identity, channel);
+            // file opens one of its own rather than asking a descriptor this broker has closed. There is
+            // nothing to hand over where there is no identity, because nothing kept there is ever asked
+            // for a lock, and this channel is one this take opened for itself.
+            if (fileIdentity != null) {
+                PINNED_REFUSED_CHANNELS.remove(fileIdentity, channel);
+            }
             return held;
         } catch (OverlappingFileLockException heldByThisJvm) {
             // Something in this JVM holds a lock on this very file, which the claim above did not see:
@@ -294,15 +331,18 @@ final class DataDirectoryLock implements Closeable {
             // A channel still open is a channel one of those paths could not safely close, so it is
             // kept rather than dropped; the two paths where closing is safe have closed it already,
             // and a channel that is closed is not kept. It is kept before the claims go back, and that
-            // order is load-bearing: a claim is the only thing keeping the next take from opening a
-            // second descriptor on this file, so the entry has to be there before that take can look.
+            // order is load-bearing wherever there is an identity to keep it under: a claim is the only
+            // thing keeping the next take from opening a second descriptor on this file, so the entry
+            // has to be there before that take can look. Where there is none, no later take looks, and
+            // keeping it in the same place costs that path nothing.
+            //
             // Claims left behind by a take that failed are worse than the failure that left them,
             // because an entry names a file or a directory and nothing else: every later start over
             // either in this JVM would be refused for the life of the process by a claim with no broker
             // behind it. Both of this take's go back, and only this take's — a refused claim was rolled
             // back by claimAllOrNone before this ever ran.
             if (!taken) {
-                pinIfAFailedTakeLeftItOpen(identity, opened);
+                pinIfAFailedTakeLeftItOpen(fileIdentity, directoryPath, opened);
                 releaseClaims(claims);
             }
         }
@@ -338,19 +378,26 @@ final class DataDirectoryLock implements Closeable {
     }
 
     /**
-     * How many descriptors the backstop is keeping open in this process, which is what turns the bound
-     * above from a sentence into a number: one per lock file, whatever a supervisor retries.
+     * How many descriptors the backstop is keeping open in this process, which is what turns the bounds
+     * above from sentences into numbers: one per lock file wherever {@code fileKey()} answers, whatever a
+     * supervisor retries, and one per refused attempt where it does not.
      *
      * <p>It is here for
-     * {@code BrokerDataDirectoryLockTest#keepsOneDescriptorPerLockFileHoweverManyStartsANonBrokerHolderRefuses},
-     * which counts them across a run of refused starts, because a cost nobody counts is a cost nobody
-     * knows has changed. Nothing in the broker reads it.
+     * {@code BrokerDataDirectoryLockTest#keepsOneDescriptorPerLockFileHoweverManyStartsANonBrokerHolderRefuses}
+     * and for
+     * {@code BrokerDataDirectoryLockTest#keepsEveryRefusedDescriptorWhereTheLockFileHasNoIdentityToBoundThemBy},
+     * which count them across a run of refusals, because a cost nobody counts is a cost nobody knows has
+     * changed. Nothing in the broker reads it.
      *
      * @return how many channels refusals are keeping open, across every lock file this process has been
-     *         refused over
+     *         refused over, under both of the keys one can be kept under
      */
     static int pinnedChannelCount() {
-        return PINNED_REFUSED_CHANNELS.size();
+        int keptWithNoIdentity = 0;
+        for (List<FileChannel> channels : PINNED_REFUSED_CHANNELS_WITH_NO_IDENTITY.values()) {
+            keptWithNoIdentity += channels.size();
+        }
+        return PINNED_REFUSED_CHANNELS.size() + keptWithNoIdentity;
     }
 
     /**
@@ -455,31 +502,56 @@ final class DataDirectoryLock implements Closeable {
 
     /**
      * Keeps a channel a failed {@link #take(Path)} opened and could not safely close from being closed
-     * by anything else, under the claim that take was refused over.
+     * by anything else — under the lock file's own identity where it has one, and in a list nothing ever
+     * asks for a lock where it has none.
      *
      * <p>Being left alone is not the same as being kept: a {@link FileChannel} the JDK opened for itself
      * registers a cleaner that closes its descriptor once nothing references the channel, and on this
      * file that close drops whatever lock this process holds on it — which, on the path that gets here,
-     * is a lock a running broker is serving on. So the reference in {@link #PINNED_REFUSED_CHANNELS} is
-     * the thing that keeps it, and the only take that gets it back is the one that ends up holding the
-     * lock through it.
+     * is a lock a running broker is serving on. So the reference this leaves is the thing that keeps it,
+     * and the only take that gets one back is the one that ends up holding the lock through it.
      *
      * <p>A channel that is already closed is not kept: the two failure paths where closing is safe have
      * closed it by the time this runs, and a descriptor that is gone cannot be dropped twice. Nor is one
      * this take never opened, because a take that was given a kept channel opened nothing.
      *
-     * <p>It is {@code putIfAbsent} rather than {@code put} because the entry a take found empty is the
-     * entry it is filling, and the claim it holds is what says those are the same entry. A {@code put}
-     * would read as though overwriting were allowed, and overwriting here means dropping the last
-     * reference to a descriptor that must not be closed.
+     * <p>Under an identity it is {@code putIfAbsent} rather than {@code put} because the entry a take
+     * found empty is the entry it is filling, and the claim it holds is what says those are the same
+     * entry. A {@code put} would read as though overwriting were allowed, and overwriting here means
+     * dropping the last reference to a descriptor that must not be closed.
      *
-     * @param claim  the key this take was refused over, which is what the descriptor is kept under
-     * @param opened the channel this take opened, or null if it was given one that was already kept
+     * <p>With no identity there is no entry to fill, because nothing kept on that path is ever asked for
+     * a lock: {@link #PINNED_REFUSED_CHANNELS_WITH_NO_IDENTITY} says why. So every one of them is added
+     * to that directory's list, and one slot with {@code putIfAbsent} would be the worse mistake rather
+     * than a tighter bound — a second refusal's channel would then be referenced by nothing, and a
+     * channel nothing references is closed by its cleaner, which is the close this whole branch exists
+     * to prevent.
+     *
+     * <p>It is not private because {@code BrokerDataDirectoryLockTest} calls it, and that is worth
+     * saying plainly. A refusal that reaches here with no identity cannot be built on a filesystem that
+     * answers {@code fileKey()}: it takes an open that lands on an inode this JVM already locks, and a
+     * lock file that cannot be stat'ed is one whose open either creates a fresh inode or would have been
+     * stat'ed. So the two tests for that path hand this method what such a refusal hands it. Nothing
+     * outside this class and that test calls it.
+     *
+     * @param fileIdentity  the lock file's identity, or null where it has none to give, in which case
+     *                      the channel is kept and never asked
+     * @param directoryPath the data directory's real path, which is what a channel with no identity to
+     *                      keep it under is kept beside
+     * @param opened        the channel this take opened, or null if it was given one that was already
+     *                      kept
      */
-    private static void pinIfAFailedTakeLeftItOpen(Object claim, FileChannel opened) {
-        if (opened != null && opened.isOpen()) {
-            PINNED_REFUSED_CHANNELS.putIfAbsent(claim, opened);
+    static void pinIfAFailedTakeLeftItOpen(Object fileIdentity, Path directoryPath, FileChannel opened) {
+        if (opened == null || !opened.isOpen()) {
+            return;
         }
+        if (fileIdentity != null) {
+            PINNED_REFUSED_CHANNELS.putIfAbsent(fileIdentity, opened);
+            return;
+        }
+        PINNED_REFUSED_CHANNELS_WITH_NO_IDENTITY
+                .computeIfAbsent(directoryPath, directory -> new CopyOnWriteArrayList<>())
+                .add(opened);
     }
 
     private static ShrikeIOException alreadyLocked(Path dataDirectory, Path lockFile, Throwable heldByThisJvm) {
