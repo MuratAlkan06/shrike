@@ -5,14 +5,18 @@ import io.shrike.core.log.LogConfig;
 import io.shrike.core.log.ProducedRecord;
 import io.shrike.core.log.RecordRange;
 import io.shrike.core.log.SegmentedLog;
+import io.shrike.core.log.WriteProgress;
 import io.shrike.core.time.SystemTimeSource;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -52,11 +56,17 @@ import org.openjdk.jmh.annotations.Warmup;
  * costs. It is not a measurement of the file read alone, and neither number is a measurement of a
  * network. Both paths pay the same socket, which is what leaves the difference between them.
  *
- * <p><strong>A third method prices that shared socket, and it is not a fetch path.</strong>
- * {@link #writeRangeToTheSinkAlone} writes the same bytes into the same loopback pair with no log
- * behind it, so what both rows pay is a number this repository commits rather than one it asserts.
- * It belongs beside the two rather than in them: it is what says whether either row is bound by the
- * socket, and it is what has to come off both before the distance between them can be read.
+ * <p><strong>Two further methods price the floor under each of those two paths, and neither is a fetch
+ * path.</strong> {@link #writeRangeToTheSinkAlone} writes the same bytes out of the same heap array
+ * into the same loopback pair with no log behind it, which is the floor under the buffered row: what
+ * that row pays for the socket once the read and the allocation are taken away.
+ * {@link #transferWarmFileToTheSinkAlone} transfers the same bytes out of an already-warm file into the
+ * same pair with no log behind it — no range located, no descriptor opened per invocation — which is
+ * the floor under the transfer row, and it is a different number from the other floor because
+ * {@code transferTo} out of a file and {@code write} out of a heap buffer are different system calls
+ * doing different work. Pricing one shared sink and subtracting it from both rows would have charged
+ * the transfer row for a copy it never makes; the two floors are measured separately for that reason,
+ * and each row is read against its own.
  *
  * <p><strong>The transfer path opens a file descriptor per fetch and the buffered path does not.</strong>
  * {@link SegmentedLog#openRange} opens a second descriptor on the segment file and the
@@ -65,6 +75,15 @@ import org.openjdk.jmh.annotations.Warmup;
  * benchmark's — {@code LogSegment.openRange} is the same call a served fetch makes, and the second
  * descriptor is what lets a range still be sent after retention has deleted the segment it is in — so
  * the open and the close are inside the transfer number rather than taken out of it.
+ *
+ * <p><strong>The buffered path allocates a mebibyte per fetch and the transfer path allocates
+ * nothing.</strong> {@link SegmentedLog#readRange} answers with a {@code byte[]} sized to the range, so
+ * every invocation of {@link #serveRangeByBuffer} allocates a fresh 1 048 478-byte array — larger than
+ * half a G1 region at any heap size this machine defaults to, which makes it a humongous allocation
+ * rather than one served from a thread-local buffer. That is the broker's own behaviour and not this
+ * benchmark's, so it is inside the buffered number; the {@code gc} profiler is what says how much of
+ * that number it is, and the {@code fetch-allocation} execution of the {@code bench} profile is what
+ * runs it.
  *
  * <p>The response header is outside both calls, because it is byte for byte the same in both paths and
  * is written the same way in both. What varies is only how the records block reaches the wire.
@@ -102,6 +121,9 @@ public class FetchPathBenchmark {
     /** How long a trial waits for the drainer to end after its socket has been closed. */
     private static final long DRAIN_JOIN_MILLIS = 5_000L;
 
+    /** What the file holding the range's bytes with no log around them is called inside the trial's dir. */
+    private static final String WARM_FILE_NAME = "warm-file.bytes";
+
     private Path dataDirectory;
     private SegmentedLog log;
     private long highWaterMark;
@@ -111,6 +133,21 @@ public class FetchPathBenchmark {
      * sends exactly what the two fetch paths send with no log in the call that sends it.
      */
     private byte[] recordsBlock;
+
+    /**
+     * A plain file holding those same bytes and nothing else, so that
+     * {@link #transferWarmFileToTheSinkAlone} transfers exactly what the transfer path transfers out of
+     * a file the log knows nothing about. It is not a segment: it has no index, no base offset, and no
+     * frames as far as anything here is concerned — it is a mebibyte on disk.
+     */
+    private Path warmFile;
+
+    /**
+     * One descriptor on {@link #warmFile}, opened at trial setup and read through by every invocation.
+     * It is deliberately not opened per invocation: the open is what the transfer <em>row</em> pays and
+     * this is the floor under that row, so the floor is the transfer alone.
+     */
+    private FileChannel warmFileChannel;
 
     private ServerSocketChannel listener;
 
@@ -148,6 +185,7 @@ public class FetchPathBenchmark {
         highWaterMark = log.nextOffset();
         requireBothPathsCoverTheSameBytes();
         recordsBlock = log.readRange(FETCH_OFFSET, highWaterMark, RANGE_MAX_BYTES);
+        openTheWarmFile();
 
         listener = ServerSocketChannel.open();
         listener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
@@ -175,6 +213,7 @@ public class FetchPathBenchmark {
         }
         clientEnd.close();
         listener.close();
+        warmFileChannel.close();
         log.close();
         TemporaryDataDirectory.delete(dataDirectory);
 
@@ -229,6 +268,58 @@ public class FetchPathBenchmark {
     public long writeRangeToTheSinkAlone() throws IOException {
         ByteChannels.writeFully(brokerEnd, ByteBuffer.wrap(recordsBlock));
         return recordsBlock.length;
+    }
+
+    /**
+     * Transfers the same bytes out of a warm file into the same sink with no log behind the transfer:
+     * no range located, no segment file opened, no frame boundary found. It is not one of the two paths
+     * above and it is not a fetch — it is the floor under {@link #serveRangeByTransfer}, so that what
+     * that row costs above a bare file-to-socket transfer is a measurement rather than the same sink
+     * cost subtracted from both rows.
+     *
+     * <p>The ask is capped at {@link WriteProgress#MAX_BYTES_BETWEEN_REPORTS} in the same loop shape
+     * {@link RecordRange#transferTo} uses, which for a range this size is one call either way, so the
+     * floor and the row it sits under make the same system call the same number of times.
+     *
+     * @return how many bytes were transferred, returned so the work cannot be eliminated
+     * @throws IOException if the file or the socket fails
+     */
+    @Benchmark
+    public long transferWarmFileToTheSinkAlone() throws IOException {
+        long positionBytes = 0L;
+        long remainingBytes = recordsBlock.length;
+        while (remainingBytes > 0) {
+            long askBytes = Math.min(remainingBytes, WriteProgress.MAX_BYTES_BETWEEN_REPORTS);
+            long transferredBytes = warmFileChannel.transferTo(positionBytes, askBytes, brokerEnd);
+            if (transferredBytes <= 0) {
+                throw new IOException("the warm file " + warmFile + " gave " + positionBytes + " of the "
+                        + recordsBlock.length + " bytes it holds");
+            }
+            positionBytes += transferredBytes;
+            remainingBytes -= transferredBytes;
+        }
+        return positionBytes;
+    }
+
+    /**
+     * Writes the range's bytes into a file of their own, opens one descriptor on it, and reads the whole
+     * of it once so that the first measured transfer meets the same page cache every later one does.
+     *
+     * @throws IOException if the file cannot be written, opened, or read
+     */
+    private void openTheWarmFile() throws IOException {
+        warmFile = dataDirectory.resolve(WARM_FILE_NAME);
+        Files.write(warmFile, recordsBlock);
+        warmFileChannel = FileChannel.open(warmFile, StandardOpenOption.READ);
+
+        ByteBuffer warming = ByteBuffer.allocateDirect(recordsBlock.length);
+        while (warming.hasRemaining() && warmFileChannel.read(warming) >= 0) {
+            // Reading it whole is the warming; where the bytes went is of no interest.
+        }
+        if (warming.hasRemaining()) {
+            throw new IllegalStateException("the warm file holds " + (recordsBlock.length - warming.remaining())
+                    + " of the " + recordsBlock.length + " bytes the range covers");
+        }
     }
 
     /**
