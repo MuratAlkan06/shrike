@@ -26,13 +26,17 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.web.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.web.servlet.DispatcherServlet;
 
 /**
  * The facade against a real broker in a process of its own, over real HTTP.
@@ -60,6 +64,9 @@ class AdminFacadeIT {
 
     private static final int ORDERS_PARTITION_COUNT = 3;
     private static final int SHIPMENTS_PARTITION_COUNT = 2;
+
+    /** How many requests in a row count as a burst: enough that a line per request would show. */
+    private static final int BURST_REQUEST_COUNT = 5;
 
     @TempDir
     Path workingDirectory;
@@ -170,6 +177,59 @@ class AdminFacadeIT {
         assertPlainError(response, 503, "broker unreachable");
     }
 
+    /**
+     * A caller that will take nothing this facade produces is asking for something rather than
+     * breaking something. Until this was mapped it fell through to the catch-all: 500, which is the
+     * wrong story, and a stack trace per header, which is the disk somebody else gets to fill that the
+     * 4xx paths were already fixed for.
+     */
+    @Test
+    void answersNotAcceptableWithoutAStackWhenACallerWillTakeNoMediaTypeThisFacadeProduces() throws Exception {
+        int brokerPort = startBroker();
+        fillTheBroker(brokerPort);
+        startFacade(brokerPort);
+
+        HttpResponse<String> response;
+        List<LogRecord> lines;
+        try (CapturedLog captured = CapturedLog.of(ErrorResponses.class)) {
+            response = get("/api/v1/topics", "application/xml");
+            lines = captured.lines();
+        }
+
+        assertPlainError(response, 406, "request refused");
+        assertTrue(contentTypeOf(response).startsWith("application/json"), contentTypeOf(response));
+        assertEquals(List.of("FINE answering 406 request refused"), writtenDown(lines),
+                "a header a caller chose is worth one quiet line and no stack");
+    }
+
+    /**
+     * A broker that is down is a state rather than an event: every request that arrives while it holds
+     * meets the same failure, so the answer a stranger can ask for a thousand times has to cost one
+     * line. Three of them used to write some four hundred between them.
+     */
+    @Test
+    void writesOneLineAndNoStackForEachOfABurstOfRequestsToABrokerThatIsNotListening() throws Exception {
+        int brokerPort = aPortNothingIsListeningOn();
+        startFacade(brokerPort);
+
+        List<Integer> statuses = new ArrayList<>();
+        List<LogRecord> lines;
+        try (CapturedLog captured = CapturedLog.of(ErrorResponses.class)) {
+            for (int request = 0; request < BURST_REQUEST_COUNT; request++) {
+                statuses.add(get("/api/v1/topics").statusCode());
+            }
+            lines = captured.lines();
+        }
+
+        assertEquals(List.of(503, 503, 503, 503, 503), statuses);
+        assertEquals(BURST_REQUEST_COUNT, lines.size(), "one line each, and no more: " + writtenDown(lines));
+        assertEquals(List.of(), stacksIn(lines), "a stack was written for a broker a caller found down");
+        assertTrue(lines.stream().allMatch(line -> line.getLevel().equals(Level.SEVERE)
+                        && line.getMessage().startsWith("answering 503 broker unreachable: cannot connect to "
+                                + LOOPBACK + ":" + brokerPort)),
+                "each line still names the broker that could not be reached: " + writtenDown(lines));
+    }
+
     @Test
     void answersNotFoundWithoutDetailForAPathItDoesNotServe() throws Exception {
         startFacade(aPortNothingIsListeningOn());
@@ -179,6 +239,23 @@ class AdminFacadeIT {
         // Spring's own error page never gets the chance: a path nobody serves comes back in the same
         // one-field shape as every other failure.
         assertPlainError(response, 404, "no such endpoint");
+    }
+
+    /**
+     * The facade's own answer to an unmapped path is quiet, and the framework's is not: the
+     * dispatcher writes one WARN naming the path before this facade is asked anything, which is log
+     * volume a stranger with a list of paths decides. The pin in {@code application.properties} is
+     * asserted through the predicate the dispatcher itself consults before writing that line.
+     */
+    @Test
+    void answersAPathNobodyServesWithoutTheFrameworkWritingAWarningPerRequest() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        HttpResponse<String> response = get("/nothing-is-served-here");
+
+        assertEquals(404, response.statusCode(), response.body());
+        assertFalse(LoggerFactory.getLogger(DispatcherServlet.PAGE_NOT_FOUND_LOG_CATEGORY).isWarnEnabled(),
+                "the dispatcher writes one warning per unmapped path, and a caller picks how many");
     }
 
     /**
@@ -371,6 +448,26 @@ class AdminFacadeIT {
 
     private static String contentTypeOf(HttpResponse<String> response) {
         return response.headers().firstValue("content-type").orElse("");
+    }
+
+    /**
+     * @param lines every line a class wrote while a test watched
+     * @return each of them as its level and its sentence, which is what an operator would have read
+     */
+    private static List<String> writtenDown(List<LogRecord> lines) {
+        return lines.stream().map(line -> line.getLevel().getName() + " " + line.getMessage()).toList();
+    }
+
+    /**
+     * @param lines every line a class wrote while a test watched
+     * @return the ones that carry a throwable, which is what gets printed as a stack trace. A status a
+     *         caller can ask for repeatedly must produce none of these
+     */
+    private static List<String> stacksIn(List<LogRecord> lines) {
+        return lines.stream()
+                .filter(line -> line.getThrown() != null)
+                .map(line -> line.getMessage() + " <- " + line.getThrown())
+                .toList();
     }
 
     private Path dataDirectory() {

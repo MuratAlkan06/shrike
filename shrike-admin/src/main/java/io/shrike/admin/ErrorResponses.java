@@ -10,6 +10,7 @@ import java.util.Objects;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.ErrorResponse;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -31,6 +32,8 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
  *   <li>a group that has committed nothing — 404
  *   <li>a path this facade does not serve, or a method it does not answer — 404 and 405
  *   <li>a name the protocol will not carry — 400, with the rule that refused it
+ *   <li>a request the framework itself refuses on the caller's behalf — the status the framework
+ *       chose, which for an {@code Accept} header naming nothing this facade produces is 406
  *   <li>a broker that cannot be reached or does not answer in time — 503
  *   <li>an answer from the far end that is not a response this client can believe — 502
  *   <li>anything else at all — 500, with no detail whatsoever
@@ -81,10 +84,14 @@ public class ErrorResponses {
     /**
      * The broker is not answering. That is not something the caller did, and it is not something this
      * facade can fix by being asked again immediately, so it is the one status that says "try later".
+     *
+     * <p>It is also the one 5xx anybody who can reach this port can ask for as often as they like, so
+     * it is written down the way {@link #answerWithoutTheStack} describes rather than the way every
+     * other 5xx is.
      */
     @ExceptionHandler({BrokerIOException.class, BrokerTimeoutException.class})
     ResponseEntity<ErrorBody> answerUnreachableBroker(ShrikeClientException unreachable) {
-        return answer(HttpStatus.SERVICE_UNAVAILABLE, "broker unreachable", unreachable);
+        return answerWithoutTheStack(HttpStatus.SERVICE_UNAVAILABLE, "broker unreachable", unreachable);
     }
 
     /**
@@ -129,9 +136,25 @@ public class ErrorResponses {
     /**
      * Everything else. A failure nobody planned for is a bug in this facade, and a caller learns
      * nothing about it beyond that it happened — the log line is where it is described.
+     *
+     * <p><strong>Unless the framework has already decided what it is.</strong> Spring's own refusals
+     * of a request — an {@code Accept} header naming no media type this facade produces is the one
+     * this facade can be made to raise — implement {@link ErrorResponse}, and each of them carries the
+     * status that describes it. Those keep the status they came with and are logged the way every
+     * other 4xx is, because a header is something a caller chooses and can choose a million times, and
+     * because a request for a representation this facade does not produce is the caller's 406 rather
+     * than this facade failing. A framework refusal carrying a 5xx is left to the sentence below:
+     * this facade has no better name for one than the name it gives its own bugs, and no reason to
+     * believe a caller drove it.
      */
     @ExceptionHandler(Exception.class)
     ResponseEntity<ErrorBody> answerUnexpectedFailure(Exception failure) {
+        if (failure instanceof ErrorResponse framework) {
+            HttpStatus refusal = HttpStatus.resolve(framework.getStatusCode().value());
+            if (refusal != null && refusal.is4xxClientError()) {
+                return answer(refusal, sentenceFor(refusal), failure);
+            }
+        }
         return answer(HttpStatus.INTERNAL_SERVER_ERROR, INTERNAL_ERROR, failure);
     }
 
@@ -160,13 +183,18 @@ public class ErrorResponses {
     }
 
     /**
-     * <p><strong>How much of a failure is written down depends on who caused it.</strong> A 4xx is
+     * <p><strong>How much of a failure is written down depends on who can cause it.</strong> A 4xx is
      * something the caller did, and a caller that can make this process write a line can make it write
      * one per request: DEBUG, and without the throwable, because forty stack frames per 404 is a disk
      * somebody else gets to fill. {@code ShrikeBroker.java:382-386} applies exactly this rule to the
      * broker's own connection logging, for the same reason. A 5xx is this facade or the broker behind
      * it being in a state an operator has to know about rather than a shape of request anyone can send,
      * so it keeps its level and its cause.
+     *
+     * <p><strong>A 5xx a caller can drive is neither.</strong> A broker that is not listening answers
+     * every request that arrives while it is down with the same 503, so the rule above splits on who
+     * <em>can</em> cause a status rather than on the digit it starts with: that one goes through
+     * {@link #answerWithoutTheStack}, which keeps the level and the cause and drops the repetition.
      *
      * @param status  the status to answer with
      * @param message the sentence the caller is given, which is the whole of the body
@@ -180,6 +208,50 @@ public class ErrorResponses {
         } else {
             LOGGER.log(System.Logger.Level.DEBUG, () -> "answering " + status.value() + " " + message);
         }
+        return answerWith(status, message);
+    }
+
+    /**
+     * A 5xx a caller can ask for as often as it likes, written down as one line.
+     *
+     * <p>{@link #answer(HttpStatus, String, Exception)} gives a 5xx its throwable because a 5xx is
+     * normally a state an operator has to be told about once. A broker that is not listening is a
+     * state that lasts: every request that arrives while it holds asks for the same fifty frames
+     * again, and three requests against a down broker are already some four hundred lines. So the
+     * failure is summarised instead — its own sentence, which names the broker's address, and the
+     * class and message of whatever caused it, which is the part of a stack an operator reads first —
+     * and the throwable itself is not passed to the logger. The level stays ERROR, because a broker
+     * that cannot be reached is still something an operator has to know about. What is dropped is the
+     * repetition, not the report.
+     *
+     * @param status  the status to answer with
+     * @param message the sentence the caller is given, which is the whole of the body
+     * @param failure what actually happened, summarised into the line and never sent
+     * @return the answer
+     */
+    private static ResponseEntity<ErrorBody> answerWithoutTheStack(HttpStatus status, String message,
+            Exception failure) {
+        LOGGER.log(System.Logger.Level.ERROR,
+                () -> "answering " + status.value() + " " + message + ": " + summaryOf(failure));
+        return answerWith(status, message);
+    }
+
+    /**
+     * @param failure what happened
+     * @return that failure in one line: its own sentence, and the class and message of what caused it
+     *         when something did
+     */
+    private static String summaryOf(Exception failure) {
+        Throwable cause = failure.getCause();
+        return cause == null ? failure.getMessage() : failure.getMessage() + ": " + cause;
+    }
+
+    /**
+     * @param status  the status to answer with
+     * @param message the sentence the caller is given, which is the whole of the body
+     * @return the answer itself, once whatever had to be written down has been
+     */
+    private static ResponseEntity<ErrorBody> answerWith(HttpStatus status, String message) {
         // The content type is named rather than negotiated: this shape is the one answer a failure
         // gets, so a caller that will accept only HTML is given the JSON anyway instead of being told
         // its own Accept header is a second failure.
