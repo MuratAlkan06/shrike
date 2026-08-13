@@ -100,7 +100,41 @@ public interface Log extends Closeable {
      * @throws CorruptRecordException    if a frame in the range contradicts what the log knows
      * @throws ShrikeIOException         if the segment cannot be read or opened
      */
-    RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes);
+    default RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes) {
+        return openRange(fetchOffset, limitOffset, maxBytes, RecordRange.empty());
+    }
+
+    /**
+     * The same range, for a caller that is already holding a segment file open — a fetch that has
+     * waited, and is asking again now that more records have landed.
+     *
+     * <p>Which bytes this answers with is decided exactly as above and by the same walk; what changes
+     * is only which descriptor they will be sent through. When the range falls in the file
+     * {@code held} is open on, the range returned is one over that same descriptor, and {@code held}
+     * is spent. When it falls in another file — the segment a roll started, once a fetch has caught up
+     * with the end of the log — a descriptor is opened on that file and {@code held} is closed, so
+     * nothing is ever served through a descriptor open on the wrong segment. Either way the caller
+     * holds what this returns and holds nothing else: a caller that replaces its range with this one
+     * closes one descriptor once, however many times it asks.
+     *
+     * <p>Nothing this throws changes what the caller holds. A refusal or a failed open leaves
+     * {@code held} exactly as it was, still the caller's to close.
+     *
+     * @param fetchOffset the logical record number to start at
+     * @param limitOffset the exclusive logical record number to stop before
+     * @param maxBytes    the most bytes to cover, subject to the whole-frame rule
+     * @param held        the range this caller is holding, or {@link RecordRange#empty()} when it
+     *                    holds none
+     * @return the range, which the caller closes
+     * @throws NullPointerException      if {@code held} is null; a caller holding nothing says so with
+     *                                   {@link RecordRange#empty()}
+     * @throws IllegalArgumentException  if {@code maxBytes} is negative
+     * @throws OffsetOutOfRangeException if {@code fetchOffset} is below the first readable offset or
+     *                                   past {@link #nextOffset()}
+     * @throws CorruptRecordException    if a frame in the range contradicts what the log knows
+     * @throws ShrikeIOException         if the segment cannot be read or opened
+     */
+    RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes, RecordRange held);
 
     /**
      * @return the offset the next append will take, which is also the exclusive upper bound of the
@@ -147,6 +181,25 @@ public interface Log extends Closeable {
      * @throws ShrikeIOException if the force fails
      */
     boolean flushIfDue(long nowMillis);
+
+    /**
+     * Whether this log holds records it has not yet put on the device, which is the only question here
+     * a caller may ask without whatever guard it appends and reads under.
+     *
+     * <p>That exception to the single-writer rule above is the whole point of the method: the thread
+     * that asks {@link #flushIfDue(long)} once an interval wants to skip the logs that have nothing to
+     * force, and taking a lock to find out is the cost it is trying to avoid. Implementations say how
+     * they publish it.
+     *
+     * <p>What it promises is one-sided, and that is what makes it safe to act on. An answer of
+     * {@code false} means every record this log has taken was on the device at some instant during the
+     * call, so there was nothing to force; an append landing immediately afterwards makes it
+     * {@code true} again and is found by the next ask. It never answers {@code false} for a log holding
+     * unforced records for longer than it takes the append that made them to return.
+     *
+     * @return whether anything is waiting to be forced
+     */
+    boolean hasUnforcedBytes();
 
     /**
      * Closes the log's file. Implementations state in their own documentation what closing means for

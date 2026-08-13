@@ -22,6 +22,14 @@ import java.util.Objects;
  * promised, from the file it opened. Nothing counts references and nothing is deferred; the range
  * holding a descriptor of its own is the whole of it.
  *
+ * <p><strong>One descriptor, one owner, at every instant.</strong> A fetch that finds too few bytes to
+ * answer with goes on holding the range it located rather than closing it, and the wakeup that finds
+ * more records asks for a range over the same file through {@link #sameFileAt}: the descriptor moves to
+ * the new range, the old one is spent, and what leaves the partition lock at the end is the one range
+ * that owns it. That is what keeps a long poll from opening its segment file once per wakeup while
+ * leaving the rule above exactly as it was — the descriptor is still this fetch's own, and still opened
+ * under the partition lock.
+ *
  * <p>The bytes in the range need not have been forced. A transfer reads through the same page cache
  * the append wrote into, so a record acknowledged a moment ago is readable here whether or not it has
  * reached the device — and the range never covers more than the high-water mark, because the offset
@@ -57,9 +65,11 @@ public final class RecordRange implements Closeable {
     }
 
     /**
-     * @return the range a fetch with nothing to read is answered with
+     * @return the range a fetch with nothing to read is answered with, which is also what a fetch that
+     *         has not opened a segment file is holding: closing it does nothing, because there is
+     *         nothing in it to own
      */
-    static RecordRange empty() {
+    public static RecordRange empty() {
         return NO_RECORDS;
     }
 
@@ -78,6 +88,33 @@ public final class RecordRange implements Closeable {
                     + lengthBytes + "; a range with no bytes is RecordRange.empty()");
         }
         return new RecordRange(logFile, channel, positionBytes, lengthBytes);
+    }
+
+    /**
+     * @param logFile a segment's log file
+     * @return whether this range's descriptor is open on that file, so that bytes of it can be sent
+     *         through the descriptor this range already holds instead of through a second one
+     */
+    boolean isOpenOn(Path logFile) {
+        return channel != null && channel.isOpen() && logFile.equals(this.logFile);
+    }
+
+    /**
+     * The same descriptor, over another stretch of the same file — which is what a fetch that waited
+     * takes when more records have landed in the segment it already has open.
+     *
+     * <p><strong>This range is spent afterwards.</strong> The descriptor belongs to the one returned,
+     * so the caller holds that one and closes that one; closing both would close a channel twice, and
+     * closing this one would close the channel the answer is about to send through. Every caller of
+     * this replaces what it was holding with what this returns, which is what makes the descriptor
+     * something exactly one range owns at any instant.
+     *
+     * @param positionBytes the byte position the first frame of the new range starts at
+     * @param lengthBytes   how many bytes of whole frames it covers, at least one
+     * @return the range that now owns this one's descriptor
+     */
+    RecordRange sameFileAt(long positionBytes, int lengthBytes) {
+        return of(logFile, channel, positionBytes, lengthBytes);
     }
 
     /**
