@@ -7,6 +7,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.function.Consumer;
 
 /**
  * One file of a segmented log, plus the sparse index that points into it. A segment is named after
@@ -364,25 +365,47 @@ final class LogSegment implements Closeable {
      * it. {@link RecordRange} says what that buys; the short version is that {@link #delete()} may
      * run while the range is still being sent.
      *
+     * <p>A caller that is already holding a descriptor on this file hands it in as {@code held}, and
+     * then no file is opened at all: the range returned is one over that same descriptor at the
+     * position this walk found, and {@code held} is spent. A caller holding a descriptor on some other
+     * file — or holding nothing, which is {@link RecordRange#empty()} — gets a descriptor of its own,
+     * and what it handed in is closed only once there is one to put in its place. Nothing this can
+     * throw leaves the caller's range closed behind its back.
+     *
      * @param fetchOffset the offset to start at, which this segment is known to cover
      * @param limitOffset the exclusive offset to stop before, already clamped to the high-water mark
      * @param maxBytes    the most bytes to cover, subject to the whole-frame rule
+     * @param held        the range the caller is holding, which this either takes the descriptor of or
+     *                    closes; {@link RecordRange#empty()} when the caller holds nothing
+     * @param opened      told about each descriptor this opens, and about nothing when it reuses one
      * @return the range, which the caller closes
      * @throws CorruptRecordException if a frame contradicts the offset the walk expects
      * @throws ShrikeIOException      if the segment cannot be read or opened
      */
-    RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes) {
+    RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes, RecordRange held,
+                          Consumer<FileChannel> opened) {
         FramePositions range = locateRange(fetchOffset, limitOffset, maxBytes);
         if (range.lengthBytes() == 0) {
+            held.close();
             return RecordRange.empty();
         }
+        if (held.isOpenOn(logFile)) {
+            return held.sameFileAt(range.positionBytes(), range.lengthBytes());
+        }
+
+        FileChannel descriptor;
         try {
-            return RecordRange.of(logFile, FileChannel.open(logFile, StandardOpenOption.READ),
-                    range.positionBytes(), range.lengthBytes());
+            descriptor = FileChannel.open(logFile, StandardOpenOption.READ);
         } catch (IOException e) {
             throw new ShrikeIOException("cannot open " + logFile + " to send the range from offset " + fetchOffset
                     + " at position " + range.positionBytes(), e);
         }
+        opened.accept(descriptor);
+        // Last, and only now that this call has a descriptor to answer with: an open that failed above
+        // leaves the caller holding exactly what it handed in, which is what keeps a failure from
+        // closing a range somebody else is still counted as the owner of.
+        held.close();
+        return RecordRange.of(logFile, descriptor, range.positionBytes(), range.lengthBytes());
     }
 
     /**

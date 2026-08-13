@@ -5,15 +5,18 @@ import io.shrike.core.log.LogConfig;
 import io.shrike.core.log.LogStatistics;
 import io.shrike.core.log.ProducedRecord;
 import io.shrike.core.log.RecordFrame;
+import io.shrike.core.log.RecordRange;
 import io.shrike.core.log.RecordTooLargeException;
 import io.shrike.core.log.SegmentedLog;
 import io.shrike.core.time.TimeSource;
 import java.io.Closeable;
+import java.nio.channels.FileChannel;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 
 /**
  * One partition of one topic while the broker is running: its log, the lock that makes it a single
@@ -45,11 +48,19 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>An answer may leave this class holding a file open — see {@link #readable} — and it leaves under
  * the lock rather than after it. That is what lets the connection thread go on sending a fetch's bytes
  * while this partition takes appends and deletes segments behind it.
+ *
+ * <p>A fetch that waits keeps that file open while it waits, and asks for its range again through the
+ * descriptor it already has each time it wakes. One fetch therefore opens one segment file however many
+ * appends wake it before it can be answered, and the descriptor it holds is closed once: by the
+ * connection that sent the answer it left with, or by {@link #fetch} itself on every other way out.
  */
 final class Partition implements Closeable {
 
     /** No high-water mark has been read yet, so the first pass through a fetch always reads records. */
     private static final long NOTHING_READ_YET = -1L;
+
+    /** What a fetch that has not opened a segment file is holding: no file, no descriptor, no bytes. */
+    private static final RecordRange NOTHING_HELD = RecordRange.empty();
 
     private final String topic;
     private final int partition;
@@ -113,6 +124,18 @@ final class Partition implements Closeable {
     private Runnable flushLockAcquired = () -> {
     };
 
+    /**
+     * The third test seam. It is told about each segment file this partition's log opens to send a
+     * range, and is handed the descriptor that was opened — the only way a test can say afterwards
+     * whether that descriptor was closed, since a leaked one leaves no trace anywhere else in this
+     * process. The seam it forwards is the log's own, which is package-private on {@link SegmentedLog}
+     * and deliberately not on {@link Log}: {@link #open} is where the two are joined. Production leaves
+     * it doing nothing.
+     */
+    // guarded by: lock, which is held by every fetch that opens a file and by the installer below
+    private Consumer<FileChannel> segmentFileOpened = descriptor -> {
+    };
+
     private Partition(String topic, int partition, BrokerConfig config, TimeSource timeSource, Log log,
                       LogStatistics logStatistics) {
         this.topic = topic;
@@ -141,7 +164,11 @@ final class Partition implements Closeable {
     static Partition open(BrokerConfig config, String topic, int partition, TimeSource timeSource) {
         SegmentedLog log = SegmentedLog.open(config.dataDirectory(), topic, partition, timeSource,
                 config.logConfig());
-        return new Partition(topic, partition, config, timeSource, log, log);
+        Partition opened = new Partition(topic, partition, config, timeSource, log, log);
+        // The log's own seam is forwarded to this partition's, because the log this partition holds is
+        // a Log and that seam is not on that interface. See segmentFileOpened.
+        log.onRangeOpened(descriptor -> opened.segmentFileOpened.accept(descriptor));
+        return opened;
     }
 
     String topic() {
@@ -232,6 +259,11 @@ final class Partition implements Closeable {
         int servedMinBytes = clampedMinBytes(minBytes, servedMaxBytes);
         int servedMaxWaitMs = clampedWaitMs(maxWaitMs, maxFetchWaitMs);
 
+        // The one segment file this fetch opens, from the wakeup that first finds records until the
+        // answer that carries it away. Every way out of the loop below either hands it to that answer —
+        // and holds nothing afterwards — or leaves it here for the close in the finally, so it is
+        // closed once on all of them.
+        RecordRange held = NOTHING_HELD;
         lock.lock();
         try {
             // Absolute, and computed once: every wait below is for what is left of this instant, so a
@@ -243,14 +275,17 @@ final class Partition implements Closeable {
                 long remainingMillis = deadlineMillis - timeSource.currentTimeMillis();
                 boolean answerNow = remainingMillis <= 0 || stopped;
                 if (answerNow || highWaterMark != lastReadHighWaterMark) {
-                    FetchedRecords records = readable(fetchOffset, highWaterMark, servedMaxBytes);
+                    FetchedRecords records = readable(fetchOffset, highWaterMark, servedMaxBytes, held);
                     if (answerNow || records.recordBytes() >= servedMinBytes) {
+                        held = NOTHING_HELD;
                         return records;
                     }
-                    // Not enough to answer with yet, so whatever it was holding goes back before this
-                    // fetch waits again: a channel kept across a wait is a descriptor held for as long
-                    // as somebody's long poll.
-                    records.close();
+                    // Not enough to answer with yet, so the file stays open across the wait: the next
+                    // wakeup asks for the range again through this descriptor rather than opening the
+                    // segment a second time. What that costs is one descriptor per fetch that is
+                    // waiting, which is bounded by the connection cap like everything else a connection
+                    // holds.
+                    held = heldBy(records);
                     lastReadHighWaterMark = highWaterMark;
                 }
 
@@ -263,11 +298,18 @@ final class Partition implements Closeable {
                     // whoever set it, rather than swallowing it or failing a request that is fine.
                     Thread.currentThread().interrupt();
                     long interruptedAt = log.nextOffset();
-                    return readable(fetchOffset, interruptedAt, servedMaxBytes);
+                    FetchedRecords records = readable(fetchOffset, interruptedAt, servedMaxBytes, held);
+                    held = NOTHING_HELD;
+                    return records;
                 }
             }
         } finally {
             lock.unlock();
+            // Whatever this fetch was still holding on the way out, which is nothing at all when an
+            // answer took it: an answer that leaves is closed by the connection that sends it, and this
+            // is every other path — a range located and then refused, and the range a fetch is holding
+            // when the offset it is waiting on is deleted under it.
+            held.close();
         }
     }
 
@@ -282,20 +324,36 @@ final class Partition implements Closeable {
      * to delete a segment — so a range either exists before the unlink, in which case it reads the
      * inode to the end however many names are left pointing at it, or it is located after the unlink,
      * in which case the segment is already out of the log and the offset is refused with the one the
-     * log now starts at. There is no third case, and nothing is reference-counted to rule one out.
+     * log now starts at. There is no third case, and nothing is reference-counted to rule one out. A
+     * fetch that has waited holds a channel opened at one of those instants and asks again at another,
+     * which changes neither branch: the ask that meets a deleted segment is refused before a byte of it
+     * is served, and the descriptor the fetch was holding is closed as that refusal leaves.
      *
      * @param fetchOffset    the offset to read from
      * @param highWaterMark  the exclusive offset to stop before, which is where the log is now
      * @param servedMaxBytes the most bytes this fetch may be answered with
+     * @param held           the segment file this fetch already has open, or {@link #NOTHING_HELD}: the
+     *                       log answers through that descriptor when the range is in that file and
+     *                       opens the file the range is in when it is not, so nothing is served through
+     *                       a descriptor open on the wrong segment
      * @return the records, which the caller closes
      */
-    private FetchedRecords readable(long fetchOffset, long highWaterMark, int servedMaxBytes) {
+    private FetchedRecords readable(long fetchOffset, long highWaterMark, int servedMaxBytes, RecordRange held) {
         if (zeroCopyFetch) {
             return new FetchedRecords.Pinned(highWaterMark,
-                    log.openRange(fetchOffset, highWaterMark, servedMaxBytes));
+                    log.openRange(fetchOffset, highWaterMark, servedMaxBytes, held));
         }
         return new FetchedRecords.Copied(highWaterMark,
                 log.readRange(fetchOffset, highWaterMark, servedMaxBytes));
+    }
+
+    /**
+     * @param records what a fetch has just been offered
+     * @return the segment file that answer is holding open, which is the range itself when the fetch is
+     *         served out of the file and nothing at all when its records were copied into memory
+     */
+    private static RecordRange heldBy(FetchedRecords records) {
+        return records instanceof FetchedRecords.Pinned pinned ? pinned.records() : NOTHING_HELD;
     }
 
     /**
@@ -447,6 +505,21 @@ final class Partition implements Closeable {
         lock.lock();
         try {
             flushLockAcquired = seam;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Installs the test seam described on {@link #segmentFileOpened}.
+     *
+     * @param seam what to run with each descriptor a fetch on this partition opens a segment file with
+     */
+    void onSegmentFileOpened(Consumer<FileChannel> seam) {
+        Objects.requireNonNull(seam, "seam");
+        lock.lock();
+        try {
+            segmentFileOpened = seam;
         } finally {
             lock.unlock();
         }

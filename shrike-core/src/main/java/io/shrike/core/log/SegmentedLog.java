@@ -3,6 +3,7 @@ package io.shrike.core.log;
 import io.shrike.core.time.TimeSource;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -10,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -149,6 +151,18 @@ public final class SegmentedLog implements Log, LogStatistics {
     private Runnable forced = () -> {
     };
 
+    /**
+     * The second test seam, and the second field here production code never writes. It runs on the
+     * thread that opened a segment file to send a range, and is handed the descriptor it opened —
+     * which is the only way a test can say afterwards whether that descriptor was closed, since one
+     * that leaked leaves no trace anywhere else in this process. It runs for an open and never for a
+     * range served through a descriptor its fetch already held, so what it counts is exactly the
+     * {@code open(2)} calls the fetch path makes. Production leaves it doing nothing.
+     */
+    // confined to: the single thread that owns this log, which is also the thread a test installs it on
+    private Consumer<FileChannel> rangeOpened = descriptor -> {
+    };
+
     private SegmentedLog(String topic, int partition, Path directory, TimeSource timeSource, LogConfig config,
                          List<LogSegment> segments) {
         this.topic = topic;
@@ -283,12 +297,17 @@ public final class SegmentedLog implements Log, LogStatistics {
     }
 
     @Override
-    public RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes) {
+    public RecordRange openRange(long fetchOffset, long limitOffset, int maxBytes, RecordRange held) {
+        Objects.requireNonNull(held, "held");
         long endOffset = readableEndOffset(fetchOffset, limitOffset, maxBytes);
         if (endOffset == NOTHING_READABLE) {
+            held.close();
             return RecordRange.empty();
         }
-        return segmentHolding(fetchOffset).openRange(fetchOffset, endOffset, maxBytes);
+        // Which segment holds the offset is asked again on every call rather than remembered with the
+        // descriptor: a fetch at the high-water mark of a partition that then rolls is answered out of
+        // the segment the roll started, and it is this line that says so.
+        return segmentHolding(fetchOffset).openRange(fetchOffset, endOffset, maxBytes, held, rangeOpened);
     }
 
     /**
@@ -473,6 +492,22 @@ public final class SegmentedLog implements Log, LogStatistics {
      */
     void onForced(Runnable seam) {
         this.forced = Objects.requireNonNull(seam, "seam");
+    }
+
+    /**
+     * Installs the test seam described on {@link #rangeOpened}.
+     *
+     * <p>Public where {@link #onForced(Runnable)} is package-private, for the reason
+     * {@link DurableFile.StepObserver} is public: what it watches happens on the fetch path, and the
+     * fetch path is driven from another package. It is still a seam and nothing else — production
+     * installs nothing, and it is deliberately not on {@link Log}, because an interface carrying it
+     * would offer every implementation of a log a way to be watched from outside the package that owns
+     * it.
+     *
+     * @param seam what to run with each descriptor this log opens to send a range
+     */
+    public void onRangeOpened(Consumer<FileChannel> seam) {
+        this.rangeOpened = Objects.requireNonNull(seam, "seam");
     }
 
     /**
