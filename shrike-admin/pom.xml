@@ -18,6 +18,7 @@
   <properties>
     <spring-boot.version>4.1.0</spring-boot.version>
     <jackson-bom.version>3.1.5</jackson-bom.version>
+    <tomcat-embed.version>11.0.24</tomcat-embed.version>
   </properties>
 
   <!-- Order is the whole mechanism here. The Spring BOM is imported rather than inherited, and a
@@ -53,6 +54,35 @@
         <version>${jackson-bom.version}</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+
+      <!-- The embedded server, two patches ahead of the 11.0.22 the BOM below manages. That release
+           is affected by CVE-2026-55956 — security constraints declared for the default servlet had
+           any method or method omission in them ignored, Moderate, fixed in 11.0.23 — and by seven
+           Low advisories beside it, two of which were not fixed until 11.0.24. None of the eight is
+           reachable the way this facade is configured: it declares no security constraint, mounts no
+           RewriteValve, runs no cluster interceptor, and serves no example webapp. So this is the
+           same hygiene as the jackson pin above rather than a fix, and it restores ground the move
+           to Boot 4 gave up — the 10.1.57 pin it replaced was already past CVE-2026-55956, which the
+           10.1 line fixed in 10.1.56. 11.0.24 is the newest release of the 11.0 line; the one
+           advisory still open against it, CVE-2026-66299, is fixed in an unreleased 11.0.25 and is a
+           defect in the WebSocket chat example, which is part of the examples web application and
+           ships in no tomcat-embed artifact. All three artifacts carry one version because a mixed
+           set is a combination Tomcat never built or tested. -->
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-core</artifactId>
+        <version>${tomcat-embed.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-el</artifactId>
+        <version>${tomcat-embed.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-websocket</artifactId>
+        <version>${tomcat-embed.version}</version>
       </dependency>
 
       <!-- Imported here rather than inherited from spring-boot-starter-parent so the
