@@ -237,6 +237,32 @@
                 </configuration>
               </execution>
 
+              <!-- The same again on a heap small enough to change what the mebibyte the buffered path
+                   allocates per fetch costs: at the default heap G1's regions are large enough for that
+                   array to be an ordinary allocation, and at 512 MiB they are not. The JVM argument is
+                   recorded in the result file, which is the only reason it is allowed to be here. -->
+              <execution>
+                <id>fetch-allocation-small-heap</id>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <arguments>
+                    <argument>-classpath</argument>
+                    <classpath/>
+                    <argument>org.openjdk.jmh.Main</argument>
+                    <argument>io.shrike.core.bench.FetchPathBenchmark</argument>
+                    <argument>-prof</argument>
+                    <argument>gc</argument>
+                    <argument>-jvmArgsAppend</argument>
+                    <argument>-Xmx512m</argument>
+                    <argument>-rf</argument>
+                    <argument>json</argument>
+                    <argument>-rff</argument>
+                    <argument>${bench.results.directory}/v1.6-fetch-allocation-small-heap.json</argument>
+                  </arguments>
+                </configuration>
+              </execution>
             </executions>
           </plugin>
         </plugins>
