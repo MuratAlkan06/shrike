@@ -9,6 +9,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
@@ -134,12 +135,24 @@ final class WireClient implements AutoCloseable {
 
     /**
      * @return whether the broker closed this connection without sending a single byte, which is what a
-     *         frame it could not believe earns
-     * @throws IOException if the read fails for any other reason
+     *         frame it could not believe earns. A clean end of stream and a connection reset both count:
+     *         when the broker closes a connection whose client had sent bytes it had not yet read — a
+     *         reaped stall being the case that matters — those unread bytes make the close an abortive
+     *         one, so the peer sees an RST rather than a FIN, and neither carries a reply. This is the
+     *         same reading {@code BrokerWriteTimeoutTest.socketEndsBefore} takes of a reset from the
+     *         other side of the connection.
+     * @throws IOException if the read fails for any reason other than the peer resetting the connection
      */
     boolean isClosedWithNoReply() throws IOException {
         ByteBuffer oneByte = ByteBuffer.allocate(1);
-        return socket.read(oneByte) < 0;
+        try {
+            return socket.read(oneByte) < 0;
+        } catch (SocketException connectionReset) {
+            // An abortive close is still a close with no reply. The bytes this client sent and the broker
+            // reaped before reading are what turn the FIN into an RST; no answer byte was ever delivered,
+            // which is the whole of what this asks, so a reset is an affirmative answer and not an error.
+            return true;
+        }
     }
 
     @Override
