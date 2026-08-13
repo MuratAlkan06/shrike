@@ -47,6 +47,23 @@ jobs:
             exit 1
           fi
 
+  # The image is built and nothing else: it is not run, it is not pushed, and no registry credential
+  # is needed to prove what this job proves — that the Dockerfile still describes a build that works.
+  # Its own build stage runs a full uncached `mvn package` inside, which is why it is time-boxed to
+  # the same twenty minutes the reactor build gets rather than to a minute or two.
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Build the broker image
+        run: docker build -t shrike:ci .
+
   docs-gate:
     name: Check documentation gates
     runs-on: ubuntu-latest

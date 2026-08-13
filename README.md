@@ -359,6 +359,8 @@ The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a h
 
 That published port is an ordinary broker port, which the client code in the quickstart talks to unchanged. The admin facade is not in the image: it is an HTTP server of its own, and it runs beside the container.
 
+CI builds this image on every push and every pull request — built and nothing else: not run, not pushed, no registry credential — so a Dockerfile that has stopped describing a working build fails there rather than the next time somebody tries it by hand.
+
 ## Claims
 
 A claim may only be added in the same commit as the test that proves it. CI checks that every Evidence cell below points at something that exists.
@@ -540,3 +542,4 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A connection may hold a place under the facade's connection cap for ten seconds without asking anything, rather than Tomcat's default minute, and the container is running with that number | `AdminFacadeIT#boundsHowLongAConnectionMayHoldAPlaceUnderTheCapWithoutAskingAnything` | 1.4 |
 | Every answer carries the two headers that say its body is not to be sniffed and not to be framed: one this facade served, one it refused, and one the container refused before the facade was asked | `AdminFacadeIT#carriesItsSecurityHeadersOnAnAnswerOnAFailureAndOnAPathTheContainerRefuses` | 1.4 |
 | Something that is not this broker answering on the broker's port is answered 502 over HTTP, with none of what it sent reaching the caller | `AdminFacadeIT#answersBadGatewayWhenSomethingOnTheBrokersPortAnswersWithBytesThatAreNotAResponse` | 1.4 |
+| The container image is built by CI on every push and every pull request, so the Dockerfile cannot rot between the times somebody builds it by hand | `.github/workflows/ci.yml` | 1.4 |
