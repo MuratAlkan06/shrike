@@ -104,7 +104,7 @@
   <!-- The benchmarks are compiled by every build and run by none of it. `mvn verify` — which is what
        CI runs — never activates this profile, so a benchmark cannot make the build slow or flaky,
        and it still cannot rot: it is test-compiled like every other class under src/test/java.
-       Running the suite is four commands, one per execution below, and they are the commands the
+       Running the suite is five commands, one per execution below, and they are the commands the
        README documents. Each carries its own JMH arguments and its own result file, so what produced
        a published number is in this file rather than in somebody's shell history. -->
   <profiles>
