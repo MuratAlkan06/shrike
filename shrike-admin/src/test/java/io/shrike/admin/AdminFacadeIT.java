@@ -270,6 +270,26 @@ class AdminFacadeIT {
     }
 
     /**
+     * The 502 says the far end is wrong rather than absent, and the far end that produces one is
+     * something other than this broker listening on the broker's port. The stub is exactly that: it
+     * answers the describe with the first line of an HTTP response, whose four leading bytes read as a
+     * frame length of 1 213 486 160 — past any length this client will believe, so nothing is sized to
+     * it and the connection is closed. A stub is the only way to reach this answer from outside, since
+     * the exception behind it cannot be constructed from this package.
+     */
+    @Test
+    void answersBadGatewayWhenSomethingOnTheBrokersPortAnswersWithBytesThatAreNotAResponse() throws Exception {
+        try (ScriptedServer notABroker = ScriptedServer.start("not-a-broker",
+                socket -> socket.getOutputStream().write("HTTP/1.1 200 OK\r\n\r\n".getBytes(UTF_8)))) {
+            startFacade(notABroker.port());
+
+            HttpResponse<String> response = get("/api/v1/topics");
+
+            assertPlainError(response, 502, "broker answer could not be read");
+        }
+    }
+
+    /**
      * The one test in this build that waits on real time, and it waits only to bound it. A broker that
      * accepts a connection and then says nothing is the case a read timeout exists for, and the bound
      * asserted here is deliberately loose: what it rules out is the client library's thirty-second
