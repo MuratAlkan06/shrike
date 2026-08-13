@@ -2,7 +2,7 @@ package io.shrike.admin;
 
 import jakarta.servlet.RequestDispatcher;
 import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.boot.web.servlet.error.ErrorController;
+import org.springframework.boot.webmvc.error.ErrorController;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
@@ -34,7 +34,7 @@ import org.springframework.web.bind.annotation.ResponseBody;
  * is arranged.
  */
 @Controller
-@RequestMapping("${server.error.path:/error}")
+@RequestMapping("${spring.web.error.path:/error}")
 public class ErrorEndpoint implements ErrorController {
 
     /**

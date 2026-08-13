@@ -72,7 +72,7 @@ try (ShrikeConsumer consumer = ShrikeConsumer.open(config)) {
 **Read it back over HTTP.** The admin facade is not in the image. It runs beside the broker and already points at `127.0.0.1:9750`:
 
 ```
-java -jar shrike-admin/target/shrike-admin-1.1.0.jar
+java -jar shrike-admin/target/shrike-admin-1.7.0.jar
 curl -s localhost:8080/api/v1/topics
 curl -s localhost:8080/api/v1/topics/orders
 curl -s localhost:8080/api/v1/groups/billing/lag
