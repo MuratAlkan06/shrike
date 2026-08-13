@@ -254,7 +254,7 @@ mvn -pl shrike-core -P bench test-compile exec:exec@fetch-allocation-small-heap
 
 They are run one at a time, with nothing else on the machine, and they take about twenty minutes together. `test-compile` is part of each command rather than a convenience: it is what runs the toolchain that puts JDK 21 in front of `java`. A command without it runs the harness on whichever JVM launched Maven — a JDK 25 on this machine, which the reactor deliberately does not build with. That happened once while this slice was being measured, and the run was thrown away rather than published, which is the argument for recording the JVM in the result file as loudly as JMH does.
 
-**Everything below is a measurement of one machine at one commit.** The harness is commit `HARNESS_COMMIT_PLACEHOLDER`. That word is a placeholder rather than a commit, and it is deliberately not a hexadecimal one: it has to be replaced with the squash commit this work merges as, or with the `v1.6.0` tag, and until it is, this section cites no commit at all. The machine is an Apple M4 Pro with 14 cores and 48 GiB of memory running macOS 15.6.1 (build 24G90), and the JVM is the one the toolchain selects:
+**Everything below is a measurement of one machine at one commit.** The harness is the commit released as `v1.6.0`; a fresh clone resolves that tag to the exact commit these benchmarks were run at. The machine is an Apple M4 Pro with 14 cores and 48 GiB of memory running macOS 15.6.1 (build 24G90), and the JVM is the one the toolchain selects:
 
 ```
 openjdk version "21.0.7" 2025-04-15 LTS
