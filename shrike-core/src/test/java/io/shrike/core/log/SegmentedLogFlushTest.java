@@ -114,6 +114,49 @@ class SegmentedLogFlushTest {
     }
 
     @Test
+    void holdsUnforcedBytesFromTheAppendThatMadeThemUntilTheFlushThatForcesThem() {
+        try (SegmentedLog log = open(intervalOf(ONE_HUNDRED_MS, LogConfig.DEFAULT_FLUSH_INTERVAL_BYTES))) {
+            boolean beforeAnyRecord = log.hasUnforcedBytes();
+            log.append(recordNumber(0));
+            log.flushIfDue(FIRST_TIMESTAMP_MS);
+            log.onForced(forces::incrementAndGet);
+
+            boolean afterThatFlush = log.hasUnforcedBytes();
+            log.append(recordNumber(1));
+            boolean afterTheNextAppend = log.hasUnforcedBytes();
+            log.flushIfDue(FIRST_TIMESTAMP_MS + ONE_HUNDRED_MS - 1L);
+            boolean afterAnAskThatWasNotDue = log.hasUnforcedBytes();
+            log.flushIfDue(FIRST_TIMESTAMP_MS + ONE_HUNDRED_MS);
+
+            assertFalse(beforeAnyRecord, "a log that has taken no record holds nothing anybody could force");
+            assertFalse(afterThatFlush, "and neither does one whose records are already on the device");
+            assertTrue(afterTheNextAppend, "the append made bytes only the operating system has");
+            assertTrue(afterAnAskThatWasNotDue, "and an ask before the interval left them exactly where they were");
+            assertFalse(log.hasUnforcedBytes(), "the flush that was due is what puts them on the device");
+            assertEquals(1, forces.get(), "which is the one force this whole test asked for");
+        }
+    }
+
+    @Test
+    void holdsNothingUnforcedAfterAnAppendThatForcedOnItsOwn() {
+        long twoRecordsOfBytes = 2L * RECORD_BYTES;
+
+        try (SegmentedLog log = open(intervalOf(ONE_HOUR_MS, twoRecordsOfBytes))) {
+            log.onForced(forces::incrementAndGet);
+
+            log.append(recordNumber(0));
+            boolean underTheVolumeBound = log.hasUnforcedBytes();
+            log.append(recordNumber(1));
+
+            assertTrue(underTheVolumeBound, "one record is under flush.interval.bytes, so it waits for a flush");
+            assertFalse(log.hasUnforcedBytes(),
+                    "the append that reached the bound forced before it returned, so there is nothing left to find");
+            assertEquals(1, forces.get());
+            assertFalse(log.flushIfDue(nowMillis.get() + ONE_HOUR_MS), "which is what the interval then answers");
+        }
+    }
+
+    @Test
     void forcesOnceFlushIntervalBytesHaveBeenAppendedWithoutTheClockMoving() {
         long threeRecordsOfBytes = (long) THREE_RECORDS * RECORD_BYTES;
 

@@ -57,7 +57,10 @@ import java.util.regex.Pattern;
  *
  * <p>A log has a single writer. Nothing here is safe to call from two threads at once — retention and
  * flushing included: whatever owns a log is what has to call {@code deleteRetiredSegments} and
- * {@code flushIfDue} on it, under whatever guards an append and a read already take.
+ * {@code flushIfDue} on it, under whatever guards an append and a read already take. There is one
+ * exception, and it is deliberate: {@link #hasUnforcedBytes()} reads a single volatile number and may
+ * be asked from any thread, which is what lets a flush sweep pass over a log with nothing to force
+ * without taking the guard that log is held under.
  */
 public final class SegmentedLog implements Log, LogStatistics {
 
@@ -112,11 +115,15 @@ public final class SegmentedLog implements Log, LogStatistics {
     /**
      * Bytes appended since the last force this log made: a flush, or the seal a roll makes.
      * {@link #close()} forces too and leaves this alone, because nothing appends after a close. It is
-     * the volume half of {@code flush.mode} and the reason {@link #flushIfDue(long)} can tell "nothing
-     * to do" from "not time yet".
+     * the volume half of {@code flush.mode}, the reason {@link #flushIfDue(long)} can tell "nothing to
+     * do" from "not time yet", and — through {@link #hasUnforcedBytes()} — the reason a flush sweep can
+     * tell those apart before it takes anything.
      */
-    // confined to: the single thread that owns this log
-    private long unflushedBytes;
+    // written by: the single thread that owns this log, under whatever guard that owner appends under.
+    // volatile because it is read outside that guard and by a thread that does not own this log: a
+    // sweep asks hasUnforcedBytes() before it takes the partition lock, and one that could see a stale
+    // zero would leave those records unforced until some later append moved the number again.
+    private volatile long unflushedBytes;
 
     /**
      * The epoch millisecond {@code flush.interval.ms} is measured from, or {@link #NEVER_FLUSHED}.
@@ -334,6 +341,25 @@ public final class SegmentedLog implements Log, LogStatistics {
      * @return whether anything was forced
      * @throws ShrikeIOException if the force fails
      */
+    /**
+     * Whether this log holds records it has not yet put on the device, answered from one volatile read
+     * and therefore answerable without the guard everything else here is called under.
+     *
+     * <p>Every place that moves {@link #unflushedBytes} is a place that already holds that guard — the
+     * append that counts a frame, the append that forces because {@code flush.interval.bytes} was
+     * reached, the seal a roll makes, and {@link #flushIfDue(long)} itself — so what a sweep reads here
+     * is a number some thread published under the lock rather than one being assembled. It can be read
+     * an instant before an append makes it stale, which is what the one-sided promise on {@link Log} is
+     * about: the records that append wrote are found by the next ask, and no ask ever misses records
+     * that were already there when it was made.
+     *
+     * @return whether anything is waiting to be forced
+     */
+    @Override
+    public boolean hasUnforcedBytes() {
+        return unflushedBytes != 0L;
+    }
+
     @Override
     public boolean flushIfDue(long nowMillis) {
         if (unflushedBytes == 0L) {

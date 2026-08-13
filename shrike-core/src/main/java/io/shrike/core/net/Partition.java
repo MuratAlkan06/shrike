@@ -26,6 +26,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * same reason: it <em>is</em> the log's next offset, read under the lock that the appending thread
  * held when it moved it, so there is no second copy of it to drift.
  *
+ * <p>Exactly one question is asked without the lock, and it is the one whose answer is almost always
+ * "no": whether this partition holds records nobody has forced yet. {@link #flushIfDue(long)} says why
+ * a sweep may ask it that way and what being one sweep late costs.
+ *
  * <p>A fetch that has fewer bytes than it asked for checks what it has and registers as a waiter
  * <em>under the same lock</em> that a produce holds while it appends and signals. That is what makes
  * a lost wakeup impossible: an append landing "just after" the check cannot have landed, because it
@@ -70,8 +74,10 @@ final class Partition implements Closeable {
     /**
      * This partition's storage. Every call on it — append, read, next offset — is made under
      * {@link #lock}, which is what turns a log with a single writer into one many connections share.
+     * The one exception is {@link Log#hasUnforcedBytes()}, which is a volatile read and is deliberately
+     * asked without the lock; {@link #flushIfDue(long)} is the only place that does it and says why.
      */
-    // guarded by: lock
+    // guarded by: lock, except for the one call named above
     private final Log log;
 
     /**
@@ -88,13 +94,23 @@ final class Partition implements Closeable {
     private boolean stopped;
 
     /**
-     * A test seam, and the only field here that production code never writes. It fires under
+     * A test seam, and one of the two fields here that production code never writes. It fires under
      * {@link #lock} at the instant a fetch has decided to wait and has not released the lock yet,
      * which is the window a lost wakeup would have to live in. A test uses it to land an append in
      * exactly that window; production leaves it doing nothing.
      */
     // guarded by: lock
     private Runnable waiterRegistered = () -> {
+    };
+
+    /**
+     * The second test seam. It fires under {@link #lock} at the instant {@link #flushIfDue(long)} has
+     * taken it, which is the only thing a flush sweep does to a partition that a test can count — a
+     * sweep that passes a partition over leaves nothing else behind, and an fsync that did not happen
+     * is invisible. Production leaves it doing nothing.
+     */
+    // guarded by: lock
+    private Runnable flushLockAcquired = () -> {
     };
 
     private Partition(String topic, int partition, BrokerConfig config, TimeSource timeSource, Log log,
@@ -348,13 +364,28 @@ final class Partition implements Closeable {
      * It does not delay a waiting fetch: {@link Condition#await(long, TimeUnit)} releases this lock, so
      * a long poll holds nothing while it waits.
      *
+     * <p>A partition with nothing to force is passed over before any of that, on
+     * {@link Log#hasUnforcedBytes()} alone. A sweep asks every partition of every topic ten times a
+     * second by default, and on all but the ones being written to the answer is "nothing to do" — so
+     * the lock a sweep used to take to be told that was a lock taken against the connection threads
+     * appending to and reading from that partition, for an answer a volatile read already had. What the
+     * lock-free check gives up is a partition that becomes dirty in the instant after it was passed
+     * over, which the next sweep finds: the flag is set by the append that made those records and is
+     * cleared only by a force, so being late by one sweep is the whole of it and no partition can be
+     * skipped twice for the same records.
+     *
      * @param nowMillis the epoch millisecond the interval is measured against
      * @return whether anything was forced
      * @throws io.shrike.core.log.ShrikeIOException if the force fails
      */
     boolean flushIfDue(long nowMillis) {
+        if (!log.hasUnforcedBytes()) {
+            return false;
+        }
+
         lock.lock();
         try {
+            flushLockAcquired.run();
             return log.flushIfDue(nowMillis);
         } finally {
             lock.unlock();
@@ -401,6 +432,21 @@ final class Partition implements Closeable {
         lock.lock();
         try {
             waiterRegistered = seam;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Installs the test seam described on {@link #flushLockAcquired}.
+     *
+     * @param seam what to run when a flush takes this partition's lock
+     */
+    void onFlushLockAcquired(Runnable seam) {
+        Objects.requireNonNull(seam, "seam");
+        lock.lock();
+        try {
+            flushLockAcquired = seam;
         } finally {
             lock.unlock();
         }
