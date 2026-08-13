@@ -16,14 +16,18 @@ import java.util.concurrent.CountDownLatch;
  * <p>It accepts exactly one connection, runs the script over it, and then holds the socket open until
  * the test closes this server — a socket that closed itself would look like a broker hanging up,
  * which is a different case with a different exception.
+ *
+ * <p>This module's test classes are attached as a test-jar, so {@code shrike-admin} drives the
+ * facade's own answers to a broker that will not answer through this class. What another module needs
+ * — start a server, learn its port, close it — is public, and the rest is not.
  */
-final class ScriptedServer implements AutoCloseable {
+public final class ScriptedServer implements AutoCloseable {
 
     /** How long the accepting thread gets to notice that this server is closing. */
     private static final long STOP_TIMEOUT_SECONDS = 15L;
 
     /** What one connection is answered with. */
-    interface Script {
+    public interface Script {
 
         void answer(Socket socket) throws IOException;
     }
@@ -49,11 +53,19 @@ final class ScriptedServer implements AutoCloseable {
      * @return the started server, listening on a port the operating system chose
      * @throws IOException if the listening socket cannot be opened
      */
-    static ScriptedServer start(String name, Script script) throws IOException {
+    public static ScriptedServer start(String name, Script script) throws IOException {
         ServerSocket listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
         ScriptedServer server = new ScriptedServer(listener, name, script);
         server.thread.start();
         return server;
+    }
+
+    /**
+     * @return the loopback port this server is listening on, for a caller that is configured with a
+     *         port rather than with a {@link ClientConfig}
+     */
+    public int port() {
+        return listener.getLocalPort();
     }
 
     /**

@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.shrike</groupId>
     <artifactId>shrike-parent</artifactId>
-    <version>1.3.1</version>
+    <version>1.4.0</version>
   </parent>
 
   <artifactId>shrike-clients</artifactId>

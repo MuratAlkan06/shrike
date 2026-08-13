@@ -42,6 +42,15 @@ docker build -t shrike:1.1.0 .
 docker run -d --name shrike -p 127.0.0.1:9750:9750 -v shrike-data:/var/lib/shrike shrike:1.1.0
 ```
 
+**A named volume needs nothing; a bind mount needs one command first.** The image creates `/var/lib/shrike` and hands it to uid 10001 before declaring the volume, and docker seeds a fresh named volume from the image's own directory, ownership included — which is why the `-v shrike-data:/var/lib/shrike` above simply works. A bind mount is the host's directory exactly as it stands, so `-v /srv/shrike:/var/lib/shrike` on a directory root owns is a directory the broker's user cannot write to. Give it to that uid on the host rather than giving the container root:
+
+```
+sudo install -d -o 10001 -g 10001 /srv/shrike
+docker run -d --name shrike -p 127.0.0.1:9750:9750 -v /srv/shrike:/var/lib/shrike shrike:1.1.0
+```
+
+`--user 0` would also make the broker able to write there, and it throws away the non-root user the image exists to run as.
+
 **The address in front of that port is not decoration.** The unqualified `-p 9750:9750` publishes on every interface the host has, and this broker has no authentication, so that form hands an unauthenticated broker to whatever can reach the machine. It is also not something a host firewall necessarily catches: on Linux, Docker publishes a port by writing DNAT rules that are traversed before the `INPUT` chain, so a firewall written as `INPUT` rules is a firewall the published port goes around. `127.0.0.1:9750:9750` publishes to the host's loopback and nowhere else, which is what the rest of this quickstart connects to.
 
 **Produce and consume.** A published port is an ordinary broker port, so this is the same whether the broker is in a container or not. With `shrike-core` and `shrike-clients` on the classpath — both of which depend on the JDK alone:
@@ -120,7 +129,7 @@ It binds `127.0.0.1:8080`, and what those three answer with is under [Admin endp
 
 The dotted names in the left-hand column are what the javadoc on those two records calls each field, and what the prose below calls them; the middle column is each of those names under the rule above. Three more numbers sit on `BrokerConfig` beside them with no dotted name of their own, and the same rule reaches them from their fields: `connectionCap`, 64, from `SHRIKE_CONNECTION_CAP`, `maxTotalPartitions`, 1024, from `SHRIKE_MAX_TOTAL_PARTITIONS`, and `maxTotalGroups`, 1024, from `SHRIKE_MAX_TOTAL_GROUPS`.
 
-`shrike-admin` has a settable surface of its own, because it is a Spring application: `server.address`, `server.port`, `shrike.broker.host`, and `shrike.broker.port` are set the way any Spring Boot property is, and they are described under [Admin endpoints](#admin-endpoints).
+`shrike-admin` has a settable surface of its own, because it is a Spring application: `server.address`, `server.port`, `shrike.broker.host`, `shrike.broker.port`, and `shrike.broker.read-timeout-millis` are set the way any Spring Boot property is, and they are described under [Admin endpoints](#admin-endpoints).
 
 ## Architecture
 
@@ -295,6 +304,8 @@ And `per-record` is per record, not per produce request. The row above is one `a
 
 `shrike-admin` answers three GETs in JSON by asking a running broker the same questions any other client may ask it. It reads and never writes, it opens no file the broker owns, and it keeps nothing between requests: each call opens a connection, gets its answer, and closes it. It serves `127.0.0.1:8080` and reads a broker at `127.0.0.1:9750` unless `server.address`, `server.port`, `shrike.broker.host`, and `shrike.broker.port` say otherwise.
 
+**Two bounds keep a broker that is not answering from becoming a facade that is not answering.** `shrike.broker.read-timeout-millis` is `5000`: every question this facade asks is a describe the broker answers out of memory, so five seconds is generous for one and short enough that sixteen threads are not each spending the client library's thirty-second default on a broker that accepts connections and then says nothing. `server.tomcat.connection-timeout` is `10s`, beside the `server.tomcat.max-connections=64` it protects, because sixty-four sockets that connect and stay silent otherwise hold every place under that cap until Tomcat's default minute reclaims them.
+
 **What it does not check.** This facade has no authentication and no transport security — TLS or auth is as much a non-goal here as it is on the broker's own port — so anything that can reach its port can list every topic the broker holds, read each partition's offsets, segment count, and bytes, and ask how far any group it names has got through the partitions that group has committed. The `127.0.0.1` above is the default and the whole of what keeps that on one machine: `server.address` is the only way this facade comes to listen anywhere else, widening it is the same deliberate act as widening the broker's own bind address, and the host it is widened onto is one trusted with the broker it reads.
 
 The bodies below came off a broker holding two topics — `orders` with three partitions and `shipments` with two — carrying five records in `orders-0`, two in `orders-1`, three in `shipments-0`, and a group `watchers` that had committed 2, 2, and 1 against them. `AdminFacadeIT` pins the same three bodies whole, against a broker in a process of its own.
@@ -317,17 +328,20 @@ The bodies below came off a broker holding two topics — `orders` with three pa
 {"group":"watchers","partitions":[{"topic":"orders","partition":0,"committedOffset":2,"highWaterMark":5,"lag":3},{"topic":"orders","partition":1,"committedOffset":2,"highWaterMark":2,"lag":0},{"topic":"shipments","partition":0,"committedOffset":1,"highWaterMark":3,"lag":2}]}
 ```
 
-**Every failure this facade answers is one shape:** `{"error":"<one sentence>"}`, and nothing else — `/error` included, and so are the `/WEB-INF` and `/META-INF` prefixes Tomcat refuses inside the container, both of which the framework would otherwise answer in a shape of its own carrying a timestamp and the caller's path. No stack trace, no exception class name, and no path on anybody's disk reaches a caller; what actually failed is logged by the facade, where an operator can read it — with its cause when the failure belongs to the facade or to the broker, and as one line without one when it belongs to the caller, because a log line a stranger can ask for is a log line a stranger can ask for a million of.
+**Every failure this facade answers is one shape:** `{"error":"<one sentence>"}`, and nothing else — `/error` included, and so are the `/WEB-INF` and `/META-INF` prefixes Tomcat refuses inside the container, both of which the framework would otherwise answer in a shape of its own carrying a timestamp and the caller's path. No stack trace, no exception class name, and no path on anybody's disk reaches a caller; what actually failed is logged by the facade, where an operator can read it.
+
+**How much of it is written down depends on who can ask for it again**, because a log line a stranger can ask for is a log line a stranger can ask for a million of. A 4xx is one DEBUG line with no exception behind it. A 5xx keeps its level and its whole stack — except the one a caller can drive, a broker that is not listening, which is one ERROR line naming the broker's address and what came back from it rather than fifty frames per request while the broker is down. The framework's own line per unmapped path is pinned above the level it is written at for the same reason: this facade already answers that request, quietly, in the shape above.
 
 A request Tomcat refuses **before** the servlet stack sees it — a broken percent-escape in the path, a request line longer than the header buffer — never reaches any of that. Those are answered with the status code and an empty body, never a page.
 
 | Status | When | The sentence |
 |---|---|---|
-| 400 | a topic name or group id the protocol will not carry, refused before anything is asked of the broker | `topic must be 1 to 200 characters of [A-Za-z0-9._-] and neither "." nor "..", but was "orders!"` |
+| 400 | a topic name or group id the protocol will not carry, refused before a connection to the broker is opened | `topic must be 1 to 200 characters of [A-Za-z0-9._-] and neither "." nor "..", but was "orders!"` |
 | 404 | a topic the broker does not hold | `no such topic` |
 | 404 | a group that has committed nothing, which is also what a group this broker has never heard of looks like | `group has no committed offsets: nobody` |
 | 404 | a path this facade does not serve | `no such endpoint` |
 | 405 | a method it does not answer, every endpoint here being a read | `this facade answers GET only` |
+| 406 | an `Accept` header naming no representation this facade produces, which is JSON and nothing else | `request refused` |
 | 502 | something answered on the broker's port with bytes this client will not believe | `broker answer could not be read` |
 | 503 | a broker that cannot be reached, or does not answer in time | `broker unreachable` |
 | 4xx | any other refusal the container settled before a handler was asked | `request refused` |
@@ -335,13 +349,17 @@ A request Tomcat refuses **before** the servlet stack sees it — a broken perce
 
 The 400 sentence names the field the name arrived in — `topic` on a topic path, `groupId` on a group path — and quotes the caller's own input back, cut down when it is long. That quotation is the only detail any error body here carries, and it is the caller's, not the broker's.
 
+**Every answer carries two headers, whatever its status.** `X-Content-Type-Options: nosniff` says to take the `application/json` this facade declared rather than to guess a better type out of the bytes, and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` says that an answer treated as a document anyway may load nothing at all and be framed by nobody. Both are the empty policy rather than a tuned one, because there is no page, script, or stylesheet here to make an exception for. The only answer without them is the one that leaves before any filter of this facade's runs: a request Tomcat refuses while it is still parsing bytes, which is a status line and no body to sniff.
+
 ## The container image
 
 The image holds a Temurin 21 JRE and one jar, runs as a user that is not root, and keeps everything under `/var/lib/shrike`, which is where its volume goes. The two commands that build it and start it are in the [quickstart](#quickstart) above.
 
-The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a host port onto the container's own interface and never onto its loopback. The bare broker's default is the loopback address and stays that way: the image opts in, inside a network namespace of its own, and the port it can be reached on is the one its operator published. `SHRIKE_DATA_DIRECTORY` and `SHRIKE_PORT` are the other two the image sets, `SHRIKE_READY_FILE` is left at its default inside the volume, and `docker run -e` is how any of them — or any other variable in [Configuration](#configuration), none of which this image sets — is given a value. `docker stop` is a `SIGTERM`, which the broker answers by closing its logs. Its `HEALTHCHECK` opens a TCP connection to `SHRIKE_PORT` and closes it — no request, no api key, nothing appended — so `docker ps` says healthy when something is listening and says nothing about what it would answer.
+The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a host port onto the container's own interface and never onto its loopback. The bare broker's default is the loopback address and stays that way: the image opts in, inside a network namespace of its own, and the port it can be reached on is the one its operator published. `SHRIKE_DATA_DIRECTORY` and `SHRIKE_PORT` are the other two the image sets, `SHRIKE_READY_FILE` is left at its default inside the volume, and `docker run -e` is how any of them — or any other variable in [Configuration](#configuration), none of which this image sets — is given a value. `docker stop` is a `SIGTERM`, which the broker answers by closing its logs. Its `HEALTHCHECK` opens a TCP connection to the port the broker is on and closes it — no request, no api key, nothing appended — so `docker ps` says healthy when something is listening and says nothing about what it would answer. That port is `SHRIKE_PORT`, or `9750` when the variable is unset **or set to nothing at all**, which is the same reading the broker gives it: `docker run -e SHRIKE_PORT=` leaves the broker on its default, so the check has to land there too.
 
 That published port is an ordinary broker port, which the client code in the quickstart talks to unchanged. The admin facade is not in the image: it is an HTTP server of its own, and it runs beside the container.
+
+CI builds this image on every push and every pull request — built and nothing else: not run, not pushed, no registry credential — so a Dockerfile that has stopped describing a working build fails there rather than the next time somebody tries it by hand.
 
 ## Claims
 
@@ -453,7 +471,7 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | Asking the facade about a topic the broker does not hold is answered 404, with one plain sentence and no stack trace, exception name, or path | `AdminFacadeIT#answersNotFoundForATopicTheBrokerDoesNotHold` | 6 |
 | Asking the facade for the lag of a group that has committed nothing is answered 404, saying only what the broker can actually tell | `AdminFacadeIT#answersNotFoundForAGroupThatHasCommittedNothing` | 6 |
 | A facade pointed at a broker that is not listening answers 503 rather than an empty report | `AdminFacadeIT#answersServiceUnavailableWhenTheBrokerIsNotListening` | 6 |
-| A topic name the protocol will not carry is refused by the facade with 400 and the rule it broke, before anything is asked of the broker | `AdminFacadeIT#answersBadRequestForANameTheProtocolWillNotCarry` | 6 |
+| A topic name the protocol will not carry is refused by the facade with 400 and the rule it broke | `AdminFacadeIT#answersBadRequestForANameTheProtocolWillNotCarry` | 6 |
 | A path the facade does not serve is answered 404 in the same one-field JSON shape as every other failure, never the framework's default error body | `AdminFacadeIT#answersNotFoundWithoutDetailForAPathItDoesNotServe` | 6 |
 | `/error`, where the container forwards, is answered in the facade's own shape whether the caller will accept JSON or HTML, rather than the framework's error body or its HTML page | `AdminFacadeIT#answersTheContainersErrorPathInItsOwnShapeWhateverTheCallerWillAccept` | 6 |
 | A path Tomcat refuses inside the container, `/WEB-INF` and `/META-INF`, comes back in that same one-field shape, without the timestamp and path the framework's default body carries | `AdminFacadeIT#answersAPathTheContainerRefusesInTheSameShapeAsEveryOtherFailure` | 6 |
@@ -516,3 +534,12 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A topic whose create failed before its registry file was moved into place is forgotten: nothing on disk names it, no partition directory is left, and the create that comes after the failure is served in full | `TopicRegistryTest#forgetsATopicWhoseCreateFailedBeforeItsRegistryFileWasMovedIntoPlace` | 1.3 |
 | A topic whose create failed after its registry file was moved into place is kept, at the partition count that file lists, so a later create of that name is refused and a create of another topic rewrites the file without shrinking it | `TopicRegistryTest#keepsATopicWhoseCreateMovedItsRegistryFileIntoPlaceAndThenFailed` | 1.3 |
 | A create whose registry file landed and whose logs would not open is refused when it is repeated, rather than served over the listed topic and rewritten with a partition count of its own, so no partition directory is left listed by nothing | `TopicRegistryTest#refusesALaterCreateOfATopicWhoseRegistryFileLandedButWhoseLogsWouldNotOpen` | 1.3 |
+| A caller that will accept only a media type the facade does not produce is answered 406 in the one JSON shape, and it costs one quiet line rather than a stack trace per header | `AdminFacadeIT#answersNotAcceptableWithoutAStackWhenACallerWillTakeNoMediaTypeThisFacadeProduces` | 1.4 |
+| A burst of requests to a broker that is not listening is answered 503 each and written down as one line each, naming the broker that could not be reached and carrying no stack | `AdminFacadeIT#writesOneLineAndNoStackForEachOfABurstOfRequestsToABrokerThatIsNotListening` | 1.4 |
+| A path nobody serves is answered 404 without the framework writing a warning of its own for it, so log volume is not something a caller decides | `AdminFacadeIT#answersAPathNobodyServesWithoutTheFrameworkWritingAWarningPerRequest` | 1.4 |
+| A topic name or group id the protocol will not carry is refused 400 while nothing at all is listening on the broker's port, which is what says the name is judged before a connection is opened rather than inside one | `AdminFacadeIT#answersBadRequestForAnUnusableNameEvenWithNoBrokerToConnectTo` | 1.4 |
+| A broker that accepts a connection and then says nothing is given up on inside the facade's own describe-sized bound, which the failure it logs names, rather than the client library's thirty seconds | `AdminFacadeIT#givesUpOnABrokerThatAcceptsAConnectionAndThenSaysNothing` | 1.4 |
+| A connection may hold a place under the facade's connection cap for ten seconds without asking anything, rather than Tomcat's default minute, and the container is running with that number | `AdminFacadeIT#boundsHowLongAConnectionMayHoldAPlaceUnderTheCapWithoutAskingAnything` | 1.4 |
+| Every answer carries the two headers that say its body is not to be sniffed and not to be framed: one this facade served, one it refused, and one the container refused before the facade was asked | `AdminFacadeIT#carriesItsSecurityHeadersOnAnAnswerOnAFailureAndOnAPathTheContainerRefuses` | 1.4 |
+| Something that is not this broker answering on the broker's port is answered 502 over HTTP, with none of what it sent reaching the caller | `AdminFacadeIT#answersBadGatewayWhenSomethingOnTheBrokersPortAnswersWithBytesThatAreNotAResponse` | 1.4 |
+| The container image is built by CI on every push and every pull request, so the Dockerfile cannot rot between the times somebody builds it by hand | `.github/workflows/ci.yml` | 1.4 |

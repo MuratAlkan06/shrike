@@ -1,6 +1,7 @@
 package io.shrike.admin;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -9,6 +10,7 @@ import io.shrike.clients.Await;
 import io.shrike.clients.BrokerProcessMain;
 import io.shrike.clients.ClientConfig;
 import io.shrike.clients.JavaProcess;
+import io.shrike.clients.ScriptedServer;
 import io.shrike.clients.ShrikeConsumer;
 import io.shrike.clients.ShrikeProducer;
 import io.shrike.clients.ShrikeTopics;
@@ -26,13 +28,20 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
 import java.util.stream.Stream;
+import org.apache.catalina.startup.Tomcat;
+import org.apache.coyote.AbstractProtocol;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.web.context.WebServerApplicationContext;
+import org.springframework.boot.web.embedded.tomcat.TomcatWebServer;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.web.servlet.DispatcherServlet;
 
 /**
  * The facade against a real broker in a process of its own, over real HTTP.
@@ -60,6 +69,23 @@ class AdminFacadeIT {
 
     private static final int ORDERS_PARTITION_COUNT = 3;
     private static final int SHIPMENTS_PARTITION_COUNT = 2;
+
+    /** How many requests in a row count as a burst: enough that a line per request would show. */
+    private static final int BURST_REQUEST_COUNT = 5;
+
+    /** The bound this facade gives a broker to answer a describe, from {@code application.properties}. */
+    private static final int DESCRIBE_READ_TIMEOUT_MILLIS = 5_000;
+
+    /** How long a connection may hold a place under the connection cap without asking anything. */
+    private static final int CONNECTION_TIMEOUT_MILLIS = 10_000;
+
+    /**
+     * The upper bound on giving up on a broker that will not answer. It is neither the bound being
+     * tested nor near it: it sits between the five seconds this facade waits and the thirty a client
+     * waits by default, far enough from both that a loaded machine cannot move a passing run across
+     * it, and it fails only if this facade is waiting the client default again.
+     */
+    private static final long GIVING_UP_BOUND_MILLIS = 20_000L;
 
     @TempDir
     Path workingDirectory;
@@ -161,6 +187,26 @@ class AdminFacadeIT {
         assertNothingLeaked(response);
     }
 
+    /**
+     * With nothing listening on the broker's port, a connect can only end one way, so a 400 here is
+     * the whole proof that none was attempted: the name was judged first, by the rule the broker would
+     * have applied to it, and both endpoints judge it in the same place.
+     */
+    @Test
+    void answersBadRequestForAnUnusableNameEvenWithNoBrokerToConnectTo() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        HttpResponse<String> topic = get("/api/v1/topics/bad!name");
+        HttpResponse<String> group = get("/api/v1/groups/bad!name/lag");
+
+        assertEquals(400, topic.statusCode(), "a connect was attempted before the name was judged: " + topic.body());
+        assertEquals(400, group.statusCode(), "a connect was attempted before the name was judged: " + group.body());
+        assertTrue(topic.body().startsWith("{\"error\":\"topic must be 1 to 200 characters"), topic.body());
+        assertTrue(group.body().startsWith("{\"error\":\"groupId must be 1 to 200 characters"), group.body());
+        assertNothingLeaked(topic);
+        assertNothingLeaked(group);
+    }
+
     @Test
     void answersServiceUnavailableWhenTheBrokerIsNotListening() throws Exception {
         startFacade(aPortNothingIsListeningOn());
@@ -168,6 +214,126 @@ class AdminFacadeIT {
         HttpResponse<String> response = get("/api/v1/topics");
 
         assertPlainError(response, 503, "broker unreachable");
+    }
+
+    /**
+     * A caller that will take nothing this facade produces is asking for something rather than
+     * breaking something. Until this was mapped it fell through to the catch-all: 500, which is the
+     * wrong story, and a stack trace per header, which is the disk somebody else gets to fill that the
+     * 4xx paths were already fixed for.
+     */
+    @Test
+    void answersNotAcceptableWithoutAStackWhenACallerWillTakeNoMediaTypeThisFacadeProduces() throws Exception {
+        int brokerPort = startBroker();
+        fillTheBroker(brokerPort);
+        startFacade(brokerPort);
+
+        HttpResponse<String> response;
+        List<LogRecord> lines;
+        try (CapturedLog captured = CapturedLog.of(ErrorResponses.class)) {
+            response = get("/api/v1/topics", "application/xml");
+            lines = captured.lines();
+        }
+
+        assertPlainError(response, 406, "request refused");
+        assertTrue(contentTypeOf(response).startsWith("application/json"), contentTypeOf(response));
+        assertEquals(List.of("FINE answering 406 request refused"), writtenDown(lines),
+                "a header a caller chose is worth one quiet line and no stack");
+    }
+
+    /**
+     * A broker that is down is a state rather than an event: every request that arrives while it holds
+     * meets the same failure, so the answer a stranger can ask for a thousand times has to cost one
+     * line. Three of them used to write some four hundred between them.
+     */
+    @Test
+    void writesOneLineAndNoStackForEachOfABurstOfRequestsToABrokerThatIsNotListening() throws Exception {
+        int brokerPort = aPortNothingIsListeningOn();
+        startFacade(brokerPort);
+
+        List<Integer> statuses = new ArrayList<>();
+        List<LogRecord> lines;
+        try (CapturedLog captured = CapturedLog.of(ErrorResponses.class)) {
+            for (int request = 0; request < BURST_REQUEST_COUNT; request++) {
+                statuses.add(get("/api/v1/topics").statusCode());
+            }
+            lines = captured.lines();
+        }
+
+        assertEquals(List.of(503, 503, 503, 503, 503), statuses);
+        assertEquals(BURST_REQUEST_COUNT, lines.size(), "one line each, and no more: " + writtenDown(lines));
+        assertEquals(List.of(), stacksIn(lines), "a stack was written for a broker a caller found down");
+        assertTrue(lines.stream().allMatch(line -> line.getLevel().equals(Level.SEVERE)
+                        && line.getMessage().startsWith("answering 503 broker unreachable: cannot connect to "
+                                + LOOPBACK + ":" + brokerPort)),
+                "each line still names the broker that could not be reached: " + writtenDown(lines));
+    }
+
+    /**
+     * The 502 says the far end is wrong rather than absent, and the far end that produces one is
+     * something other than this broker listening on the broker's port. The stub is exactly that: it
+     * answers the describe with the first line of an HTTP response, whose four leading bytes read as a
+     * frame length of 1 213 486 160 — past any length this client will believe, so nothing is sized to
+     * it and the connection is closed. A stub is the only way to reach this answer from outside, since
+     * the exception behind it cannot be constructed from this package.
+     */
+    @Test
+    void answersBadGatewayWhenSomethingOnTheBrokersPortAnswersWithBytesThatAreNotAResponse() throws Exception {
+        try (ScriptedServer notABroker = ScriptedServer.start("not-a-broker",
+                socket -> socket.getOutputStream().write("HTTP/1.1 200 OK\r\n\r\n".getBytes(UTF_8)))) {
+            startFacade(notABroker.port());
+
+            HttpResponse<String> response = get("/api/v1/topics");
+
+            assertPlainError(response, 502, "broker answer could not be read");
+        }
+    }
+
+    /**
+     * The one test in this build that waits on real time, and it waits only to bound it. A broker that
+     * accepts a connection and then says nothing is the case a read timeout exists for, and the bound
+     * asserted here is deliberately loose: what it rules out is the client library's thirty-second
+     * default being what this facade waits, not any particular moment inside the five seconds it asks
+     * for. Which bound actually fired is read off the line the facade wrote, where it is exact.
+     */
+    @Test
+    void givesUpOnABrokerThatAcceptsAConnectionAndThenSaysNothing() throws Exception {
+        try (ScriptedServer silentBroker = ScriptedServer.start("silent-broker", socket -> { })) {
+            startFacade(silentBroker.port());
+
+            HttpResponse<String> response;
+            List<LogRecord> lines;
+            long startedNanos = System.nanoTime();
+            try (CapturedLog captured = CapturedLog.of(ErrorResponses.class)) {
+                response = get("/api/v1/topics");
+                lines = captured.lines();
+            }
+            long elapsedMillis = NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
+
+            assertPlainError(response, 503, "broker unreachable");
+            assertTrue(elapsedMillis < GIVING_UP_BOUND_MILLIS,
+                    "a describe waited " + elapsedMillis + "ms, which is the client default rather than this"
+                            + " facade's own bound");
+            assertTrue(writtenDown(lines).stream().anyMatch(line -> line.contains("did not finish answering within "
+                            + DESCRIBE_READ_TIMEOUT_MILLIS + "ms")),
+                    "the bound that fired is the one sized for a describe: " + writtenDown(lines));
+        }
+    }
+
+    /**
+     * The cap on connections is only half a bound: sixty-four sockets that connect and say nothing
+     * hold every place under it until Tomcat reclaims them, and Tomcat's own default for that is a
+     * minute. This asserts the pin where the container actually read it, rather than in the properties
+     * file where it is written.
+     */
+    @Test
+    void boundsHowLongAConnectionMayHoldAPlaceUnderTheCapWithoutAskingAnything() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        AbstractProtocol<?> protocol = (AbstractProtocol<?>) tomcatOf(facade).getConnector().getProtocolHandler();
+
+        assertEquals(CONNECTION_TIMEOUT_MILLIS, protocol.getConnectionTimeout(),
+                "a silent connection would hold its place for Tomcat's default minute");
     }
 
     @Test
@@ -179,6 +345,23 @@ class AdminFacadeIT {
         // Spring's own error page never gets the chance: a path nobody serves comes back in the same
         // one-field shape as every other failure.
         assertPlainError(response, 404, "no such endpoint");
+    }
+
+    /**
+     * The facade's own answer to an unmapped path is quiet, and the framework's is not: the
+     * dispatcher writes one WARN naming the path before this facade is asked anything, which is log
+     * volume a stranger with a list of paths decides. The pin in {@code application.properties} is
+     * asserted through the predicate the dispatcher itself consults before writing that line.
+     */
+    @Test
+    void answersAPathNobodyServesWithoutTheFrameworkWritingAWarningPerRequest() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        HttpResponse<String> response = get("/nothing-is-served-here");
+
+        assertEquals(404, response.statusCode(), response.body());
+        assertFalse(LoggerFactory.getLogger(DispatcherServlet.PAGE_NOT_FOUND_LOG_CATEGORY).isWarnEnabled(),
+                "the dispatcher writes one warning per unmapped path, and a caller picks how many");
     }
 
     /**
@@ -215,6 +398,28 @@ class AdminFacadeIT {
 
         assertPlainError(underWebInf, 404, "no such endpoint");
         assertPlainError(underMetaInf, 404, "no such endpoint");
+    }
+
+    /**
+     * The three answers a caller can get from three different places — a controller, this facade's
+     * advice, and the container's own forward — all leave through the same socket, so all three carry
+     * the headers that say what these bodies are not.
+     */
+    @Test
+    void carriesItsSecurityHeadersOnAnAnswerOnAFailureAndOnAPathTheContainerRefuses() throws Exception {
+        int brokerPort = startBroker();
+        startFacade(brokerPort);
+
+        HttpResponse<String> served = get("/api/v1/topics");
+        HttpResponse<String> refusedHere = get("/nothing-is-served-here");
+        HttpResponse<String> refusedByTheContainer = get("/WEB-INF/x");
+
+        assertEquals(200, served.statusCode(), served.body());
+        assertSaysWhatTheBodyIsNot(served);
+        assertPlainError(refusedHere, 404, "no such endpoint");
+        assertSaysWhatTheBodyIsNot(refusedHere);
+        assertPlainError(refusedByTheContainer, 404, "no such endpoint");
+        assertSaysWhatTheBodyIsNot(refusedByTheContainer);
     }
 
     /**
@@ -355,6 +560,21 @@ class AdminFacadeIT {
     }
 
     /**
+     * The rule every answer keeps, whatever its status: it says the bytes are to be taken as the type
+     * they were declared as, and that a browser handed them anyway may load nothing and frame nothing.
+     */
+    private void assertSaysWhatTheBodyIsNot(HttpResponse<String> response) {
+        assertEquals(SecurityHeaders.NOSNIFF, headerOf(response, SecurityHeaders.NO_SNIFFING),
+                "a browser is left to guess this body's type from its bytes");
+        assertEquals(SecurityHeaders.LOAD_NOTHING_AND_BE_FRAMED_BY_NOBODY,
+                headerOf(response, SecurityHeaders.CONTENT_SECURITY_POLICY));
+    }
+
+    private static String headerOf(HttpResponse<String> response, String name) {
+        return response.headers().firstValue(name).orElse("");
+    }
+
+    /**
      * The rule every failing answer keeps: a caller learns what went wrong and nothing about the
      * machine it went wrong on.
      */
@@ -371,6 +591,35 @@ class AdminFacadeIT {
 
     private static String contentTypeOf(HttpResponse<String> response) {
         return response.headers().firstValue("content-type").orElse("");
+    }
+
+    /**
+     * @param facade a facade this test started
+     * @return the embedded server behind it, for the settings that are the container's rather than
+     *         this facade's own
+     */
+    private static Tomcat tomcatOf(ConfigurableApplicationContext facade) {
+        return ((TomcatWebServer) ((WebServerApplicationContext) facade).getWebServer()).getTomcat();
+    }
+
+    /**
+     * @param lines every line a class wrote while a test watched
+     * @return each of them as its level and its sentence, which is what an operator would have read
+     */
+    private static List<String> writtenDown(List<LogRecord> lines) {
+        return lines.stream().map(line -> line.getLevel().getName() + " " + line.getMessage()).toList();
+    }
+
+    /**
+     * @param lines every line a class wrote while a test watched
+     * @return the ones that carry a throwable, which is what gets printed as a stack trace. A status a
+     *         caller can ask for repeatedly must produce none of these
+     */
+    private static List<String> stacksIn(List<LogRecord> lines) {
+        return lines.stream()
+                .filter(line -> line.getThrown() != null)
+                .map(line -> line.getMessage() + " <- " + line.getThrown())
+                .toList();
     }
 
     private Path dataDirectory() {
