@@ -1,5 +1,7 @@
 # Shrike
 
+[![CI](https://github.com/MuratAlkan06/shrike/actions/workflows/ci.yml/badge.svg)](https://github.com/MuratAlkan06/shrike/actions/workflows/ci.yml)
+
 Shrike is a single-node, log-structured message broker written in Java 21. Producers append records to a segmented commit log on one machine's disk, consumers read them back by offset, and delivery is at-least-once: a record may be redelivered after a failure, and no record is silently dropped.
 
 Version 1.8.0 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a flush policy that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker. What a running broker can be told is twenty environment variables and no more, one for each setting this README names, which [Configuration](#configuration) sets out; the [Non-goals](#non-goals) below are what this build does not do at all.
@@ -28,7 +30,7 @@ mvn -B clean verify
 **Run the broker.** `SHRIKE_DATA_DIRECTORY` is the one variable with no default, because a default would be a path this build picked rather than one somebody chose:
 
 ```
-SHRIKE_DATA_DIRECTORY=/var/lib/shrike java -cp shrike-core/target/classes io.shrike.core.net.BrokerMain
+SHRIKE_DATA_DIRECTORY="$PWD/shrike-data" java -cp shrike-core/target/classes io.shrike.core.net.BrokerMain
 ```
 
 It listens on port 9750, binds the loopback interface, and writes `shrike.ready` — the port it bound and its pid — into the data directory. `SHRIKE_PORT`, `SHRIKE_READY_FILE`, and `SHRIKE_BIND_ADDRESS` are the other three variables that name where a broker lives, each of which has a default, and the last of them is the only way this broker comes to listen anywhere but loopback. Every other setting this README names is read from one variable of its own — retention, the flush policy, the sizes, the caps — and a variable nobody sets is a setting left at the default this build has always run. [Configuration](#configuration) is the list of them, with the rule that names them and the default each one runs at.
