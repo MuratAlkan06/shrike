@@ -2,7 +2,7 @@
 
 Shrike is a single-node, log-structured message broker written in Java 21. Producers append records to a segmented commit log on one machine's disk, consumers read them back by offset, and delivery is at-least-once: a record may be redelivered after a failure, and no record is silently dropped.
 
-Version 1.1.0 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a flush policy that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker. What a running broker can be told is twenty environment variables and no more, one for each setting this README names, which [Configuration](#configuration) sets out; the [Non-goals](#non-goals) below are what this build does not do at all.
+Version 1.8.0 — a TCP broker with a length-guarded wire protocol, long-polling fetch, and durable group offsets; retention that deletes whole sealed segments by age or by size, a fetch whose records go from the segment file to the socket without being read into memory, and a flush policy that is either per-record or interval, with JMH benchmarks of what the last two cost on one machine; a blocking client library that routes keys to partitions, splits a topic between the members of a consumer group, and commits only after the records have been processed; a read-only HTTP admin facade that reads a live broker over that same protocol; and a container image holding the broker. What a running broker can be told is twenty environment variables and no more, one for each setting this README names, which [Configuration](#configuration) sets out; the [Non-goals](#non-goals) below are what this build does not do at all.
 
 ## Non-goals
 
@@ -38,15 +38,15 @@ It listens on port 9750, binds the loopback interface, and writes `shrike.ready`
 **Or run it in a container.** The image is the same entry point reading the same variables, with `SHRIKE_BIND_ADDRESS` set to `0.0.0.0` because a published port never lands on a container's loopback:
 
 ```
-docker build -t shrike:1.1.0 .
-docker run -d --name shrike -p 127.0.0.1:9750:9750 -v shrike-data:/var/lib/shrike shrike:1.1.0
+docker build -t shrike:1.8.0 .
+docker run -d --name shrike -p 127.0.0.1:9750:9750 -v shrike-data:/var/lib/shrike shrike:1.8.0
 ```
 
 **A named volume needs nothing; a bind mount needs one command first.** The image creates `/var/lib/shrike` and hands it to uid 10001 before declaring the volume, and docker seeds a fresh named volume from the image's own directory, ownership included — which is why the `-v shrike-data:/var/lib/shrike` above simply works. A bind mount is the host's directory exactly as it stands, so `-v /srv/shrike:/var/lib/shrike` on a directory root owns is a directory the broker's user cannot write to. Give it to that uid on the host rather than giving the container root:
 
 ```
 sudo install -d -o 10001 -g 10001 /srv/shrike
-docker run -d --name shrike -p 127.0.0.1:9750:9750 -v /srv/shrike:/var/lib/shrike shrike:1.1.0
+docker run -d --name shrike -p 127.0.0.1:9750:9750 -v /srv/shrike:/var/lib/shrike shrike:1.8.0
 ```
 
 `--user 0` would also make the broker able to write there, and it throws away the non-root user the image exists to run as.
@@ -72,7 +72,7 @@ try (ShrikeConsumer consumer = ShrikeConsumer.open(config)) {
 **Read it back over HTTP.** The admin facade is not in the image. It runs beside the broker and already points at `127.0.0.1:9750`:
 
 ```
-java -jar shrike-admin/target/shrike-admin-1.1.0.jar
+java -jar shrike-admin/target/shrike-admin-1.8.0.jar
 curl -s localhost:8080/api/v1/topics
 curl -s localhost:8080/api/v1/topics/orders
 curl -s localhost:8080/api/v1/groups/billing/lag

@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.shrike</groupId>
     <artifactId>shrike-parent</artifactId>
-    <version>1.7.0</version>
+    <version>1.8.0</version>
   </parent>
 
   <artifactId>shrike-admin</artifactId>
@@ -16,22 +16,22 @@
   <description>Admin and observability facade. The only module allowed to use Spring.</description>
 
   <properties>
-    <spring-boot.version>3.5.16</spring-boot.version>
-    <jackson-bom.version>2.21.5</jackson-bom.version>
-    <tomcat-embed.version>10.1.57</tomcat-embed.version>
+    <spring-boot.version>4.1.0</spring-boot.version>
+    <jackson-bom.version>3.1.5</jackson-bom.version>
+    <tomcat-embed.version>11.0.24</tomcat-embed.version>
   </properties>
 
   <!-- Order is the whole mechanism here. The Spring BOM is imported rather than inherited, and a
        <properties> override of the kind spring-boot-starter-parent documents does nothing to an
        imported BOM: the version it pins is the one that wins. What does win is an earlier entry in
        this same section, because the first declaration of a coordinate is the one Maven keeps. So
-       everything this module means to move off what Spring Boot 3.5.16 pins is declared above the
-       import, and nothing below it can pull those back. DESIGN.md carries why this line of Spring
-       is being patched by hand at all. -->
+       everything this module means to move off what Spring Boot 4.1.0 pins is declared above the
+       import, and nothing below it can pull those back. DESIGN.md carries which of these overrides
+       this build owns and why each one is still here. -->
   <dependencyManagement>
     <dependencies>
       <!-- The reactor's parent already imports this, and the Spring BOM imported below would
-           otherwise override it for this module alone: JUnit 5.12.2 here against 5.14.4 in the two
+           otherwise override it for this module alone: JUnit 6.0.3 here against 5.14.4 in the two
            modules that do not name Spring. Tests in one build run one version. -->
       <dependency>
         <groupId>org.junit</groupId>
@@ -41,21 +41,34 @@
         <scope>import</scope>
       </dependency>
 
-      <!-- Three moderate deserialization advisories against what Boot 3.5.16 pins. None of them is
-           reachable from this facade — it answers JSON and never reads any — so this is hygiene
-           rather than a fix, and it is a BOM import so that every jackson artifact on the path
-           moves together. -->
+      <!-- Jackson 3, which is what Boot 4 answers JSON with, one patch ahead of the 3.1.4 the BOM
+           below pins: that release carries a moderate deserialization advisory, fixed in 3.1.5. It
+           is not reachable from this facade — it writes JSON and never reads any — so this is the
+           same hygiene the 3.5 line needed rather than a fix, and it is a BOM import so that every
+           jackson artifact on the path moves together. The group is tools.jackson because Jackson 3
+           publishes under that one, and this same BOM is what pins the annotations artifact Jackson
+           3 still takes from com.fasterxml.jackson.core, so the two cannot part company. -->
       <dependency>
-        <groupId>com.fasterxml.jackson</groupId>
+        <groupId>tools.jackson</groupId>
         <artifactId>jackson-bom</artifactId>
         <version>${jackson-bom.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
 
-      <!-- The embedded server, ahead of the BOM that pins an older one. All three artifacts carry
-           the same version on purpose: they are one release of Tomcat, and a build that mixed them
-           would be running a combination Tomcat never tested. -->
+      <!-- The embedded server, two patches ahead of the 11.0.22 the BOM below manages. That release
+           is affected by CVE-2026-55956 — security constraints declared for the default servlet had
+           any method or method omission in them ignored, Moderate, fixed in 11.0.23 — and by seven
+           Low advisories beside it, two of which were not fixed until 11.0.24. None of the eight is
+           reachable the way this facade is configured: it declares no security constraint, mounts no
+           RewriteValve, runs no cluster interceptor, and serves no example webapp. So this is the
+           same hygiene as the jackson pin above rather than a fix, and it restores ground the move
+           to Boot 4 gave up — the 10.1.57 pin it replaced was already past CVE-2026-55956, which the
+           10.1 line fixed in 10.1.56. 11.0.24 is the newest release of the 11.0 line; the one
+           advisory still open against it, CVE-2026-66299, is fixed in an unreleased 11.0.25 and is a
+           defect in the WebSocket chat example, which is part of the examples web application and
+           ships in no tomcat-embed artifact. All three artifacts carry one version because a mixed
+           set is a combination Tomcat never built or tested. -->
       <dependency>
         <groupId>org.apache.tomcat.embed</groupId>
         <artifactId>tomcat-embed-core</artifactId>

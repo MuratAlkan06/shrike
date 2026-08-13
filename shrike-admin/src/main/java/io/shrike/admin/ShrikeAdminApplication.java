@@ -7,7 +7,7 @@ import org.apache.catalina.valves.ErrorReportValve;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.boot.web.embedded.tomcat.TomcatServletWebServerFactory;
+import org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactory;
 import org.springframework.boot.web.server.WebServerFactoryCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.Ordered;
@@ -60,7 +60,7 @@ public class ShrikeAdminApplication {
      * that sent bytes this server would not parse is owed the status code and nothing else.
      *
      * <p>Turning that valve's {@code showReport} and {@code showServerInfo} off is not enough, and
-     * Spring Boot has already done it: whenever {@code server.error.include-stacktrace} is
+     * Spring Boot has already done it: whenever {@code spring.web.error.include-stacktrace} is
      * {@code never}, which is pinned in {@code application.properties}, Boot adds a valve with both
      * flags cleared. Those two only drop the report table and the version footer — the page around
      * them, a title and an {@code h1} naming the status, is written regardless. So the valve is
