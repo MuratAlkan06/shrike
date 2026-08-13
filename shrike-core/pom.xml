@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.shrike</groupId>
     <artifactId>shrike-parent</artifactId>
-    <version>1.5.0</version>
+    <version>1.6.0</version>
   </parent>
 
   <artifactId>shrike-core</artifactId>
@@ -104,14 +104,16 @@
   <!-- The benchmarks are compiled by every build and run by none of it. `mvn verify` — which is what
        CI runs — never activates this profile, so a benchmark cannot make the build slow or flaky,
        and it still cannot rot: it is test-compiled like every other class under src/test/java.
-       Running the suite is one command, and it is the command the README documents. -->
+       Running the suite is five commands, one per execution below, and they are the commands the
+       README documents. Each carries its own JMH arguments and its own result file, so what produced
+       a published number is in this file rather than in somebody's shell history. -->
   <profiles>
     <profile>
       <id>bench</id>
       <properties>
-        <!-- Where the raw JMH result lands. It is committed as it was written, because a number in
-             the README is worth what the file behind it is worth. -->
-        <bench.results.file>${project.basedir}/../docs/bench/slice-5-flush-and-fetch.json</bench.results.file>
+        <!-- Where the raw JMH results land. They are committed as they were written, because a number
+             in the README is worth what the file behind it is worth. -->
+        <bench.results.directory>${project.basedir}/../docs/bench</bench.results.directory>
       </properties>
       <build>
         <plugins>
@@ -125,16 +127,143 @@
                    records which JVM it was. -->
               <executable>java</executable>
               <classpathScope>test</classpathScope>
-              <arguments>
-                <argument>-classpath</argument>
-                <classpath/>
-                <argument>org.openjdk.jmh.Main</argument>
-                <argument>-rf</argument>
-                <argument>json</argument>
-                <argument>-rff</argument>
-                <argument>${bench.results.file}</argument>
-              </arguments>
             </configuration>
+            <executions>
+              <!-- Every benchmark, at the iteration counts its own annotations state. -->
+              <execution>
+                <id>suite</id>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <arguments>
+                    <argument>-classpath</argument>
+                    <classpath/>
+                    <argument>org.openjdk.jmh.Main</argument>
+                    <argument>-rf</argument>
+                    <argument>json</argument>
+                    <argument>-rff</argument>
+                    <argument>${bench.results.directory}/v1.6-flush-and-fetch.json</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+
+              <!-- The sampled per-record arm again, over thirty two-second iterations rather than five
+                   one-second ones. At around four milliseconds an append the suite above can only time
+                   a couple of thousand invocations of it, and a p99 read off that few is a thin number;
+                   this is what the published tail stands on. The counts land in the result file. -->
+              <execution>
+                <id>per-record-tail</id>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <arguments>
+                    <argument>-classpath</argument>
+                    <classpath/>
+                    <argument>org.openjdk.jmh.Main</argument>
+                    <argument>io.shrike.core.bench.FlushPolicyBenchmark.appendOneProduceServiceTime</argument>
+                    <!-- The parameter is joined to its flag rather than written as two arguments, and
+                         that is load-bearing: `<argument>flushMode=PER_RECORD</argument>` on its own is
+                         dropped on the way to the command line, which leaves JMH reading the next flag
+                         as the parameter and refusing to start. JMH takes `-pname=value` as one token,
+                         so the value cannot go missing. -->
+                    <argument>-pflushMode=PER_RECORD</argument>
+                    <argument>-i</argument>
+                    <argument>30</argument>
+                    <argument>-r</argument>
+                    <argument>2s</argument>
+                    <argument>-rf</argument>
+                    <argument>json</argument>
+                    <argument>-rff</argument>
+                    <argument>${bench.results.directory}/v1.6-per-record-tail.json</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+
+              <!-- One long per-record throughput trial, four forks of twenty three-second iterations,
+                   which exists to answer whether the two forks that disagreed in the Slice 5 run were
+                   the mode or the machine. Eighty measured iterations across four JVMs is enough to
+                   see a mode that is bimodal and enough to see a machine that is not. -->
+              <execution>
+                <id>per-record-long-trial</id>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <arguments>
+                    <argument>-classpath</argument>
+                    <classpath/>
+                    <argument>org.openjdk.jmh.Main</argument>
+                    <argument>io.shrike.core.bench.FlushPolicyBenchmark.appendOneProduceThroughput</argument>
+                    <argument>-pflushMode=PER_RECORD</argument>
+                    <argument>-pbatchRecords=1</argument>
+                    <argument>-f</argument>
+                    <argument>4</argument>
+                    <argument>-i</argument>
+                    <argument>20</argument>
+                    <argument>-r</argument>
+                    <argument>3s</argument>
+                    <argument>-rf</argument>
+                    <argument>json</argument>
+                    <argument>-rff</argument>
+                    <argument>${bench.results.directory}/v1.6-per-record-long-trial.json</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+
+              <!-- The fetch paths again under JMH's allocation profiler, which is what says how much of
+                   the buffered path's cost is the mebibyte it allocates per fetch. Same iterations as
+                   the suite; the profiler is the only difference, and its results land in the same
+                   result file beside the scores. -->
+              <execution>
+                <id>fetch-allocation</id>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <arguments>
+                    <argument>-classpath</argument>
+                    <classpath/>
+                    <argument>org.openjdk.jmh.Main</argument>
+                    <argument>io.shrike.core.bench.FetchPathBenchmark</argument>
+                    <argument>-prof</argument>
+                    <argument>gc</argument>
+                    <argument>-rf</argument>
+                    <argument>json</argument>
+                    <argument>-rff</argument>
+                    <argument>${bench.results.directory}/v1.6-fetch-allocation.json</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+
+              <!-- The same again on a heap small enough to change what the mebibyte the buffered path
+                   allocates per fetch costs: at the default heap G1's regions are large enough for that
+                   array to be an ordinary allocation, and at 512 MiB they are not. The JVM argument is
+                   recorded in the result file, which is the only reason it is allowed to be here. -->
+              <execution>
+                <id>fetch-allocation-small-heap</id>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <arguments>
+                    <argument>-classpath</argument>
+                    <classpath/>
+                    <argument>org.openjdk.jmh.Main</argument>
+                    <argument>io.shrike.core.bench.FetchPathBenchmark</argument>
+                    <argument>-prof</argument>
+                    <argument>gc</argument>
+                    <argument>-jvmArgsAppend</argument>
+                    <argument>-Xmx512m</argument>
+                    <argument>-rf</argument>
+                    <argument>json</argument>
+                    <argument>-rff</argument>
+                    <argument>${bench.results.directory}/v1.6-fetch-allocation-small-heap.json</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+            </executions>
           </plugin>
         </plugins>
       </build>

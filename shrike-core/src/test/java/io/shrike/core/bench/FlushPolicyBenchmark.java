@@ -25,36 +25,48 @@ import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
 
 /**
- * What {@code flush.mode} costs an append: one {@link SegmentedLog#append} under
- * {@link FlushMode#PER_RECORD}, where the record is forced before the call returns, against the same
- * append under {@link FlushMode#INTERVAL} at its defaults, where the append that crosses
- * {@code flush.interval.bytes} is the one that forces.
+ * What {@code flush.mode} costs one produce's worth of appends: {@code batchRecords} calls to
+ * {@link SegmentedLog#append} under {@link FlushMode#PER_RECORD}, where every record is forced before
+ * the call that appended it returns, against the same appends under {@link FlushMode#INTERVAL} at its
+ * defaults, where the append that crosses {@code flush.interval.bytes} is the one that forces.
  *
- * <p><strong>What is measured is one call to {@code append} and nothing around it.</strong> There is
- * no socket, no protocol, and no broker here: a produce is acknowledged once {@code append} returns,
- * so the append is the whole of what a flush mode changes. The log is opened with
- * {@link LogConfig#defaults()} apart from the mode — 128 MiB segments, an index entry every 4 KiB,
- * retention off — so a segment roll and the force that seals it fall inside the measurement exactly
- * as they fall inside a running broker's.
+ * <p><strong>One invocation is one produce, and {@code batchRecords} says how big a produce.</strong>
+ * {@code Partition.produce} appends a request's records one at a time under one lock, so a produce
+ * carrying N records makes N appends and — under {@code per-record} — N forces. At
+ * {@code batchRecords=1} this measures a single append, which is the figure a per-record cost is read
+ * from; at {@code batchRecords=100} it measures what one produce of a hundred records costs, which is
+ * the figure an operator sizing a client's batch actually needs. The lock and the socket are outside
+ * both: a produce is acknowledged once the appends have returned, so the appends are the whole of what
+ * a flush mode changes.
  *
- * <p><strong>Only the {@code interval} arm reaches a roll.</strong> At the rates the two modes run
- * at, a {@code per-record} trial appends some eighteen hundred records over its warmup and measured
- * seconds — about 280 KiB of frames — and never comes near the 128 MiB {@code segment.bytes}, so it
- * rolls no segment at all. An {@code interval} trial appends nearly four million in the same eight
- * seconds, some 600 MiB, and rolls and seals a segment about every 128 MiB while it does. The cost of
- * rolling and sealing is therefore charged to the {@code interval} arm alone, and it lands in that
- * arm's tail.
+ * <p>The log is opened with {@link LogConfig#defaults()} apart from the mode — 128 MiB segments, an
+ * index entry every 4 KiB, retention off — so a segment roll and the force that seals it fall inside
+ * the measurement exactly as they fall inside a running broker's.
+ *
+ * <p><strong>Only the {@code interval} arms reach a roll.</strong> At the rates the two modes run at,
+ * a {@code per-record} trial appends a few thousand records over its warmup and measured seconds —
+ * some hundreds of kibibytes of frames — and never comes near the 128 MiB {@code segment.bytes}, so it
+ * rolls no segment at all. An {@code interval} trial appends millions in the same seconds, hundreds of
+ * mebibytes, and rolls and seals a segment about every 128 MiB while it does. The cost of rolling and
+ * sealing is therefore charged to the {@code interval} arms alone, and it lands in their tail.
  *
  * <p><strong>What is not measured, in {@code interval} mode, is the time bound.</strong> The
  * {@code shrike-flush} thread is a broker's, not a log's, and it forces from a thread of its own; the
  * bound that shows up here is the volume one, because that is the bound an append itself can cross.
  *
  * <p>Two result kinds are produced from the same call. {@link Mode#Throughput} answers how many
- * appends a second one writer sustains, and {@link Mode#SampleTime} is what a percentile can be read
+ * produces a second one writer sustains, and {@link Mode#SampleTime} is what a percentile can be read
  * off — a mean cannot be turned into a p99, so the tail needs per-invocation samples. Every sampled
- * number here is <em>closed-loop service time</em>: the harness issues the next append only once the
+ * number here is <em>closed-loop service time</em>: the harness issues the next produce only once the
  * previous one has returned, so nothing queues behind anything, and a percentile from this benchmark
  * understates what a client would see under an arrival rate it does not control.
+ *
+ * <p><strong>A {@code per-record} tail wants more measured seconds than this class asks for.</strong>
+ * The annotations below are what the whole suite runs at; the sampled {@code per-record} arm is run a
+ * second time, deeper, from the {@code per-record-tail} execution of the {@code bench} profile, because
+ * at roughly four milliseconds an append the iterations here can only produce a couple of thousand
+ * samples and a p99 read off that few is a thin number. What that execution changes is the iteration
+ * count and their length, which JMH records in the result file it writes.
  *
  * <p>One thread, because a partition has one writer by construction and a second appending thread
  * would be measuring the partition lock rather than the flush policy.
@@ -75,6 +87,14 @@ public class FlushPolicyBenchmark {
     /** Which mode the log under this trial is opened in; everything else is {@link LogConfig#defaults()}. */
     @Param({"PER_RECORD", "INTERVAL"})
     public FlushMode flushMode;
+
+    /**
+     * How many records one invocation appends, which is how many records the produce it stands for
+     * carries. One is the per-record figure; a hundred is a batch a client library would send without
+     * anybody thinking it large, and under {@code per-record} it is a hundred forces.
+     */
+    @Param({"1", "100"})
+    public int batchRecords;
 
     private Path dataDirectory;
     private SegmentedLog log;
@@ -114,26 +134,40 @@ public class FlushPolicyBenchmark {
     }
 
     /**
-     * @return the offset the record was appended at, returned so that nothing about the append can be
-     *         eliminated as dead code
+     * @return the offset the last record of the produce was appended at, returned so that nothing
+     *         about the appends can be eliminated as dead code
      */
     @Benchmark
     @BenchmarkMode(Mode.Throughput)
     @OutputTimeUnit(TimeUnit.SECONDS)
-    public long appendRecordThroughput() {
-        return log.append(record);
+    public long appendOneProduceThroughput() {
+        return appendOneProduce();
     }
 
     /**
-     * The same append, sampled per invocation so that the tail can be read rather than averaged. Every
+     * The same produce, sampled per invocation so that the tail can be read rather than averaged. Every
      * percentile it produces is closed-loop service time.
      *
-     * @return the offset the record was appended at
+     * @return the offset the last record of the produce was appended at
      */
     @Benchmark
     @BenchmarkMode(Mode.SampleTime)
     @OutputTimeUnit(TimeUnit.MICROSECONDS)
-    public long appendRecordServiceTime() {
-        return log.append(record);
+    public long appendOneProduceServiceTime() {
+        return appendOneProduce();
+    }
+
+    /**
+     * Appends the records of one produce, one at a time and in order, which is what
+     * {@code Partition.produce} does with the records of a produce request.
+     *
+     * @return the offset the last of them was appended at
+     */
+    private long appendOneProduce() {
+        long lastOffset = -1L;
+        for (int appended = 0; appended < batchRecords; appended++) {
+            lastOffset = log.append(record);
+        }
+        return lastOffset;
     }
 }
