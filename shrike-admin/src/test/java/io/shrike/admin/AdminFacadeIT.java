@@ -1,6 +1,7 @@
 package io.shrike.admin;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -9,6 +10,7 @@ import io.shrike.clients.Await;
 import io.shrike.clients.BrokerProcessMain;
 import io.shrike.clients.ClientConfig;
 import io.shrike.clients.JavaProcess;
+import io.shrike.clients.ScriptedServer;
 import io.shrike.clients.ShrikeConsumer;
 import io.shrike.clients.ShrikeProducer;
 import io.shrike.clients.ShrikeTopics;
@@ -29,12 +31,15 @@ import java.util.Locale;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.stream.Stream;
+import org.apache.catalina.startup.Tomcat;
+import org.apache.coyote.AbstractProtocol;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.web.context.WebServerApplicationContext;
+import org.springframework.boot.web.embedded.tomcat.TomcatWebServer;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.web.servlet.DispatcherServlet;
 
@@ -67,6 +72,20 @@ class AdminFacadeIT {
 
     /** How many requests in a row count as a burst: enough that a line per request would show. */
     private static final int BURST_REQUEST_COUNT = 5;
+
+    /** The bound this facade gives a broker to answer a describe, from {@code application.properties}. */
+    private static final int DESCRIBE_READ_TIMEOUT_MILLIS = 5_000;
+
+    /** How long a connection may hold a place under the connection cap without asking anything. */
+    private static final int CONNECTION_TIMEOUT_MILLIS = 10_000;
+
+    /**
+     * The upper bound on giving up on a broker that will not answer. It is neither the bound being
+     * tested nor near it: it sits between the five seconds this facade waits and the thirty a client
+     * waits by default, far enough from both that a loaded machine cannot move a passing run across
+     * it, and it fails only if this facade is waiting the client default again.
+     */
+    private static final long GIVING_UP_BOUND_MILLIS = 20_000L;
 
     @TempDir
     Path workingDirectory;
@@ -248,6 +267,53 @@ class AdminFacadeIT {
                         && line.getMessage().startsWith("answering 503 broker unreachable: cannot connect to "
                                 + LOOPBACK + ":" + brokerPort)),
                 "each line still names the broker that could not be reached: " + writtenDown(lines));
+    }
+
+    /**
+     * The one test in this build that waits on real time, and it waits only to bound it. A broker that
+     * accepts a connection and then says nothing is the case a read timeout exists for, and the bound
+     * asserted here is deliberately loose: what it rules out is the client library's thirty-second
+     * default being what this facade waits, not any particular moment inside the five seconds it asks
+     * for. Which bound actually fired is read off the line the facade wrote, where it is exact.
+     */
+    @Test
+    void givesUpOnABrokerThatAcceptsAConnectionAndThenSaysNothing() throws Exception {
+        try (ScriptedServer silentBroker = ScriptedServer.start("silent-broker", socket -> { })) {
+            startFacade(silentBroker.port());
+
+            HttpResponse<String> response;
+            List<LogRecord> lines;
+            long startedNanos = System.nanoTime();
+            try (CapturedLog captured = CapturedLog.of(ErrorResponses.class)) {
+                response = get("/api/v1/topics");
+                lines = captured.lines();
+            }
+            long elapsedMillis = NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
+
+            assertPlainError(response, 503, "broker unreachable");
+            assertTrue(elapsedMillis < GIVING_UP_BOUND_MILLIS,
+                    "a describe waited " + elapsedMillis + "ms, which is the client default rather than this"
+                            + " facade's own bound");
+            assertTrue(writtenDown(lines).stream().anyMatch(line -> line.contains("did not finish answering within "
+                            + DESCRIBE_READ_TIMEOUT_MILLIS + "ms")),
+                    "the bound that fired is the one sized for a describe: " + writtenDown(lines));
+        }
+    }
+
+    /**
+     * The cap on connections is only half a bound: sixty-four sockets that connect and say nothing
+     * hold every place under it until Tomcat reclaims them, and Tomcat's own default for that is a
+     * minute. This asserts the pin where the container actually read it, rather than in the properties
+     * file where it is written.
+     */
+    @Test
+    void boundsHowLongAConnectionMayHoldAPlaceUnderTheCapWithoutAskingAnything() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        AbstractProtocol<?> protocol = (AbstractProtocol<?>) tomcatOf(facade).getConnector().getProtocolHandler();
+
+        assertEquals(CONNECTION_TIMEOUT_MILLIS, protocol.getConnectionTimeout(),
+                "a silent connection would hold its place for Tomcat's default minute");
     }
 
     @Test
@@ -468,6 +534,15 @@ class AdminFacadeIT {
 
     private static String contentTypeOf(HttpResponse<String> response) {
         return response.headers().firstValue("content-type").orElse("");
+    }
+
+    /**
+     * @param facade a facade this test started
+     * @return the embedded server behind it, for the settings that are the container's rather than
+     *         this facade's own
+     */
+    private static Tomcat tomcatOf(ConfigurableApplicationContext facade) {
+        return ((TomcatWebServer) ((WebServerApplicationContext) facade).getWebServer()).getTomcat();
     }
 
     /**

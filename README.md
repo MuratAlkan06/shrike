@@ -120,7 +120,7 @@ It binds `127.0.0.1:8080`, and what those three answer with is under [Admin endp
 
 The dotted names in the left-hand column are what the javadoc on those two records calls each field, and what the prose below calls them; the middle column is each of those names under the rule above. Three more numbers sit on `BrokerConfig` beside them with no dotted name of their own, and the same rule reaches them from their fields: `connectionCap`, 64, from `SHRIKE_CONNECTION_CAP`, `maxTotalPartitions`, 1024, from `SHRIKE_MAX_TOTAL_PARTITIONS`, and `maxTotalGroups`, 1024, from `SHRIKE_MAX_TOTAL_GROUPS`.
 
-`shrike-admin` has a settable surface of its own, because it is a Spring application: `server.address`, `server.port`, `shrike.broker.host`, and `shrike.broker.port` are set the way any Spring Boot property is, and they are described under [Admin endpoints](#admin-endpoints).
+`shrike-admin` has a settable surface of its own, because it is a Spring application: `server.address`, `server.port`, `shrike.broker.host`, `shrike.broker.port`, and `shrike.broker.read-timeout-millis` are set the way any Spring Boot property is, and they are described under [Admin endpoints](#admin-endpoints).
 
 ## Architecture
 
@@ -294,6 +294,8 @@ And `per-record` is per record, not per produce request. The row above is one `a
 ## Admin endpoints
 
 `shrike-admin` answers three GETs in JSON by asking a running broker the same questions any other client may ask it. It reads and never writes, it opens no file the broker owns, and it keeps nothing between requests: each call opens a connection, gets its answer, and closes it. It serves `127.0.0.1:8080` and reads a broker at `127.0.0.1:9750` unless `server.address`, `server.port`, `shrike.broker.host`, and `shrike.broker.port` say otherwise.
+
+**Two bounds keep a broker that is not answering from becoming a facade that is not answering.** `shrike.broker.read-timeout-millis` is `5000`: every question this facade asks is a describe the broker answers out of memory, so five seconds is generous for one and short enough that sixteen threads are not each spending the client library's thirty-second default on a broker that accepts connections and then says nothing. `server.tomcat.connection-timeout` is `10s`, beside the `server.tomcat.max-connections=64` it protects, because sixty-four sockets that connect and stay silent otherwise hold every place under that cap until Tomcat's default minute reclaims them.
 
 **What it does not check.** This facade has no authentication and no transport security — TLS or auth is as much a non-goal here as it is on the broker's own port — so anything that can reach its port can list every topic the broker holds, read each partition's offsets, segment count, and bytes, and ask how far any group it names has got through the partitions that group has committed. The `127.0.0.1` above is the default and the whole of what keeps that on one machine: `server.address` is the only way this facade comes to listen anywhere else, widening it is the same deliberate act as widening the broker's own bind address, and the host it is widened onto is one trusted with the broker it reads.
 
@@ -523,3 +525,5 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A burst of requests to a broker that is not listening is answered 503 each and written down as one line each, naming the broker that could not be reached and carrying no stack | `AdminFacadeIT#writesOneLineAndNoStackForEachOfABurstOfRequestsToABrokerThatIsNotListening` | 1.4 |
 | A path nobody serves is answered 404 without the framework writing a warning of its own for it, so log volume is not something a caller decides | `AdminFacadeIT#answersAPathNobodyServesWithoutTheFrameworkWritingAWarningPerRequest` | 1.4 |
 | A topic name or group id the protocol will not carry is refused 400 while nothing at all is listening on the broker's port, which is what says the name is judged before a connection is opened rather than inside one | `AdminFacadeIT#answersBadRequestForAnUnusableNameEvenWithNoBrokerToConnectTo` | 1.4 |
+| A broker that accepts a connection and then says nothing is given up on inside the facade's own describe-sized bound, which the failure it logs names, rather than the client library's thirty seconds | `AdminFacadeIT#givesUpOnABrokerThatAcceptsAConnectionAndThenSaysNothing` | 1.4 |
+| A connection may hold a place under the facade's connection cap for ten seconds without asking anything, rather than Tomcat's default minute, and the container is running with that number | `AdminFacadeIT#boundsHowLongAConnectionMayHoldAPlaceUnderTheCapWithoutAskingAnything` | 1.4 |
