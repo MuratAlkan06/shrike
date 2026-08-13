@@ -168,6 +168,26 @@ class AdminFacadeIT {
         assertNothingLeaked(response);
     }
 
+    /**
+     * With nothing listening on the broker's port, a connect can only end one way, so a 400 here is
+     * the whole proof that none was attempted: the name was judged first, by the rule the broker would
+     * have applied to it, and both endpoints judge it in the same place.
+     */
+    @Test
+    void answersBadRequestForAnUnusableNameEvenWithNoBrokerToConnectTo() throws Exception {
+        startFacade(aPortNothingIsListeningOn());
+
+        HttpResponse<String> topic = get("/api/v1/topics/bad!name");
+        HttpResponse<String> group = get("/api/v1/groups/bad!name/lag");
+
+        assertEquals(400, topic.statusCode(), "a connect was attempted before the name was judged: " + topic.body());
+        assertEquals(400, group.statusCode(), "a connect was attempted before the name was judged: " + group.body());
+        assertTrue(topic.body().startsWith("{\"error\":\"topic must be 1 to 200 characters"), topic.body());
+        assertTrue(group.body().startsWith("{\"error\":\"groupId must be 1 to 200 characters"), group.body());
+        assertNothingLeaked(topic);
+        assertNothingLeaked(group);
+    }
+
     @Test
     void answersServiceUnavailableWhenTheBrokerIsNotListening() throws Exception {
         startFacade(aPortNothingIsListeningOn());

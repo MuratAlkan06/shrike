@@ -50,14 +50,14 @@ public class TopicsEndpoint {
      */
     @GetMapping("/{topic}")
     public TopicDetail describe(@PathVariable("topic") String topic) {
+        // Before the connection, not inside it: a name the broker's own rule will refuse is refused
+        // here, so asking about one costs no socket and is answered 400 rather than 503 when the
+        // broker is down. The request record checks it again on the way to the wire, by the same rule.
+        UnusableNameException.requireUsable(topic, "topic");
+
         List<TopicDescription> described;
         try (ShrikeTopics topics = ShrikeTopics.open(broker)) {
             described = topics.describe(List.of(topic));
-        } catch (IllegalArgumentException unusable) {
-            // The request record applies the broker's own name rule before a byte is sent, and that is
-            // the only thing here that can raise this. Naming it as such is what keeps some other
-            // library's IllegalArgumentException from being answered as if the caller had caused it.
-            throw new UnusableNameException(unusable);
         }
         // One name was asked about, so one description is owed: a broker that answers a describe with
         // a different number of topics has answered a different question, and this facade says so

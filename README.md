@@ -325,7 +325,7 @@ A request Tomcat refuses **before** the servlet stack sees it — a broken perce
 
 | Status | When | The sentence |
 |---|---|---|
-| 400 | a topic name or group id the protocol will not carry, refused before anything is asked of the broker | `topic must be 1 to 200 characters of [A-Za-z0-9._-] and neither "." nor "..", but was "orders!"` |
+| 400 | a topic name or group id the protocol will not carry, refused before a connection to the broker is opened | `topic must be 1 to 200 characters of [A-Za-z0-9._-] and neither "." nor "..", but was "orders!"` |
 | 404 | a topic the broker does not hold | `no such topic` |
 | 404 | a group that has committed nothing, which is also what a group this broker has never heard of looks like | `group has no committed offsets: nobody` |
 | 404 | a path this facade does not serve | `no such endpoint` |
@@ -456,7 +456,7 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | Asking the facade about a topic the broker does not hold is answered 404, with one plain sentence and no stack trace, exception name, or path | `AdminFacadeIT#answersNotFoundForATopicTheBrokerDoesNotHold` | 6 |
 | Asking the facade for the lag of a group that has committed nothing is answered 404, saying only what the broker can actually tell | `AdminFacadeIT#answersNotFoundForAGroupThatHasCommittedNothing` | 6 |
 | A facade pointed at a broker that is not listening answers 503 rather than an empty report | `AdminFacadeIT#answersServiceUnavailableWhenTheBrokerIsNotListening` | 6 |
-| A topic name the protocol will not carry is refused by the facade with 400 and the rule it broke, before anything is asked of the broker | `AdminFacadeIT#answersBadRequestForANameTheProtocolWillNotCarry` | 6 |
+| A topic name the protocol will not carry is refused by the facade with 400 and the rule it broke | `AdminFacadeIT#answersBadRequestForANameTheProtocolWillNotCarry` | 6 |
 | A path the facade does not serve is answered 404 in the same one-field JSON shape as every other failure, never the framework's default error body | `AdminFacadeIT#answersNotFoundWithoutDetailForAPathItDoesNotServe` | 6 |
 | `/error`, where the container forwards, is answered in the facade's own shape whether the caller will accept JSON or HTML, rather than the framework's error body or its HTML page | `AdminFacadeIT#answersTheContainersErrorPathInItsOwnShapeWhateverTheCallerWillAccept` | 6 |
 | A path Tomcat refuses inside the container, `/WEB-INF` and `/META-INF`, comes back in that same one-field shape, without the timestamp and path the framework's default body carries | `AdminFacadeIT#answersAPathTheContainerRefusesInTheSameShapeAsEveryOtherFailure` | 6 |
@@ -522,3 +522,4 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A caller that will accept only a media type the facade does not produce is answered 406 in the one JSON shape, and it costs one quiet line rather than a stack trace per header | `AdminFacadeIT#answersNotAcceptableWithoutAStackWhenACallerWillTakeNoMediaTypeThisFacadeProduces` | 1.4 |
 | A burst of requests to a broker that is not listening is answered 503 each and written down as one line each, naming the broker that could not be reached and carrying no stack | `AdminFacadeIT#writesOneLineAndNoStackForEachOfABurstOfRequestsToABrokerThatIsNotListening` | 1.4 |
 | A path nobody serves is answered 404 without the framework writing a warning of its own for it, so log volume is not something a caller decides | `AdminFacadeIT#answersAPathNobodyServesWithoutTheFrameworkWritingAWarningPerRequest` | 1.4 |
+| A topic name or group id the protocol will not carry is refused 400 while nothing at all is listening on the broker's port, which is what says the name is judged before a connection is opened rather than inside one | `AdminFacadeIT#answersBadRequestForAnUnusableNameEvenWithNoBrokerToConnectTo` | 1.4 |

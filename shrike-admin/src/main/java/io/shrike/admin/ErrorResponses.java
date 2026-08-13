@@ -104,8 +104,8 @@ public class ErrorResponses {
     }
 
     /**
-     * A topic name or a group id the protocol will not carry is refused before a byte reaches a
-     * socket, by the same one rule the broker applies. Its message is a sentence about the rule and a
+     * A topic name or a group id the protocol will not carry is refused before a socket to the broker
+     * is opened, by the same one rule the broker applies. Its message is a sentence about the rule and a
      * quoted, cut-down copy of what was sent, which is the one piece of detail a caller is owed: it is
      * the caller's own input.
      */

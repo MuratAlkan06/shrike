@@ -46,13 +46,14 @@ public class GroupLagEndpoint {
      */
     @GetMapping("/{group}/lag")
     public GroupLag describe(@PathVariable("group") String group) {
+        // A group id becomes a file name, so it goes through the same one rule a topic name does, and
+        // in the same place: in front of the connection, so that a name this facade can already see is
+        // unusable costs no socket. TopicsEndpoint.describe says the rest of it.
+        UnusableNameException.requireUsable(group, "groupId");
+
         List<GroupOffset> committed;
         try (ShrikeGroups groups = ShrikeGroups.open(broker)) {
             committed = groups.describe(group);
-        } catch (IllegalArgumentException unusable) {
-            // A group id becomes a file name, so it goes through the same one rule a topic name does,
-            // and that rule is the only thing here that can raise this.
-            throw new UnusableNameException(unusable);
         }
         if (committed.isEmpty()) {
             throw new NoCommittedOffsetsException(group);
