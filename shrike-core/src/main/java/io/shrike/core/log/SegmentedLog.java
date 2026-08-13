@@ -350,17 +350,6 @@ public final class SegmentedLog implements Log, LogStatistics {
     }
 
     /**
-     * Forces the records this log has not put on the device yet, once {@code flush.interval.ms} has
-     * passed since the last time this method did. A log with nothing unforced is not due whatever the
-     * clock says, which is also why {@link FlushMode#PER_RECORD} never finds work here: an append in
-     * that mode has already forced what it wrote. A log that has never flushed on the interval has no
-     * earlier flush to measure one from, so the first ask that finds unforced records answers it.
-     *
-     * @param nowMillis the epoch millisecond the interval is measured against
-     * @return whether anything was forced
-     * @throws ShrikeIOException if the force fails
-     */
-    /**
      * Whether this log holds records it has not yet put on the device, answered from one volatile read
      * and therefore answerable without the guard everything else here is called under.
      *
@@ -379,6 +368,17 @@ public final class SegmentedLog implements Log, LogStatistics {
         return unflushedBytes != 0L;
     }
 
+    /**
+     * Forces the records this log has not put on the device yet, once {@code flush.interval.ms} has
+     * passed since the last time this method did. A log with nothing unforced is not due whatever the
+     * clock says, which is also why {@link FlushMode#PER_RECORD} never finds work here: an append in
+     * that mode has already forced what it wrote. A log that has never flushed on the interval has no
+     * earlier flush to measure one from, so the first ask that finds unforced records answers it.
+     *
+     * @param nowMillis the epoch millisecond the interval is measured against
+     * @return whether anything was forced
+     * @throws ShrikeIOException if the force fails
+     */
     @Override
     public boolean flushIfDue(long nowMillis) {
         if (unflushedBytes == 0L) {

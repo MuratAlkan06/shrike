@@ -103,7 +103,7 @@ It binds `127.0.0.1:8080`, and what those three answer with is under [Admin endp
 | `SHRIKE_READ_TIMEOUT_MS` | `30000` | the longest one connection may spend idle between requests, or part way through a request frame, before this broker closes it; it never bounds serving one; at most `3600000`, an hour |
 | `SHRIKE_WRITE_TIMEOUT_MS` | `30000` | the longest an answer this broker is sending may go with no byte of it leaving, before this broker closes the connection; it bounds a write that is getting nowhere and never a write that is merely slow; at most `3600000`, an hour |
 | `SHRIKE_FETCH_ZERO_COPY` | `true` | `true` to send a fetch's records out of the segment file, `false` to read them into memory first |
-| `SHRIKE_CONNECTION_CAP` | `64` | the most connections served at once; at most `1024`, a platform thread and a file descriptor each |
+| `SHRIKE_CONNECTION_CAP` | `64` | the most connections served at once; at most `1024`, a platform thread and a socket each, and one segment file descriptor more while a long poll of theirs waits |
 | `SHRIKE_MAX_TOTAL_PARTITIONS` | `1024` | the most partitions this broker will hold open across every topic |
 | `SHRIKE_MAX_TOTAL_GROUPS` | `1024` | the most consumer groups this broker will hold committed offsets for; a commit that would create one past it is refused |
 
@@ -546,7 +546,8 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A flush sweep takes no lock at all on a partition with nothing to force, and exactly one on the partition that has something | `PartitionFlushSweepTest#takesTheLockOfOnlyThePartitionThatHasRecordsToForce` | 1.5 |
 | The partitions it passed over were partitions whose records were already on the device, and the one it stopped at is the one it forced | `PartitionFlushSweepTest#forcesThePartitionThatHasRecordsAndNoOtherPartition` | 1.5 |
 | A partition written to just after a sweep passed over it is forced by the next sweep, rather than waiting for another append to notice it | `PartitionFlushSweepTest#forcesOnTheNextSweepAPartitionDirtiedAfterOneFoundItClean` | 1.5 |
-| A log says it holds unforced bytes from the append that made them until the flush that forces them, and says it holds none when the append forced them itself | `SegmentedLogFlushTest#holdsUnforcedBytesFromTheAppendThatMadeThemUntilTheFlushThatForcesThem` | 1.5 |
+| A log says it holds unforced bytes from the append that made them until the flush that forces them | `SegmentedLogFlushTest#holdsUnforcedBytesFromTheAppendThatMadeThemUntilTheFlushThatForcesThem` | 1.5 |
+| A log says it holds no unforced bytes when the append that made them forced them itself | `SegmentedLogFlushTest#holdsNothingUnforcedAfterAnAppendThatForcedOnItsOwn` | 1.5 |
 | A fetch woken several times before it can be answered opens its segment file once rather than once per wakeup, and the descriptor leaves with the answer | `PartitionFetchDescriptorTest#opensItsSegmentFileOnceHoweverManyAppendsWakeAFetchBeforeItCanBeAnswered` | 1.5 |
 | A fetch waiting at the offset a roll then starts a segment at is served that new segment's own bytes | `PartitionFetchDescriptorTest#servesTheSegmentARollStartedToAFetchWaitingAtTheOffsetThatSegmentBeginsAt` | 1.5 |
 | A fetch whose wakeup came from a record that landed in a new segment is still served the bytes of the segment its own offset is in | `PartitionFetchDescriptorTest#servesTheSegmentItAlreadyHoldsWhenTheRecordThatWokeItLandedInANewOne` | 1.5 |
