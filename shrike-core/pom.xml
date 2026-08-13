@@ -163,8 +163,12 @@
                     <classpath/>
                     <argument>org.openjdk.jmh.Main</argument>
                     <argument>io.shrike.core.bench.FlushPolicyBenchmark.appendOneProduceServiceTime</argument>
-                    <argument>-p</argument>
-                    <argument>flushMode=PER_RECORD</argument>
+                    <!-- The parameter is joined to its flag rather than written as two arguments, and
+                         that is load-bearing: `<argument>flushMode=PER_RECORD</argument>` on its own is
+                         dropped on the way to the command line, which leaves JMH reading the next flag
+                         as the parameter and refusing to start. JMH takes `-pname=value` as one token,
+                         so the value cannot go missing. -->
+                    <argument>-pflushMode=PER_RECORD</argument>
                     <argument>-i</argument>
                     <argument>30</argument>
                     <argument>-r</argument>
@@ -192,10 +196,8 @@
                     <classpath/>
                     <argument>org.openjdk.jmh.Main</argument>
                     <argument>io.shrike.core.bench.FlushPolicyBenchmark.appendOneProduceThroughput</argument>
-                    <argument>-p</argument>
-                    <argument>flushMode=PER_RECORD</argument>
-                    <argument>-p</argument>
-                    <argument>batchRecords=1</argument>
+                    <argument>-pflushMode=PER_RECORD</argument>
+                    <argument>-pbatchRecords=1</argument>
                     <argument>-f</argument>
                     <argument>4</argument>
                     <argument>-i</argument>
@@ -234,6 +236,7 @@
                   </arguments>
                 </configuration>
               </execution>
+
             </executions>
           </plugin>
         </plugins>
