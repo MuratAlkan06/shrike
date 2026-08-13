@@ -381,6 +381,28 @@ class AdminFacadeIT {
     }
 
     /**
+     * The three answers a caller can get from three different places — a controller, this facade's
+     * advice, and the container's own forward — all leave through the same socket, so all three carry
+     * the headers that say what these bodies are not.
+     */
+    @Test
+    void carriesItsSecurityHeadersOnAnAnswerOnAFailureAndOnAPathTheContainerRefuses() throws Exception {
+        int brokerPort = startBroker();
+        startFacade(brokerPort);
+
+        HttpResponse<String> served = get("/api/v1/topics");
+        HttpResponse<String> refusedHere = get("/nothing-is-served-here");
+        HttpResponse<String> refusedByTheContainer = get("/WEB-INF/x");
+
+        assertEquals(200, served.statusCode(), served.body());
+        assertSaysWhatTheBodyIsNot(served);
+        assertPlainError(refusedHere, 404, "no such endpoint");
+        assertSaysWhatTheBodyIsNot(refusedHere);
+        assertPlainError(refusedByTheContainer, 404, "no such endpoint");
+        assertSaysWhatTheBodyIsNot(refusedByTheContainer);
+    }
+
+    /**
      * A request target holding a broken percent-escape is refused while Tomcat is still parsing bytes,
      * so no servlet, no filter, and no advice of this facade's ever sees it. What it must not get back
      * is Tomcat's own HTML report, which names the server and its version.
@@ -515,6 +537,21 @@ class AdminFacadeIT {
         assertEquals(status, response.statusCode(), response.body());
         assertEquals("{\"error\":\"" + message + "\"}", response.body());
         assertNothingLeaked(response);
+    }
+
+    /**
+     * The rule every answer keeps, whatever its status: it says the bytes are to be taken as the type
+     * they were declared as, and that a browser handed them anyway may load nothing and frame nothing.
+     */
+    private void assertSaysWhatTheBodyIsNot(HttpResponse<String> response) {
+        assertEquals(SecurityHeaders.NOSNIFF, headerOf(response, SecurityHeaders.NO_SNIFFING),
+                "a browser is left to guess this body's type from its bytes");
+        assertEquals(SecurityHeaders.LOAD_NOTHING_AND_BE_FRAMED_BY_NOBODY,
+                headerOf(response, SecurityHeaders.CONTENT_SECURITY_POLICY));
+    }
+
+    private static String headerOf(HttpResponse<String> response, String name) {
+        return response.headers().firstValue(name).orElse("");
     }
 
     /**

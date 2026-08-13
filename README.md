@@ -340,6 +340,8 @@ A request Tomcat refuses **before** the servlet stack sees it — a broken perce
 
 The 400 sentence names the field the name arrived in — `topic` on a topic path, `groupId` on a group path — and quotes the caller's own input back, cut down when it is long. That quotation is the only detail any error body here carries, and it is the caller's, not the broker's.
 
+**Every answer carries two headers, whatever its status.** `X-Content-Type-Options: nosniff` says to take the `application/json` this facade declared rather than to guess a better type out of the bytes, and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` says that an answer treated as a document anyway may load nothing at all and be framed by nobody. Both are the empty policy rather than a tuned one, because there is no page, script, or stylesheet here to make an exception for. The only answer without them is the one that leaves before any filter of this facade's runs: a request Tomcat refuses while it is still parsing bytes, which is a status line and no body to sniff.
+
 ## The container image
 
 The image holds a Temurin 21 JRE and one jar, runs as a user that is not root, and keeps everything under `/var/lib/shrike`, which is where its volume goes. The two commands that build it and start it are in the [quickstart](#quickstart) above.
@@ -527,3 +529,4 @@ A claim may only be added in the same commit as the test that proves it. CI chec
 | A topic name or group id the protocol will not carry is refused 400 while nothing at all is listening on the broker's port, which is what says the name is judged before a connection is opened rather than inside one | `AdminFacadeIT#answersBadRequestForAnUnusableNameEvenWithNoBrokerToConnectTo` | 1.4 |
 | A broker that accepts a connection and then says nothing is given up on inside the facade's own describe-sized bound, which the failure it logs names, rather than the client library's thirty seconds | `AdminFacadeIT#givesUpOnABrokerThatAcceptsAConnectionAndThenSaysNothing` | 1.4 |
 | A connection may hold a place under the facade's connection cap for ten seconds without asking anything, rather than Tomcat's default minute, and the container is running with that number | `AdminFacadeIT#boundsHowLongAConnectionMayHoldAPlaceUnderTheCapWithoutAskingAnything` | 1.4 |
+| Every answer carries the two headers that say its body is not to be sniffed and not to be framed: one this facade served, one it refused, and one the container refused before the facade was asked | `AdminFacadeIT#carriesItsSecurityHeadersOnAnAnswerOnAFailureAndOnAPathTheContainerRefuses` | 1.4 |
