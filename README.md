@@ -42,6 +42,15 @@ docker build -t shrike:1.1.0 .
 docker run -d --name shrike -p 127.0.0.1:9750:9750 -v shrike-data:/var/lib/shrike shrike:1.1.0
 ```
 
+**A named volume needs nothing; a bind mount needs one command first.** The image creates `/var/lib/shrike` and hands it to uid 10001 before declaring the volume, and docker seeds a fresh named volume from the image's own directory, ownership included — which is why the `-v shrike-data:/var/lib/shrike` above simply works. A bind mount is the host's directory exactly as it stands, so `-v /srv/shrike:/var/lib/shrike` on a directory root owns is a directory the broker's user cannot write to. Give it to that uid on the host rather than giving the container root:
+
+```
+sudo install -d -o 10001 -g 10001 /srv/shrike
+docker run -d --name shrike -p 127.0.0.1:9750:9750 -v /srv/shrike:/var/lib/shrike shrike:1.1.0
+```
+
+`--user 0` would also make the broker able to write there, and it throws away the non-root user the image exists to run as.
+
 **The address in front of that port is not decoration.** The unqualified `-p 9750:9750` publishes on every interface the host has, and this broker has no authentication, so that form hands an unauthenticated broker to whatever can reach the machine. It is also not something a host firewall necessarily catches: on Linux, Docker publishes a port by writing DNAT rules that are traversed before the `INPUT` chain, so a firewall written as `INPUT` rules is a firewall the published port goes around. `127.0.0.1:9750:9750` publishes to the host's loopback and nowhere else, which is what the rest of this quickstart connects to.
 
 **Produce and consume.** A published port is an ordinary broker port, so this is the same whether the broker is in a container or not. With `shrike-core` and `shrike-clients` on the classpath — both of which depend on the JDK alone:
@@ -346,7 +355,7 @@ The 400 sentence names the field the name arrived in — `topic` on a topic path
 
 The image holds a Temurin 21 JRE and one jar, runs as a user that is not root, and keeps everything under `/var/lib/shrike`, which is where its volume goes. The two commands that build it and start it are in the [quickstart](#quickstart) above.
 
-The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a host port onto the container's own interface and never onto its loopback. The bare broker's default is the loopback address and stays that way: the image opts in, inside a network namespace of its own, and the port it can be reached on is the one its operator published. `SHRIKE_DATA_DIRECTORY` and `SHRIKE_PORT` are the other two the image sets, `SHRIKE_READY_FILE` is left at its default inside the volume, and `docker run -e` is how any of them — or any other variable in [Configuration](#configuration), none of which this image sets — is given a value. `docker stop` is a `SIGTERM`, which the broker answers by closing its logs. Its `HEALTHCHECK` opens a TCP connection to `SHRIKE_PORT` and closes it — no request, no api key, nothing appended — so `docker ps` says healthy when something is listening and says nothing about what it would answer.
+The image sets `SHRIKE_BIND_ADDRESS=0.0.0.0`, because publishing a port maps a host port onto the container's own interface and never onto its loopback. The bare broker's default is the loopback address and stays that way: the image opts in, inside a network namespace of its own, and the port it can be reached on is the one its operator published. `SHRIKE_DATA_DIRECTORY` and `SHRIKE_PORT` are the other two the image sets, `SHRIKE_READY_FILE` is left at its default inside the volume, and `docker run -e` is how any of them — or any other variable in [Configuration](#configuration), none of which this image sets — is given a value. `docker stop` is a `SIGTERM`, which the broker answers by closing its logs. Its `HEALTHCHECK` opens a TCP connection to the port the broker is on and closes it — no request, no api key, nothing appended — so `docker ps` says healthy when something is listening and says nothing about what it would answer. That port is `SHRIKE_PORT`, or `9750` when the variable is unset **or set to nothing at all**, which is the same reading the broker gives it: `docker run -e SHRIKE_PORT=` leaves the broker on its default, so the check has to land there too.
 
 That published port is an ordinary broker port, which the client code in the quickstart talks to unchanged. The admin facade is not in the image: it is an HTTP server of its own, and it runs beside the container.
 
