@@ -103,23 +103,33 @@ what it published. `validate-phase.sh` does, and it recomputes that footer
 against the packet on disk; a reply sitting beside a packet it did not answer
 is refused as `CLARIFICATION-TAMPERED`.
 
-The reply must contain four sections and no more:
+The reply must contain exactly these four sections, in this order, and nothing
+else at that heading level:
 
     ## Claim
     ## Supporting evidence
     ## What would falsify this
     ## Verification command
 
+`validate-phase.sh` reads the headings of the published body — everything above
+the provenance footer — and refuses anything else with
+`STATUS: CLARIFICATION-INVALID`: a fifth section, a missing one, the same four
+shuffled. The wording of each heading is the reviewer's; what the section is
+about is not, so the match is on the keyword and is case-insensitive.
+
 The command section contains one command and nothing else — no prose, no
 alternatives, no fallback — or the single word `none`. `validate-phase.sh`
 counts the non-empty lines in that section, ignoring the provenance footer
-below it, and rejects the file with `STATUS: CLARIFICATION-INVALID` when there
-is more than one. A reviewer who needs three commands to make a point does not
-have evidence yet.
+below it, and rejects the file when there is more than one. A reviewer who
+needs three commands to make a point does not have evidence yet.
 
 `none` is a valid and expected answer. It means no single command settles the
 question, and it counts as zero commands, because there is nothing for the
-verification lead to run.
+verification lead to run. It has to be the bare word, alone on its line — any
+case, but nothing around it. A `none` wrapped in backticks is markdown about
+the word, and `none.` is a sentence; both are refused as
+`CLARIFICATION-INVALID` rather than quietly rescored, because otherwise
+punctuation decides whether the verification lead runs something.
 
 There is no second reply. Not a follow-up question, not a "can you also
 check". If the clarification does not settle it, the protocol is finished and

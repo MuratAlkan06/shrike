@@ -66,9 +66,17 @@ usage() {
 [ "$#" -eq 2 ] || usage "expected 2 arguments, got $#"
 PHASE_ARG="$1"
 AC_ID="$2"
+# `AC-[0-9]*` reads like an anchored pattern and is not one: as a shell glob it
+# means AC-, one digit, then anything at all, so AC-1xyz passes it. The ID names
+# a directory this script reads and publishes into, so it is checked exactly —
+# AC- followed by digits and nothing else, the same shape the verdict reader in
+# validate-phase.sh requires of a criterion row.
 case "${AC_ID}" in
-  AC-[0-9]*) ;;
-  *) usage "criterion ID must look like AC-01, got: ${AC_ID}" ;;
+  AC-*) AC_DIGITS="${AC_ID#AC-}" ;;
+  *)    AC_DIGITS="" ;;
+esac
+case "${AC_DIGITS}" in
+  ""|*[!0-9]*) usage "criterion ID must be AC- followed by digits only, got: ${AC_ID}" ;;
 esac
 
 # Everything below is fixed in this script. None of it is reachable from the
@@ -99,15 +107,29 @@ if ! REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || [ -z "${REPO_RO
   exit 2
 fi
 
+# Resolved physically, then required to be inside the repository. This script
+# publishes into the directory it is handed, and "it exists" is not a licence to
+# write there: an absolute path, or a symlink pointing out of the tree, would
+# otherwise put the reply somewhere no diff, no validator and no reviewer will
+# ever look at again.
+REPO_ROOT_PHYS="$(cd "${REPO_ROOT}" && pwd -P)"
 PHASE_DIR=""
 if [ -d "${PHASE_ARG}" ]; then
-  PHASE_DIR="$(cd "${PHASE_ARG}" && pwd)"
+  PHASE_DIR="$(cd "${PHASE_ARG}" && pwd -P)"
 elif [ -d "${REPO_ROOT}/${PHASE_ARG}" ]; then
-  PHASE_DIR="$(cd "${REPO_ROOT}/${PHASE_ARG}" && pwd)"
+  PHASE_DIR="$(cd "${REPO_ROOT}/${PHASE_ARG}" && pwd -P)"
 else
   die MISSING-PHASE-DIR "no such phase directory: ${PHASE_ARG}" \
       "paths are resolved against the current directory, then the repo root."
 fi
+case "${PHASE_DIR}" in
+  "${REPO_ROOT_PHYS}"|"${REPO_ROOT_PHYS}"/*) ;;
+  *) die MISSING-PHASE-DIR \
+       "the phase directory is outside the repository: ${PHASE_DIR}" \
+       "repository root: ${REPO_ROOT_PHYS}" \
+       "a phase record belongs to the repository under review, and a clarification" \
+       "is published beside its packet; nothing here writes outside the work tree" ;;
+esac
 cd "${REPO_ROOT}"
 
 CONTRACT="${PHASE_DIR}/contract.md"
@@ -185,6 +207,62 @@ NOW_CODEX_SHA="$(sha256 "${CODEX_VERDICT}")"
   mismatch claude_verdict_sha256 "${PACKET_CLAUDE_SHA}" "${NOW_CLAUDE_SHA}"
 [ "${PACKET_CODEX_SHA}" = "${NOW_CODEX_SHA}" ] || \
   mismatch codex_verdict_sha256 "${PACKET_CODEX_SHA}" "${NOW_CODEX_SHA}"
+
+# ---- precondition: the packet names the candidate both verdicts judge --------
+# The artifact hashes above prove the packet still describes the same FILES.
+# They say nothing about the commit it claims those files judged: a packet can
+# carry three correct hashes and a candidate_sha nobody reviewed, and then the
+# reviewer is asked about a commit that was never in front of either verifier.
+#
+# The reading rule is validate-phase.sh's, unchanged. claude-verdict.md binds on
+# line 1, because the evidence-matrix template mandates line 1. codex-verdict.md
+# binds in the last `---`-delimited provenance footer the gate harness appends,
+# and falls back to line 1 when it has none. A line-1 sha may abbreviate what a
+# footer spells out in full, so agreement is prefix agreement — git's own rule,
+# and the one --new-challenge already applies to a candidate argument.
+verdict_line1_sha() { # $1 file — the sha a line-1 `HEAD:` binds, or empty
+  head -n1 "$1" | sed -n 's/^HEAD:[[:space:]]*\([0-9a-fA-F]\{7,40\}\)[[:space:]]*$/\1/p'
+}
+verdict_footer_sha() { # $1 file — head of the LAST delimited provenance footer
+  awk '
+    prev == "---" && $0 == "provenance:" {
+      inprov = 1; found = 0; val = ""; prev = $0; next
+    }
+    inprov && $0 !~ /^[[:space:]]/ { inprov = 0 }
+    inprov && !found && /^[[:space:]]+head:[[:space:]]*/ {
+      line = $0
+      sub(/^[[:space:]]*head:[[:space:]]*/, "", line)
+      sub(/[[:space:]]*$/, "", line)
+      val = line
+      found = 1
+    }
+    { prev = $0 }
+    END { if (found) print val }
+  ' "$1" | sed -n 's/^\([0-9a-fA-F]\{40\}\)$/\1/p'
+}
+sha_agrees() { # $1 $2 — equal, or one is an abbreviation of the other
+  [ -n "$1" ] || return 1
+  [ -n "$2" ] || return 1
+  case "$1" in "$2"*) return 0 ;; esac
+  case "$2" in "$1"*) return 0 ;; esac
+  return 1
+}
+
+CLAUDE_HEAD="$(verdict_line1_sha "${CLAUDE_VERDICT}")"
+CODEX_HEAD="$(verdict_footer_sha "${CODEX_VERDICT}")"
+if [ -z "${CODEX_HEAD}" ]; then CODEX_HEAD="$(verdict_line1_sha "${CODEX_VERDICT}")"; fi
+
+candidate_mismatch() { # $1 which verdict disagreed
+  die CLARIFY-PACKET-MISMATCH \
+    "${DISC}: candidate_sha is not the commit ${1} judges" \
+    "packet candidate_sha: ${PACKET_CANDIDATE}" \
+    "claude-verdict.md binds: ${CLAUDE_HEAD:-<nothing binds it to a commit>}" \
+    "codex-verdict.md binds: ${CODEX_HEAD:-<nothing binds it to a commit>}" \
+    "a packet must name the commit both verdicts judged; nothing here repairs one" \
+    "if the candidate changed, a human archives this challenge and raises a new one"
+}
+sha_agrees "${PACKET_CANDIDATE}" "${CLAUDE_HEAD}" || candidate_mismatch claude-verdict.md
+sha_agrees "${PACKET_CANDIDATE}" "${CODEX_HEAD}"  || candidate_mismatch codex-verdict.md
 
 # ---- precondition: the one shot is still unspent -----------------------------
 if [ -e "${CLAR}" ]; then
@@ -277,9 +355,24 @@ cat "${REPLY_TMP}" > "${STAGE}"
   echo "  model: ${CLARIFY_MODEL} / effort=high / sandbox=read-only / ephemeral / clean-room"
   echo "  clarifier: ${CLARIFY_VERSION} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
 } >> "${STAGE}"
-# The staging file is a sibling of its destination, so this rename is atomic:
+# The staging file is a sibling of its destination, so publication is atomic:
 # a reader sees either no clarification or the whole one, never a partial file.
-mv -f "${STAGE}" "${CLAR}"
+# It is also NO-CLOBBER, and that is the part that matters. `mv -f` would
+# happily replace a clarification published while this call was waiting for the
+# reviewer, and that window is the whole length of the reviewer call — minutes,
+# not microseconds. `ln` fails when the destination exists, so the file already
+# on disk wins and this reply is discarded. The existence check before the call
+# is a courtesy that saves a pointless invocation; this is the check that holds.
+if ! ln "${STAGE}" "${CLAR}" 2>/dev/null; then
+  rm -f "${STAGE}"
+  die CLARIFY-EXISTS \
+    "a clarification was published for ${AC_ID} while the reviewer was answering" \
+    "on disk: ${CLAR}" \
+    "one clarification per (candidate, criterion), ever — there is no second round" \
+    "publication is no-clobber: the recorded reply is untouched and this one is" \
+    "discarded, unpublished. Adjudicate on what is already recorded."
+fi
+rm -f "${STAGE}"
 
 echo "CLARIFICATION: ${CLAR}"
 echo "STATUS: CLARIFY-OK"

@@ -312,7 +312,7 @@ clarify_footer_start() { # $1 file — line of the `---` opening the last footer
 validate_clarification() { # $1 file, $2 label, $3 packet file, $4 criterion
   local file="$1" label="$2" packet="${3:-}" criterion="${4:-}" commands
   local recorded_packet recorded_criterion recorded_candidate now_packet packet_candidate
-  local footer_line body
+  local footer_line body heads nheads sole sole_lc sole_bare
 
   # The footer is provenance, not reply. It is appended below the reviewer's
   # last section, so the section reader would otherwise keep counting into it
@@ -326,21 +326,52 @@ validate_clarification() { # $1 file, $2 label, $3 packet file, $4 criterion
     cat "${file}" > "${body}"
   fi
 
-  grep -qiE '^##[[:space:]].*claim'    "${body}" || die CLARIFICATION-INVALID \
-    "${label}: missing the '## Claim' section"
-  grep -qiE '^##[[:space:]].*evidence' "${body}" || die CLARIFICATION-INVALID \
-    "${label}: missing the supporting-evidence section"
-  grep -qiE '^##[[:space:]].*falsif'   "${body}" || die CLARIFICATION-INVALID \
-    "${label}: missing the falsification section"
-  grep -qiE '^##[[:space:]].*command'  "${body}" || die CLARIFICATION-INVALID \
-    "${label}: missing the verification-command section"
+  # The documented shape (references/discrepancy-protocol.md) is exactly four
+  # `##` sections, in one order, and nothing else at that heading level. Four
+  # independent greps could see none of that: they passed a reply whose
+  # sections were shuffled, or duplicated, or followed by a fifth one arguing
+  # the point after the command. So the headings are read once, in order, and
+  # compared against the shape. Keyword matching stays case-insensitive: the
+  # reviewer titles its own sections and the protocol only fixes what each one
+  # is about — the replies in the field read '## What would falsify this' and
+  # '## Verification command'.
+  heads="${WORK}/clarification-heads"
+  awk '/^##/ { print tolower($0) }' "${body}" > "${heads}"
+  nheads="$(wc -l < "${heads}" | tr -d ' ')"
+  if [ "${nheads}" -ne 4 ]; then
+    die CLARIFICATION-INVALID \
+      "${label}: expected exactly 4 '##' sections, found ${nheads}" \
+      "the shape is:  ## Claim  /  ## Supporting evidence  /" \
+      "               ## What would falsify this  /  ## Verification command" \
+      "and nothing else at that heading level" \
+      "found: $(tr '\n' '|' < "${heads}" | sed 's/|$//')"
+  fi
+  if ! awk '
+    NR == 1 && $0 !~ /claim/    { exit 1 }
+    NR == 2 && $0 !~ /evidence/ { exit 1 }
+    NR == 3 && $0 !~ /falsif/   { exit 1 }
+    NR == 4 && $0 !~ /command/  { exit 1 }
+  ' "${heads}"; then
+    die CLARIFICATION-INVALID \
+      "${label}: the four sections are not the documented ones, in order" \
+      "expected: claim, then supporting evidence, then what would falsify," \
+      "then verification command" \
+      "found: $(tr '\n' '|' < "${heads}" | sed 's/|$//')"
+  fi
 
   # `none` is the reviewer's way of saying that no single command settles it.
   # It is a valid, expected answer — and it is zero commands, not one, because
   # there is nothing for the verification lead to run. It leaves the
   # disagreement UNRESOLVED unless evidence already on record adjudicates it;
   # that is the protocol's business, not this script's.
-  commands="$(awk '
+  #
+  # It has to be the bare word, in any case but with nothing around it. `none`
+  # in backticks is markdown ABOUT the word; `none.` is a sentence. Accepting
+  # either made the difference between "run nothing" and "run this" a matter of
+  # punctuation. They are refused rather than quietly rescored as one command,
+  # because the reviewer plainly meant "nothing to run" and the verification
+  # lead must not be sent to run a word.
+  awk '
     /^##/ { incmd = (tolower($0) ~ /command/) ? 1 : 0; next }
     incmd {
       line = $0
@@ -349,13 +380,25 @@ validate_clarification() { # $1 file, $2 label, $3 packet file, $4 criterion
       if (line ~ /^```/) next
       if (line ~ /^</ && line ~ />$/) next
       n++
-      if (n == 1) { sole = tolower(line) }
+      if (n == 1) { sole = line }
     }
-    END {
-      if (n == 1 && (sole == "none" || sole == "`none`" || sole == "none.")) { n = 0 }
-      print n + 0
-    }
-  ' "${body}")"
+    END { print n + 0; print sole }
+  ' "${body}" > "${WORK}/clarification-commands"
+  commands="$(sed -n 1p "${WORK}/clarification-commands")"
+  sole="$(sed -n 2p "${WORK}/clarification-commands")"
+  if [ "${commands}" -eq 1 ]; then
+    sole_lc="$(printf '%s\n' "${sole}" | tr '[:upper:]' '[:lower:]')"
+    sole_bare="$(printf '%s\n' "${sole_lc}" | awk '{ gsub(/[^a-z0-9]/, ""); print }')"
+    if [ "${sole_lc}" = none ]; then
+      commands=0
+    elif [ "${sole_bare}" = none ]; then
+      die CLARIFICATION-INVALID \
+        "${label}: the verification-command section reads: ${sole}" \
+        "the sanctioned answer is the bare word  none  — no backticks, no" \
+        "quoting, no punctuation. Anything else there is read as a command," \
+        "and that one is not runnable."
+    fi
+  fi
   if [ "${commands}" -gt 1 ]; then
     die CLARIFICATION-INVALID \
       "${label}: ${commands} command lines in the verification-command section" \
