@@ -360,6 +360,22 @@ cat "${REPLY_TMP}" > "${STAGE}"
   echo "  model: ${CLARIFY_MODEL} / effort=high / sandbox=read-only / ephemeral / clean-room"
   echo "  clarifier: ${CLARIFY_VERSION} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
 } >> "${STAGE}"
+# Adjudication is rechecked HERE as well, and both rechecks are needed because
+# they close different windows. The one before the call (with CLARIFY-EXISTS
+# beside it) saves a pointless reviewer invocation; this one is the one that
+# holds, because the reviewer call is minutes long and the verification lead can
+# close the record inside it. The clarification race below has a natural guard —
+# `ln` cannot clobber the file it would create — but adjudication has none:
+# challenge-result.md is not the file being written, so nothing about publishing
+# would notice it. Order matches the pre-call pair: closed outranks spent.
+if [ -e "${RESULT}" ]; then
+  rm -f "${STAGE}"
+  die CLARIFY-ADJUDICATED \
+    "${AC_ID} was adjudicated while the reviewer was answering: ${RESULT}" \
+    "the challenge closed during the call; nothing was published and the reply" \
+    "is discarded — a clarification now could only reopen a settled record" \
+    "adjudicate on what is already recorded"
+fi
 # The staging file is a sibling of its destination, so publication is atomic:
 # a reader sees either no clarification or the whole one, never a partial file.
 # It is also NO-CLOBBER, and that is the part that matters. `mv -f` would

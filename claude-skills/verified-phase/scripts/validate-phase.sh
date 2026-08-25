@@ -386,6 +386,19 @@ validate_clarification() { # $1 file, $2 label, $3 packet file, $4 criterion
   ' "${body}" > "${WORK}/clarification-commands"
   commands="$(sed -n 1p "${WORK}/clarification-commands")"
   sole="$(sed -n 2p "${WORK}/clarification-commands")"
+  # One command, or the word `none` — never neither. An empty section is not the
+  # same claim as `none`: `none` is the reviewer stating that no single command
+  # settles the question, and a section with nothing in it states nothing at all.
+  # Silence there is what a truncated, malformed or half-written reply looks
+  # like, and reading it as "run nothing" would let the protocol's one settling
+  # step be skipped by omission rather than by a judgement anyone made.
+  if [ "${commands}" -eq 0 ]; then
+    die CLARIFICATION-INVALID \
+      "${label}: the verification-command section is empty" \
+      "it holds exactly one command line, or the single word  none  when no" \
+      "single command settles it; an empty section says neither, and a reply" \
+      "that names no command and does not say  none  is not a finished reply"
+  fi
   if [ "${commands}" -eq 1 ]; then
     sole_lc="$(printf '%s\n' "${sole}" | tr '[:upper:]' '[:lower:]')"
     sole_bare="$(printf '%s\n' "${sole_lc}" | awk '{ gsub(/[^a-z0-9]/, ""); print }')"

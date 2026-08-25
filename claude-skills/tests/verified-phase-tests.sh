@@ -548,6 +548,43 @@ none.
 CLAR
 expect_out 'STATUS: CLARIFICATION-INVALID' "validate: a punctuated none is CLARIFICATION-INVALID"
 
+# An empty command section is not the same answer as `none`. `none` is the
+# reviewer saying no single command settles it; an empty section says nothing,
+# which is what a truncated or half-written reply looks like. Counting only
+# "more than one" let that pass as though the reviewer had answered.
+clar_case 1 "an empty verification-command section is refused" <<'CLAR'
+## Claim
+The deadline check is absent from the committed range.
+
+## Supporting evidence
+src/deep/reaper.txt:12 in the supplied diff shows no comparison.
+
+## What would falsify this
+Any line comparing a deadline to a clock reading.
+
+## Verification command
+CLAR
+expect_out 'STATUS: CLARIFICATION-INVALID' \
+  "validate: an empty command section is CLARIFICATION-INVALID"
+expect_out 'exactly one command line, or the single word' \
+  "validate: cites the one-command-or-none rule"
+
+# The blank-looking section is built rather than pasted, so the spaces and tab
+# that make this case what it is survive an editor that strips trailing space.
+{
+  printf '%s\n' \
+    '## Claim' 'The deadline check is absent from the committed range.' '' \
+    '## Supporting evidence' 'src/deep/reaper.txt:12 shows no comparison.' '' \
+    '## What would falsify this' 'Any line comparing a deadline to a clock.' '' \
+    '## Verification command'
+  printf ' \t \n'
+} > "${TEST_ROOT}/clar-blank-command"
+clar_case 1 "a whitespace-only verification-command section is refused" \
+  < "${TEST_ROOT}/clar-blank-command"
+expect_out 'STATUS: CLARIFICATION-INVALID' \
+  "validate: a whitespace-only command section is CLARIFICATION-INVALID"
+expect_out 'section is empty' "validate: says the command section is empty"
+
 clar_case 1 "a fifth section is refused" <<'CLAR'
 ## Claim
 The deadline check is absent from the committed range.
@@ -1132,9 +1169,14 @@ cat > "${DIR}/stdin.bin"
 case "${MOCK_CODEX_MODE:-ok}" in
   fail)  echo "stand-in reviewer failure" >&2; exit 7 ;;
   empty) : > "${out}"; exit 0 ;;
-  # `race` publishes the destination itself, mid-call, the way a second
-  # invocation that started a moment earlier would while this one waits.
+  # Both mid-call modes create MOCK_CODEX_RACE while the caller waits, the way
+  # anything else working on the same challenge would; the mode decides which
+  # file that is. `race` publishes the destination itself, as a second
+  # invocation started a moment earlier would. `adjudicate` writes the
+  # challenge-result.md, as a verification lead closing the record would.
   race)  printf 'a racing publisher got there first\n' > "${MOCK_CODEX_RACE:-/dev/null}"
+         cat "${DIR}/reply.md" > "${out}"; exit 0 ;;
+  adjudicate) cat "${DIR}/result.md" > "${MOCK_CODEX_RACE:-/dev/null}"
          cat "${DIR}/reply.md" > "${out}"; exit 0 ;;
   *)     cat "${DIR}/reply.md" > "${out}"; exit 0 ;;
 esac
@@ -1174,6 +1216,7 @@ AC-04: the fourth disputed behavior holds.
 AC-05: the fifth disputed behavior holds.
 AC-06: the sixth disputed behavior holds.
 AC-07: the seventh disputed behavior holds.
+AC-08: the eighth disputed behavior holds.
 CONTRACT
 git -C "${R_CLAR}" add docs/phases/10/contract.md
 git -C "${R_CLAR}" commit -q -m 'phase 10 contract'
@@ -1181,14 +1224,14 @@ CL_CAND="$(git -C "${R_CLAR}" rev-parse HEAD)"
 {
   printf 'HEAD: %s\n\n' "${CL_CAND}"
   printf '| Criterion | Verdict | Evidence |\n|---|---|---|\n'
-  printf '| AC-0%s | PASS | tests line %s |\n' 1 8 2 9 3 10 4 11 5 12 6 13 7 14
+  printf '| AC-0%s | PASS | tests line %s |\n' 1 8 2 9 3 10 4 11 5 12 6 13 7 14 8 15
 } > "${CLD}/claude-verdict.md"
 {
   printf 'HEAD: %s\n\n' "${CL_CAND}"
   printf '| Criterion | Verdict | Evidence |\n|---|---|---|\n'
-  printf '| AC-0%s | FAIL | diff line %s |\n' 1 4 2 5 3 6 4 7 5 8 6 9 7 10
+  printf '| AC-0%s | FAIL | diff line %s |\n' 1 4 2 5 3 6 4 7 5 8 6 9 7 10 8 11
 } > "${CLD}/codex-verdict.md"
-for id in AC-01 AC-02 AC-03 AC-04 AC-05 AC-06 AC-07; do
+for id in AC-01 AC-02 AC-03 AC-04 AC-05 AC-06 AC-07 AC-08; do
   run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10 \
     --new-challenge "${id}" "${CL_CAND}"
   [ "${RUN_STATUS}" -eq 0 ] || { dump_last; fail "clarify fixture: packet for ${id} not created"; }
@@ -1536,6 +1579,46 @@ ok "clarify: the racing publisher's file is byte-unchanged"
 [ -z "$(find "${CH6}" -name '.codex-clarification.*' -print)" ] \
   || fail "clarify: the refused publication left its staging file behind"
 ok "clarify: a refused publication leaves no staging file"
+
+# -- the same window can also CLOSE the record, and `ln` cannot see that -------
+# No-clobber publication guards the clarification, and nothing about it notices
+# a challenge-result.md that appeared during the call: that file is not the one
+# being written. The stand-in closes the record mid-call, exactly as a
+# verification lead who stopped waiting would, and the reply has to be dropped
+# rather than published into a challenge somebody already settled.
+CH8="${CLD}/challenges/AC-08"
+cat > "${MOCKDIR}/result.md" <<RESULT
+# Adjudication — AC-08
+
+Clarification: not obtained; the record was closed while the call was running.
+Adjudication: sustained on the evidence already recorded in both verdicts.
+
+discrepancy_sha256: $(file_hash "${CH8}/discrepancy.md")
+clarification_sha256: absent
+RESULT
+adjudicated_sha="$(file_hash "${MOCKDIR}/result.md")"
+MOCK_MODE=adjudicate
+MOCK_RACE="${CH8}/challenge-result.md"
+run_clarify docs/phases/10 AC-08
+MOCK_MODE=ok
+MOCK_RACE=""
+expect_status 1 "clarify: a challenge adjudicated during the call refuses"
+expect_out 'STATUS: CLARIFY-ADJUDICATED' \
+  "clarify: a mid-call adjudication reports CLARIFY-ADJUDICATED"
+expect_out 'while the reviewer was answering' \
+  "clarify: says the adjudication arrived during the call"
+cmp -s "${MOCKDIR}/stdin.bin" "${CH8}/discrepancy.md" \
+  || fail "clarify: the mid-call adjudication was caught before the reviewer ran"
+ok "clarify: the refusal came after the reviewer answered, not before it"
+[ ! -e "${CH8}/codex-clarification.md" ] \
+  || fail "clarify: a reply was published into a challenge closed during the call"
+ok "clarify: a mid-call adjudication publishes nothing"
+[ -z "$(find "${CH8}" -name '.codex-clarification.*' -print)" ] \
+  || fail "clarify: the refused publication left its staging file behind"
+ok "clarify: a mid-call adjudication leaves no staging file"
+[ "${adjudicated_sha}" = "$(file_hash "${CH8}/challenge-result.md")" ] \
+  || fail "clarify: the adjudication written during the call was modified"
+ok "clarify: the adjudication written during the call is byte-unchanged"
 
 # ---- 16. a symlinked skill source is refused, not resolved -------------------
 # Phase 02 incident shape: the suite reached its own source through a symlink,
