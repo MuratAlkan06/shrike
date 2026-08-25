@@ -16,7 +16,21 @@
 # Usage: claude-skills/install.sh        (honours $HOME; tests override it)
 set -euo pipefail
 
-SRC_ROOT="$(cd "$(dirname "$0")" && pwd)"
+# The source is resolved PHYSICALLY, and a logical path that differs from it
+# means this script was reached through a symlink. Refuse: the installer copies
+# and replaces trees, and a link in the source path makes "the sandbox copy"
+# and "the live tree" the same bytes. That is exactly how a fixture once
+# reached back into the working tree it was supposed to be isolated from.
+SRC_ROOT="$(cd "$(dirname "$0")" && pwd -P)"
+SRC_ROOT_LOGICAL="$(cd "$(dirname "$0")" && pwd)"
+if [ "${SRC_ROOT}" != "${SRC_ROOT_LOGICAL}" ]; then
+  echo "install: REFUSING — the source path resolves through a symlink." >&2
+  echo "install: logical:  ${SRC_ROOT_LOGICAL}" >&2
+  echo "install: physical: ${SRC_ROOT}" >&2
+  echo "install: run it by its real path; nothing was read or written." >&2
+  echo "STATUS: SKILLS-SRC-SYMLINK"
+  exit 2
+fi
 SKILL_NAME="verified-phase"
 SRC="${SRC_ROOT}/${SKILL_NAME}"
 : "${HOME:?HOME must be set}"
