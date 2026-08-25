@@ -156,13 +156,75 @@ validate_contract() {
 }
 
 # ---- verdict files -----------------------------------------------------------
-validate_verdict() { # $1 file, $2 label
-  local file="$1" label="$2" head_sha
+# The gate harness publishes codex-verdict.md with the reviewer's criterion
+# table on line 1 and binds the candidate in the provenance footer it appends:
+#
+#     ---
+#     provenance:
+#       head: <40-hex>
+#       base: <40-hex> (merge-base of <ref>)
+#
+# so a validator that insists on line 1 rejects every genuine gate verdict.
+# The footer binding is read for the reviewer verdict; a hand-written
+# line-1 `HEAD: <sha>` still binds, and when a file carries both they must
+# name the same commit. claude-verdict.md is unchanged — the evidence-matrix
+# template mandates line 1, so line 1 is what is read.
+#
+# Only the footer the harness appends at the end of the file binds anything.
+# A reviewer writing about this very machinery can quote `provenance:` and
+# `head:` in its prose, so the LAST such block wins and an earlier quotation
+# binds nothing. If that final block carries no readable head, the file is
+# unbound — verdict prose never gets to name the candidate.
+footer_head_sha() { # $1 file — head sha of the last provenance footer, or empty
+  awk '
+    /^[[:space:]]*provenance:[[:space:]]*$/ { inprov = 1; found = 0; val = ""; next }
+    inprov && !found && /^[[:space:]]*head:[[:space:]]*/ {
+      line = $0
+      sub(/^[[:space:]]*head:[[:space:]]*/, "", line)
+      sub(/[[:space:]]*$/, "", line)
+      val = line
+      found = 1
+    }
+    END { if (found) print val }
+  ' "$1" | sed -n 's/^\([0-9a-fA-F]\{40\}\)$/\1/p'
+}
+
+validate_verdict() { # $1 file, $2 label, $3 "footer" when a provenance footer may bind
+  local file="$1" label="$2" footer_ok="${3:-}" head_sha line1_sha footer_sha
   [ -s "${file}" ] || return 0
 
-  head_sha="$(head -n1 "${file}" | sed -n 's/^HEAD:[[:space:]]*\([0-9a-fA-F]\{7,40\}\)[[:space:]]*$/\1/p')"
-  [ -n "${head_sha}" ] || die VERDICT-UNBOUND \
-    "${label}: line 1 must be exactly  HEAD: <sha>  (found: $(head -n1 "${file}"))"
+  line1_sha="$(head -n1 "${file}" | sed -n 's/^HEAD:[[:space:]]*\([0-9a-fA-F]\{7,40\}\)[[:space:]]*$/\1/p')"
+  footer_sha=""
+  if [ "${footer_ok}" = footer ]; then footer_sha="$(footer_head_sha "${file}")"; fi
+
+  # Both present: they must name one commit. A hand-written line 1 may
+  # abbreviate the sha the footer spells out in full — git's own rule, and the
+  # rule --new-challenge already applies to a candidate argument — so the
+  # footer, which is always the full 40, has to start with what line 1 claims.
+  if [ -n "${line1_sha}" ] && [ -n "${footer_sha}" ]; then
+    case "${footer_sha}" in
+      "${line1_sha}"*) ;;
+      *) die VERDICT-UNBOUND \
+           "${label}: line 1 and the provenance footer bind different commits" \
+           "line 1: ${line1_sha}" \
+           "footer: ${footer_sha}" \
+           "one file may not claim to judge two candidates; rebind or republish it" ;;
+    esac
+  fi
+
+  head_sha=""
+  if [ -n "${footer_sha}" ]; then head_sha="${footer_sha}"
+  elif [ -n "${line1_sha}" ]; then head_sha="${line1_sha}"; fi
+  if [ -z "${head_sha}" ]; then
+    if [ "${footer_ok}" = footer ]; then
+      die VERDICT-UNBOUND \
+        "${label}: nothing binds this verdict to a commit — expected line 1" \
+        "  HEAD: <sha>  or a provenance footer carrying  head: <40-hex>" \
+        "(line 1 is: $(head -n1 "${file}"))"
+    fi
+    die VERDICT-UNBOUND \
+      "${label}: line 1 must be exactly  HEAD: <sha>  (found: $(head -n1 "${file}"))"
+  fi
 
   if [ -z "${CANDIDATE_SHA}" ]; then
     CANDIDATE_SHA="${head_sha}"
@@ -307,7 +369,7 @@ validate_challenges() {
 validate_core() {
   validate_contract
   validate_verdict "${CLAUDE_VERDICT}" "claude-verdict.md"
-  validate_verdict "${CODEX_VERDICT}" "codex-verdict.md"
+  validate_verdict "${CODEX_VERDICT}" "codex-verdict.md" footer
   validate_challenges
 }
 
@@ -385,6 +447,7 @@ new_challenge() {
 # ---- mode: release-check -----------------------------------------------------
 release_check() {
   local blockers=0 id verdict waiver name_part
+  local set_status="" dupes unknown missing
   validate_core
 
   [ -s "${DECISION}" ] || die NOT-RELEASABLE \
@@ -405,8 +468,49 @@ release_check() {
     die NOT-RELEASABLE \
       "${DECISION}: a row has a bad ID or a verdict outside PASS|FAIL|CANNOT-VERIFY|UNRESOLVED"
   fi
-  [ -s "${WORK}/decision-rows" ] || die NOT-RELEASABLE \
-    "${DECISION}: no merged criterion rows found"
+  # A matrix with no rows at all is the extreme case of a row left out, and it
+  # is reported as one below, naming every criterion that has no row.
+  #
+  # The merged matrix must cover the contract and nothing else. Reading rows
+  # one at a time cannot see an absent row, and a repeated row hides which of
+  # its verdicts counted, so the row set is compared with the contract the way
+  # the gate harness compares a reviewer verdict with it: LC_ALL=C sort with
+  # uniq -d for repeats, then cmp for set equality. All three problems are
+  # reported; the status names the first class found, so it is deterministic.
+  awk '{ print $1 }' "${WORK}/decision-rows" > "${WORK}/decision-ids"
+  LC_ALL=C sort -u "${WORK}/decision-ids"  > "${WORK}/decision-ids.sorted"
+  LC_ALL=C sort -u "${WORK}/contract-ids"  > "${WORK}/contract-ids.sorted"
+
+  dupes="$(LC_ALL=C sort "${WORK}/decision-ids" | uniq -d | tr '\n' ' ')"
+  unknown=""
+  missing=""
+  if ! cmp -s "${WORK}/decision-ids.sorted" "${WORK}/contract-ids.sorted"; then
+    unknown="$(LC_ALL=C comm -23 "${WORK}/decision-ids.sorted" \
+                                 "${WORK}/contract-ids.sorted" | tr '\n' ' ')"
+    missing="$(LC_ALL=C comm -13 "${WORK}/decision-ids.sorted" \
+                                 "${WORK}/contract-ids.sorted" | tr '\n' ' ')"
+  fi
+  if [ -n "${dupes% }" ]; then
+    echo "DETAIL: ${DECISION}: repeated row(s) for: ${dupes% }"
+    echo "DETAIL: one merged row per criterion; a repeat hides which verdict counted."
+    set_status="DECISION-DUPLICATE-ROW"
+  fi
+  if [ -n "${unknown% }" ]; then
+    echo "DETAIL: ${DECISION}: row(s) naming a criterion the contract does not declare: ${unknown% }"
+    [ -n "${set_status}" ] || set_status="DECISION-UNKNOWN-ROW"
+  fi
+  if [ -n "${missing% }" ]; then
+    if [ ! -s "${WORK}/decision-ids" ]; then
+      echo "DETAIL: ${DECISION}: no merged criterion rows found at all."
+    fi
+    echo "DETAIL: ${DECISION}: no row for contracted criterion/criteria: ${missing% }"
+    echo "DETAIL: every criterion in ${CONTRACT} is reconciled before a release."
+    [ -n "${set_status}" ] || set_status="DECISION-MISSING-ROW"
+  fi
+  if [ -n "${set_status}" ]; then
+    die "${set_status}" \
+      "the merged matrix must carry one row for each contracted criterion, and no others"
+  fi
 
   grep -n 'WAIVED-BY:' "${DECISION}" > "${WORK}/waivers" || true
   : > "${WORK}/valid-waivers"
