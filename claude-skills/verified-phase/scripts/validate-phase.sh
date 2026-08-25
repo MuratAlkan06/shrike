@@ -275,17 +275,71 @@ validate_verdict() { # $1 file, $2 label, $3 "footer" when a provenance footer m
 }
 
 # ---- bounded evidence challenge ---------------------------------------------
-validate_clarification() { # $1 file, $2 label
-  local file="$1" label="$2" commands
-  grep -qiE '^##[[:space:]].*claim'    "${file}" || die CLARIFICATION-INVALID \
+# clarify-challenge.sh appends a footer delimited the way the gate harness
+# delimits its own: a line that is exactly `---` with `clarify-provenance:` at
+# column 0 immediately below it. It binds the reply to the packet it answered.
+# The same residual applies as for the verdict footer: prose that reproduces a
+# whole delimited footer byte for byte is indistinguishable from the real one.
+# Drift guard, not adversarial boundary. If several delimited footers exist the
+# LAST one wins; a file with none is legacy-acceptable and simply unbound.
+clarify_footer_field() { # $1 file, $2 key — value from the last delimited footer
+  awk -v key="$2" '
+    BEGIN { re = "^[[:space:]]+" key ":[[:space:]]*" }
+    prev == "---" && $0 == "clarify-provenance:" {
+      infoot = 1; found = 0; val = ""; prev = $0; next
+    }
+    infoot && $0 !~ /^[[:space:]]/ { infoot = 0 }
+    infoot && !found && $0 ~ re {
+      line = $0
+      sub(re, "", line)
+      sub(/[[:space:]]*$/, "", line)
+      val = line
+      found = 1
+    }
+    { prev = $0 }
+    END { if (found) print val }
+  ' "$1"
+}
+
+clarify_footer_start() { # $1 file — line of the `---` opening the last footer, or 0
+  awk '
+    prev == "---" && $0 == "clarify-provenance:" { start = NR - 1 }
+    { prev = $0 }
+    END { print start + 0 }
+  ' "$1"
+}
+
+validate_clarification() { # $1 file, $2 label, $3 packet file, $4 criterion
+  local file="$1" label="$2" packet="${3:-}" criterion="${4:-}" commands
+  local recorded_packet recorded_criterion recorded_candidate now_packet packet_candidate
+  local footer_line body
+
+  # The footer is provenance, not reply. It is appended below the reviewer's
+  # last section, so the section reader would otherwise keep counting into it
+  # and report a one-command clarification as an eight-command one. Structure
+  # is judged on the body: everything above the last delimited footer.
+  footer_line="$(clarify_footer_start "${file}")"
+  body="${WORK}/clarification-body"
+  if [ "${footer_line}" -gt 0 ]; then
+    head -n "$((footer_line - 1))" "${file}" > "${body}"
+  else
+    cat "${file}" > "${body}"
+  fi
+
+  grep -qiE '^##[[:space:]].*claim'    "${body}" || die CLARIFICATION-INVALID \
     "${label}: missing the '## Claim' section"
-  grep -qiE '^##[[:space:]].*evidence' "${file}" || die CLARIFICATION-INVALID \
+  grep -qiE '^##[[:space:]].*evidence' "${body}" || die CLARIFICATION-INVALID \
     "${label}: missing the supporting-evidence section"
-  grep -qiE '^##[[:space:]].*falsif'   "${file}" || die CLARIFICATION-INVALID \
+  grep -qiE '^##[[:space:]].*falsif'   "${body}" || die CLARIFICATION-INVALID \
     "${label}: missing the falsification section"
-  grep -qiE '^##[[:space:]].*command'  "${file}" || die CLARIFICATION-INVALID \
+  grep -qiE '^##[[:space:]].*command'  "${body}" || die CLARIFICATION-INVALID \
     "${label}: missing the verification-command section"
 
+  # `none` is the reviewer's way of saying that no single command settles it.
+  # It is a valid, expected answer — and it is zero commands, not one, because
+  # there is nothing for the verification lead to run. It leaves the
+  # disagreement UNRESOLVED unless evidence already on record adjudicates it;
+  # that is the protocol's business, not this script's.
   commands="$(awk '
     /^##/ { incmd = (tolower($0) ~ /command/) ? 1 : 0; next }
     incmd {
@@ -295,15 +349,47 @@ validate_clarification() { # $1 file, $2 label
       if (line ~ /^```/) next
       if (line ~ /^</ && line ~ />$/) next
       n++
+      if (n == 1) { sole = tolower(line) }
     }
-    END { print n + 0 }
-  ' "${file}")"
+    END {
+      if (n == 1 && (sole == "none" || sole == "`none`" || sole == "none.")) { n = 0 }
+      print n + 0
+    }
+  ' "${body}")"
   if [ "${commands}" -gt 1 ]; then
     die CLARIFICATION-INVALID \
       "${label}: ${commands} command lines in the verification-command section" \
       "the reviewer may name at most one deterministic command, and nothing else"
   fi
   echo "CLARIFICATION-OK: ${label} (commands: ${commands})"
+
+  # A published clarification carries a footer binding it to the packet it
+  # answered. If it is present it is verified; a reply that answers one packet
+  # while sitting beside another is not evidence about this challenge.
+  [ -n "${packet}" ] && [ -f "${packet}" ] || return 0
+  [ "${footer_line}" -gt 0 ] || return 0
+  recorded_packet="$(clarify_footer_field "${file}" packet_sha256)"
+  recorded_criterion="$(clarify_footer_field "${file}" disputed_criterion)"
+  recorded_candidate="$(clarify_footer_field "${file}" candidate_sha)"
+  now_packet="$(sha256 "${packet}")"
+  packet_candidate="$(sed -n 's/^candidate_sha:[[:space:]]*//p' "${packet}" | head -n1)"
+  if [ "${recorded_packet}" != "${now_packet}" ]; then
+    die CLARIFICATION-TAMPERED \
+      "${label}: the packet it answered is not the packet on disk" \
+      "recorded: ${recorded_packet:-<no packet_sha256 in the footer>}" \
+      "now:      ${now_packet}" \
+      "either the packet changed after the reply, or the reply answers another one"
+  fi
+  if [ "${recorded_criterion}" != "${criterion}" ]; then
+    die CLARIFICATION-TAMPERED \
+      "${label}: the footer names ${recorded_criterion:-<nothing>}, not ${criterion}"
+  fi
+  if [ "${recorded_candidate}" != "${packet_candidate}" ]; then
+    die CLARIFICATION-TAMPERED \
+      "${label}: the footer binds candidate ${recorded_candidate:-<nothing>}," \
+      "the packet binds ${packet_candidate}"
+  fi
+  echo "CLARIFICATION-BOUND: ${label} (packet ${now_packet})"
 }
 
 validate_challenge() { # $1 challenge dir
@@ -336,7 +422,9 @@ validate_challenge() { # $1 challenge dir
   done
   echo "CHALLENGE-OK: ${name} (packet provenance complete)"
 
-  if [ -f "${clar}" ]; then validate_clarification "${clar}" "${name}/codex-clarification.md"; fi
+  if [ -f "${clar}" ]; then
+    validate_clarification "${clar}" "${name}/codex-clarification.md" "${disc}" "${name}"
+  fi
 
   if [ -f "${res}" ]; then
     rec_disc="$(sed -n 's/^discrepancy_sha256:[[:space:]]*//p' "${res}" | head -n1)"
