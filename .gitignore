@@ -14,3 +14,7 @@ target/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Local/runtime verification artifacts
+shrike-data/
+docs/phases/**/evidence-full.log

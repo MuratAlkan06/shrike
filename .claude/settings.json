@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(codex exec --sandbox workspace-write*)",
+      "Bash(codex exec --sandbox danger-full-access*)",
+      "Bash(codex --sandbox workspace-write*)",
+      "Bash(codex --sandbox danger-full-access*)",
+      "Bash(codex exec --dangerously-bypass-approvals-and-sandbox*)",
+      "Bash(codex --dangerously-bypass-approvals-and-sandbox*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/block-unsafe-codex.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
