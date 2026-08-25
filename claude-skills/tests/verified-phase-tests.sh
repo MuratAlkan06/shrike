@@ -40,6 +40,7 @@ refute_out() { # pattern, label
   if grep -qE -- "$1" "${TEST_ROOT}/last.all"; then dump_last; fail "$2: unexpected /$1/"; fi
   ok "$2"
 }
+last_status() { sed -n 's/^STATUS: //p' "${TEST_ROOT}/last.all" | tail -n1; }
 file_hash() { shasum -a 256 "$1" | cut -d' ' -f1; }
 tree_hash() { # $1 dir — content + executability, path-ordered
   (
@@ -523,6 +524,223 @@ expect_out 'STATUS: USAGE' "validate: reports USAGE"
 run_in "${R_REL}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/99
 expect_status 1 "validate: an absent phase directory refuses"
 expect_out 'STATUS: MISSING-PHASE-DIR' "validate: reports MISSING-PHASE-DIR"
+
+# ---- 12b. the layout the gate harness actually publishes ---------------------
+# codex-gate.sh writes the reviewer's table starting at line 1 and binds the
+# candidate only in the provenance footer it appends. A validator that demands
+# `HEAD:` on line 1 rejects every genuine gate verdict, so both bindings are
+# accepted — and a file carrying both must name one commit, not two.
+R_HARN="${TEST_ROOT}/repo-harness-layout"
+new_repo "${R_HARN}"
+HARN_BASE="$(git -C "${R_HARN}" rev-parse HEAD)"
+mkdir -p "${R_HARN}/docs/phases/09"
+HD="${R_HARN}/docs/phases/09"
+cat > "${HD}/contract.md" <<CONTRACT
+# Phase 09: harness-layout fixture
+
+## Base
+Base SHA: ${HARN_BASE}
+Base ref: main
+
+## Acceptance criteria
+AC-01: the first behavior holds.
+AC-02: the second behavior holds.
+CONTRACT
+git -C "${R_HARN}" add docs/phases/09/contract.md
+git -C "${R_HARN}" commit -q -m 'phase 09 contract'
+HARN_CAND="$(git -C "${R_HARN}" rev-parse HEAD)"
+cat > "${HD}/claude-verdict.md" <<VERDICT
+HEAD: ${HARN_CAND}
+
+| Criterion | Verdict | Evidence |
+|---|---|---|
+| AC-01 | PASS | tests line 8 |
+| AC-02 | PASS | tests line 9 |
+VERDICT
+
+write_harness_verdict() { # $1 footer head sha, $2 line-1 HEAD sha ("" for none)
+  {
+    if [ -n "${2:-}" ]; then printf 'HEAD: %s\n\n' "$2"; fi
+    printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+    printf '|---|---|---|\n'
+    printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+    printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+    printf '\n## UNSTATED-RISK\n\n- none\n'
+    printf '%s\n' '---'
+    printf 'provenance:\n'
+    printf '  head: %s\n' "$1"
+    printf '  base: %s (merge-base of main)\n' "${HARN_BASE}"
+    printf '  contract_sha256: %s\n' "$(file_hash "${HD}/contract.md")"
+    printf '  gate_conf_sha256: %s\n' \
+      '0000000000000000000000000000000000000000000000000000000000000000'
+    printf '  model: gpt-5.6-sol / effort=high / sandbox=read-only / ephemeral / clean-room\n'
+    printf '  harness: codex-gate.sh v2.1.1 (2026-08-24T21:08:19Z)\n'
+  } > "${HD}/codex-verdict.md"
+}
+write_harness_decision() { # $... row bodies, e.g. 'AC-01 | PASS | PASS | PASS'
+  {
+    printf '# Phase 09 decision\n\n'
+    printf '| Criterion | Claude (Tier-1) | Codex (Tier-2) | Reconciled |\n'
+    printf '|---|---|---|---|\n'
+    for line in "$@"; do printf '| %s |\n' "${line}"; done
+  } > "${HD}/decision.md"
+}
+
+write_harness_verdict "${HARN_CAND}" ""
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 0 "validate: the harness verdict layout is accepted"
+expect_out "VERDICT-OK: codex-verdict\.md \(HEAD ${HARN_CAND}\)" \
+  "validate: binds the candidate from the provenance footer"
+expect_out 'STATUS: OK' "validate: harness layout reports OK"
+
+write_harness_decision 'AC-01 | PASS | PASS | PASS' 'AC-02 | PASS | PASS | PASS'
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" --release-check docs/phases/09
+expect_status 0 "release: a harness-published verdict passes the release check"
+expect_out 'STATUS: RELEASABLE' "release: harness layout reports RELEASABLE"
+
+cat > "${HD}/codex-verdict.md" <<VERDICT
+HEAD: ${HARN_CAND}
+
+| Criterion | Verdict | Evidence |
+|---|---|---|
+| AC-01 | PASS | diff line 4 |
+| AC-02 | PASS | tests line 9 |
+VERDICT
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 0 "validate: a legacy line-1 HEAD verdict is still accepted"
+expect_out "VERDICT-OK: codex-verdict\.md \(HEAD ${HARN_CAND}\)" \
+  "validate: line 1 still binds when there is no footer"
+
+write_harness_verdict "${HARN_CAND}" "${HARN_CAND}"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 0 "validate: line 1 and footer in agreement are accepted"
+expect_out 'STATUS: OK' "validate: agreeing bindings report OK"
+
+write_harness_verdict "${HARN_CAND}" "${HARN_BASE}"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: line 1 and footer naming different commits refuses"
+expect_out 'STATUS: VERDICT-UNBOUND' "validate: conflicting bindings report VERDICT-UNBOUND"
+expect_out "line 1: ${HARN_BASE}" "validate: names the line-1 sha in the conflict"
+expect_out "footer: ${HARN_CAND}" "validate: names the footer sha in the conflict"
+
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | diff line 4 |\n'
+  printf '| AC-02 | PASS | tests line 9 |\n'
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: a verdict bound to nothing refuses"
+expect_out 'STATUS: VERDICT-UNBOUND' "validate: an unbound verdict reports VERDICT-UNBOUND"
+
+write_harness_verdict "not-a-sha" ""
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: a footer head that is not a full sha binds nothing"
+expect_out 'STATUS: VERDICT-UNBOUND' "validate: a malformed footer head reports VERDICT-UNBOUND"
+
+write_harness_verdict "${HARN_BASE}" ""
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: a footer bound to another commit refuses"
+expect_out 'STATUS: VERDICT-SHA-MISMATCH' "validate: reports VERDICT-SHA-MISMATCH across verdicts"
+
+# A reviewer judging this machinery quotes `provenance:` and `head:` in its
+# prose. Only the footer the harness appends last may bind the file, or the
+# reviewer's own text could name the candidate.
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+  printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+  printf '\n## UNSTATED-RISK\n\n- the footer format under review reads:\n\n'
+  printf '```\nprovenance:\n  head: %s\n```\n\n' "${HARN_BASE}"
+  printf '%s\n' '---'
+  printf 'provenance:\n'
+  printf '  head: %s\n' "${HARN_CAND}"
+  printf '  harness: codex-gate.sh v2.1.1 (2026-08-24T21:08:19Z)\n'
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 0 "validate: quoted provenance text in the verdict body binds nothing"
+expect_out "VERDICT-OK: codex-verdict\.md \(HEAD ${HARN_CAND}\)" \
+  "validate: the appended footer binds, not the quotation above it"
+
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+  printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+  printf '\n## UNSTATED-RISK\n\n```\nprovenance:\n  head: %s\n```\n\n' "${HARN_CAND}"
+  printf '%s\n' '---'
+  printf 'provenance:\n'
+  printf '  base: %s (merge-base of main)\n' "${HARN_BASE}"
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: a final footer with no head leaves the verdict unbound"
+expect_out 'STATUS: VERDICT-UNBOUND' \
+  "validate: an earlier quotation cannot stand in for the missing footer head"
+
+# git accepts an abbreviated sha as naming a commit, and so does the
+# line-1 binding; the full sha the harness writes must simply start with it.
+write_harness_verdict "${HARN_CAND}" "$(printf '%s' "${HARN_CAND}" | cut -c1-8)"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 0 "validate: an abbreviated line 1 agrees with the full footer sha"
+expect_out "VERDICT-OK: codex-verdict\.md \(HEAD ${HARN_CAND}\)" \
+  "validate: the full footer sha is the one carried forward"
+
+write_harness_verdict "${HARN_CAND}" "$(printf '%s' "${HARN_BASE}" | cut -c1-8)"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: an abbreviation of another commit is still a conflict"
+expect_out 'STATUS: VERDICT-UNBOUND' "validate: abbreviated conflicts report VERDICT-UNBOUND"
+
+# ---- 12c. the merged matrix must cover the contract, and only it -------------
+write_harness_verdict "${HARN_CAND}" ""
+
+write_harness_decision
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" --release-check docs/phases/09
+expect_status 1 "release: a decision with a header but no rows blocks"
+expect_out 'STATUS: DECISION-MISSING-ROW' \
+  "release: an empty matrix is reported as rows left out, not as a bare refusal"
+expect_out 'no row for contracted criterion/criteria: AC-01 AC-02' \
+  "release: names every criterion left without a row"
+
+write_harness_decision 'AC-01 | PASS | PASS | PASS'
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" --release-check docs/phases/09
+expect_status 1 "release: a decision omitting a contracted criterion blocks"
+expect_out 'STATUS: DECISION-MISSING-ROW' "release: reports DECISION-MISSING-ROW"
+expect_out 'no row for contracted criterion/criteria: AC-02' "release: names the absent criterion"
+S_MISSING="$(last_status)"
+
+write_harness_decision 'AC-01 | PASS | PASS | PASS' 'AC-02 | PASS | PASS | PASS' \
+                       'AC-99 | PASS | PASS | PASS'
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" --release-check docs/phases/09
+expect_status 1 "release: a row for an undeclared criterion blocks"
+expect_out 'STATUS: DECISION-UNKNOWN-ROW' "release: reports DECISION-UNKNOWN-ROW"
+expect_out 'does not declare: AC-99' "release: names the undeclared criterion"
+S_UNKNOWN="$(last_status)"
+
+write_harness_decision 'AC-01 | PASS | PASS | PASS' 'AC-01 | PASS | PASS | PASS' \
+                       'AC-02 | PASS | PASS | PASS'
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" --release-check docs/phases/09
+expect_status 1 "release: a repeated row for one criterion blocks"
+expect_out 'STATUS: DECISION-DUPLICATE-ROW' "release: reports DECISION-DUPLICATE-ROW"
+expect_out 'repeated row\(s\) for: AC-01' "release: names the repeated criterion"
+S_DUP="$(last_status)"
+
+[ "${S_MISSING}" != "${S_UNKNOWN}" ] && [ "${S_UNKNOWN}" != "${S_DUP}" ] \
+  && [ "${S_MISSING}" != "${S_DUP}" ] \
+  || fail "release: the three decision-matrix statuses are not distinct"
+ok "release: missing, unknown, and repeated rows report three distinct statuses"
+
+write_harness_decision 'AC-01 | PASS | PASS | PASS' 'AC-01 | PASS | PASS | PASS' \
+                       'AC-02 | PASS | PASS | PASS' 'AC-99 | PASS | PASS | PASS'
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" --release-check docs/phases/09
+expect_status 1 "release: two matrix problems at once still block"
+expect_out 'STATUS: DECISION-DUPLICATE-ROW' "release: the reported status is the first failing class"
+expect_out 'does not declare: AC-99' "release: the other problem is still detailed"
+
+write_harness_decision 'AC-01 | PASS | PASS | PASS' 'AC-02 | PASS | PASS | PASS'
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" --release-check docs/phases/09
+expect_status 0 "release: a matrix covering the contract exactly is releasable"
+expect_out 'STATUS: RELEASABLE' "release: the complete matrix reports RELEASABLE"
 
 # ---- 13. shell portability ---------------------------------------------------
 > "${TEST_ROOT}/bash4-pattern" printf '%s\n' 'mapfile' 'readarray' 'declare -A' \
