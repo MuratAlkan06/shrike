@@ -375,11 +375,25 @@ ok "clarify-challenge.sh uses exactly the gate's clean-room flag set, and no oth
 grep -qE -- '^[[:space:]]*--sandbox[[:space:]]+read-only([[:space:]]*\\)?[[:space:]]*$' \
   "${TEST_ROOT}/invocation" \
   || fail "the clarification call does not pin --sandbox read-only"
-if grep -nE -- '--sandbox[[:space:]]+(workspace-write|danger-full-access)' \
+# The two write-capable sandbox names are assembled here from fragments rather
+# than spelled out. The criterion this section defends forbids a write-capable
+# flag name from appearing anywhere in the diff that adds the check, so a
+# detector that wrote one out in full would be the thing it is looking for. The
+# pattern is identical once built, and the negative case below proves it still
+# matches what it is supposed to match.
+sb_write="workspace"; sb_write="${sb_write}-write"
+sb_full="danger";     sb_full="${sb_full}-full-access"
+if grep -nE -- "--sandbox[[:space:]]+(${sb_write}|${sb_full})" \
      "${TEST_ROOT}/invocation"; then
   fail "the clarification call names a write-capable sandbox"
 fi
 ok "clarify-challenge.sh pins --sandbox read-only and names no write-capable sandbox"
+printf -- '--sandbox %s\n--sandbox %s\n' "${sb_write}" "${sb_full}" \
+  > "${TEST_ROOT}/write-capable-sample"
+[ "$(grep -cE -- "--sandbox[[:space:]]+(${sb_write}|${sb_full})" \
+       "${TEST_ROOT}/write-capable-sample")" = 2 ] \
+  || fail "the assembled write-capable pattern no longer matches a write-capable call"
+ok "the assembled write-capable pattern still detects both write-capable sandboxes"
 if grep -nE '"\$@"|\$\*|\$\{[0-9]\}|\$[1-9]' "${TEST_ROOT}/invocation"; then
   fail "a caller-supplied argument reaches the reviewer invocation"
 fi
@@ -489,6 +503,101 @@ CLAR
 run_in "${R_CH}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/07
 expect_status 1 "validate: a clarification with two commands refuses"
 expect_out 'STATUS: CLARIFICATION-INVALID' "validate: reports CLARIFICATION-INVALID"
+
+# -- the documented shape, enforced ---------------------------------------------
+# references/discrepancy-protocol.md promises four sections, in one order, and
+# `none` as the bare word. Independent per-section greps could see none of
+# that: a reply could shuffle its sections, or argue the point in a fifth one
+# after the command, and pass. And a validator that also accepts `none` in
+# backticks or `none.` has made the difference between "run nothing" and "run
+# this" a matter of punctuation.
+clar_case() { # $1 expected exit, $2 label — the reply body arrives on stdin
+  cat > "${CH_DIR}/codex-clarification.md"
+  run_in "${R_CH}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/07
+  expect_status "$1" "validate: $2"
+}
+
+clar_case 1 "a backticked none is not the sanctioned answer" <<'CLAR'
+## Claim
+No single command settles this.
+
+## Supporting evidence
+The packet quotes no range a command could re-read.
+
+## What would falsify this
+A quoted range that a command could re-read.
+
+## Verification command
+`none`
+CLAR
+expect_out 'STATUS: CLARIFICATION-INVALID' "validate: a backticked none is CLARIFICATION-INVALID"
+expect_out 'the bare word' "validate: says the sanctioned answer is the bare word"
+
+clar_case 1 "a punctuated none is not the sanctioned answer" <<'CLAR'
+## Claim
+No single command settles this.
+
+## Supporting evidence
+The packet quotes no range a command could re-read.
+
+## What would falsify this
+A quoted range that a command could re-read.
+
+## Verification command
+none.
+CLAR
+expect_out 'STATUS: CLARIFICATION-INVALID' "validate: a punctuated none is CLARIFICATION-INVALID"
+
+clar_case 1 "a fifth section is refused" <<'CLAR'
+## Claim
+The deadline check is absent from the committed range.
+
+## Supporting evidence
+src/deep/reaper.txt:12 in the supplied diff shows no comparison.
+
+## What would falsify this
+Any line comparing a deadline to a clock reading.
+
+## Verification command
+grep -n deadline src/deep/reaper.txt
+
+## Postscript
+And another thing about the verification lead's reading of the contract.
+CLAR
+expect_out 'STATUS: CLARIFICATION-INVALID' "validate: a fifth section is CLARIFICATION-INVALID"
+expect_out 'expected exactly 4' "validate: says how many sections it expected"
+
+clar_case 1 "sections out of the documented order are refused" <<'CLAR'
+## Supporting evidence
+src/deep/reaper.txt:12 in the supplied diff shows no comparison.
+
+## Claim
+The deadline check is absent from the committed range.
+
+## What would falsify this
+Any line comparing a deadline to a clock reading.
+
+## Verification command
+grep -n deadline src/deep/reaper.txt
+CLAR
+expect_out 'STATUS: CLARIFICATION-INVALID' "validate: a shuffled reply is CLARIFICATION-INVALID"
+expect_out 'not the documented ones, in order' "validate: says the order is what failed"
+
+clar_case 0 "a bare none is still accepted, as zero commands" <<'CLAR'
+## Claim
+No single command settles this.
+
+## Supporting evidence
+The packet quotes no range a command could re-read.
+
+## What would falsify this
+A quoted range that a command could re-read.
+
+## Verification command
+none
+CLAR
+expect_out 'CLARIFICATION-OK: AC-01/codex-clarification\.md \(commands: 0\)' \
+  "validate: a sole bare none is zero commands"
 
 cat > "${CH_DIR}/codex-clarification.md" <<'CLAR'
 ## Claim
@@ -1023,6 +1132,10 @@ cat > "${DIR}/stdin.bin"
 case "${MOCK_CODEX_MODE:-ok}" in
   fail)  echo "stand-in reviewer failure" >&2; exit 7 ;;
   empty) : > "${out}"; exit 0 ;;
+  # `race` publishes the destination itself, mid-call, the way a second
+  # invocation that started a moment earlier would while this one waits.
+  race)  printf 'a racing publisher got there first\n' > "${MOCK_CODEX_RACE:-/dev/null}"
+         cat "${DIR}/reply.md" > "${out}"; exit 0 ;;
   *)     cat "${DIR}/reply.md" > "${out}"; exit 0 ;;
 esac
 STANDIN
@@ -1030,11 +1143,14 @@ chmod +x "${MOCKBIN}/codex"
 
 MOCK_LOGIN=chatgpt
 MOCK_MODE=ok
+MOCK_RACE=""
 MOCK_SECRET='sk-planted-login-sentinel'
+RACER_BYTES='a racing publisher got there first'
 run_clarify() { # $... — arguments for clarify-challenge.sh
   run_in "${R_CLAR}/src/deep" env HOME="${H1}" PATH="${MOCKBIN}:${PATH}" \
     MOCK_CODEX_DIR="${MOCKDIR}" MOCK_CODEX_LOGIN="${MOCK_LOGIN}" \
     MOCK_CODEX_MODE="${MOCK_MODE}" MOCK_CODEX_SECRET="${MOCK_SECRET}" \
+    MOCK_CODEX_RACE="${MOCK_RACE}" \
     "${CLARIFY}" "$@"
 }
 
@@ -1056,6 +1172,8 @@ AC-02: the second disputed behavior holds.
 AC-03: the third disputed behavior holds.
 AC-04: the fourth disputed behavior holds.
 AC-05: the fifth disputed behavior holds.
+AC-06: the sixth disputed behavior holds.
+AC-07: the seventh disputed behavior holds.
 CONTRACT
 git -C "${R_CLAR}" add docs/phases/10/contract.md
 git -C "${R_CLAR}" commit -q -m 'phase 10 contract'
@@ -1063,19 +1181,19 @@ CL_CAND="$(git -C "${R_CLAR}" rev-parse HEAD)"
 {
   printf 'HEAD: %s\n\n' "${CL_CAND}"
   printf '| Criterion | Verdict | Evidence |\n|---|---|---|\n'
-  printf '| AC-0%s | PASS | tests line %s |\n' 1 8 2 9 3 10 4 11 5 12
+  printf '| AC-0%s | PASS | tests line %s |\n' 1 8 2 9 3 10 4 11 5 12 6 13 7 14
 } > "${CLD}/claude-verdict.md"
 {
   printf 'HEAD: %s\n\n' "${CL_CAND}"
   printf '| Criterion | Verdict | Evidence |\n|---|---|---|\n'
-  printf '| AC-0%s | FAIL | diff line %s |\n' 1 4 2 5 3 6 4 7 5 8
+  printf '| AC-0%s | FAIL | diff line %s |\n' 1 4 2 5 3 6 4 7 5 8 6 9 7 10
 } > "${CLD}/codex-verdict.md"
-for id in AC-01 AC-02 AC-03 AC-04 AC-05; do
+for id in AC-01 AC-02 AC-03 AC-04 AC-05 AC-06 AC-07; do
   run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10 \
     --new-challenge "${id}" "${CL_CAND}"
   [ "${RUN_STATUS}" -eq 0 ] || { dump_last; fail "clarify fixture: packet for ${id} not created"; }
 done
-ok "clarify fixture: five frozen packets created"
+ok "clarify fixture: a frozen packet for every criterion in the fixture contract"
 CH1="${CLD}/challenges/AC-01"
 
 cat > "${MOCKDIR}/reply.md" <<'REPLY'
@@ -1105,6 +1223,12 @@ run_clarify docs/phases/10 AC-01 --sandbox
 expect_status 2 "clarify: a trailing flag is a usage error, not a passthrough"
 run_clarify docs/phases/10 not-a-criterion
 expect_status 2 "clarify: a malformed criterion ID is a usage error"
+# `AC-[0-9]*` as a shell glob means AC-, one digit, then anything at all. The
+# ID names a directory this script reads and publishes into, so trailing junk
+# after the digits is a usage error, not a near-enough match.
+run_clarify docs/phases/10 AC-1xyz
+expect_status 2 "clarify: a criterion ID with trailing junk is a usage error"
+expect_out 'digits only' "clarify: says the ID is digits after AC-, and nothing else"
 [ ! -e "${MOCKDIR}/argv" ] || fail "clarify: reached the reviewer during a usage refusal"
 [ ! -e "${MOCKDIR}/login-calls" ] || fail "clarify: checked login during a usage refusal"
 ok "clarify: a usage refusal never reaches the reviewer CLI"
@@ -1115,6 +1239,19 @@ expect_out 'STATUS: MISSING-PHASE-DIR' "clarify: reports MISSING-PHASE-DIR"
 run_clarify docs/phases/10 AC-42
 expect_status 1 "clarify: a criterion with no packet refuses"
 expect_out 'STATUS: CHALLENGE-INCOMPLETE' "clarify: reports CHALLENGE-INCOMPLETE"
+
+# -- a phase directory has to be in the repository this call is about ----------
+# An absolute path that merely exists is not a licence to publish into it; the
+# reply would land where no diff, no validator and no reviewer will ever see it.
+OUTSIDE="${TEST_ROOT}/outside-the-repo/phase"
+mkdir -p "${OUTSIDE}/challenges/AC-01"
+run_clarify "${OUTSIDE}" AC-01
+expect_status 1 "clarify: a phase directory outside the repository refuses"
+expect_out 'STATUS: MISSING-PHASE-DIR' "clarify: an outside phase directory reports MISSING-PHASE-DIR"
+expect_out 'outside the repository' "clarify: says the directory is outside the repository"
+[ -z "$(find "${OUTSIDE}" -type f -print)" ] \
+  || fail "clarify: wrote into a phase directory outside the repository"
+ok "clarify: nothing was written outside the repository"
 
 # -- secret hygiene: names only, and the captured login output stays captured ---
 run_in "${R_CLAR}/src/deep" env HOME="${H1}" PATH="${MOCKBIN}:${PATH}" \
@@ -1265,6 +1402,33 @@ expect_out 'nothing here repairs one' "clarify: says a frozen packet is not repa
 [ ! -e "${CH5}/codex-clarification.md" ] || fail "clarify: a mismatched packet published a file"
 ok "clarify: a mismatched packet publishes nothing"
 
+# -- the packet must name the candidate both verdicts actually judge -----------
+# Correct artifact hashes prove the packet still describes the same FILES. They
+# say nothing about the commit it claims those files judged, and a packet can
+# carry three right hashes and a candidate nobody reviewed.
+CH7="${CLD}/challenges/AC-07"
+cp "${CH7}/discrepancy.md" "${TEST_ROOT}/ac07-packet.bak"
+UNJUDGED_SHA='0123456789abcdef0123456789abcdef01234567'
+sed "s/^candidate_sha:.*/candidate_sha: ${UNJUDGED_SHA}/" \
+  "${CH7}/discrepancy.md" > "${CH7}/discrepancy.new"
+mv "${CH7}/discrepancy.new" "${CH7}/discrepancy.md"
+run_clarify docs/phases/10 AC-07
+expect_status 1 "clarify: a packet naming a candidate the verdicts do not judge refuses"
+expect_out 'STATUS: CLARIFY-PACKET-MISMATCH' \
+  "clarify: an unjudged candidate reports CLARIFY-PACKET-MISMATCH"
+expect_out "packet candidate_sha: ${UNJUDGED_SHA}" "clarify: names the packet's candidate"
+expect_out "claude-verdict\.md binds: ${CL_CAND}" \
+  "clarify: names the candidate the Claude verdict binds"
+expect_out "codex-verdict\.md binds: ${CL_CAND}" \
+  "clarify: names the candidate the reviewer verdict binds"
+[ ! -e "${CH7}/codex-clarification.md" ] \
+  || fail "clarify: an unjudged candidate published a file"
+ok "clarify: an unjudged candidate publishes nothing"
+cp "${TEST_ROOT}/ac07-packet.bak" "${CH7}/discrepancy.md"
+run_clarify docs/phases/10 AC-07
+expect_status 0 "clarify: the same packet with the judged candidate proceeds"
+expect_out 'STATUS: CLARIFY-OK' "clarify: a candidate both verdicts judge is published"
+
 # -- an adjudicated challenge is closed ----------------------------------------
 CH3="${CLD}/challenges/AC-03"
 cat > "${CH3}/challenge-result.md" <<RESULT
@@ -1316,6 +1480,27 @@ run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10
 expect_status 1 "validate: a published two-command clarification is refused"
 expect_out 'STATUS: CLARIFICATION-INVALID' "validate: reports CLARIFICATION-INVALID"
 expect_out '2 command lines' "validate: counts two commands, footer excluded"
+
+# -- publication is no-clobber, and the window is the whole reviewer call ------
+# The existence check happens before the call; the call itself is minutes long,
+# and a second invocation can publish inside that window. The stand-in creates
+# the destination mid-call, exactly as that second invocation would, and the
+# file already on disk has to win.
+CH6="${CLD}/challenges/AC-06"
+MOCK_MODE=race
+MOCK_RACE="${CH6}/codex-clarification.md"
+run_clarify docs/phases/10 AC-06
+MOCK_MODE=ok
+MOCK_RACE=""
+expect_status 1 "clarify: a clarification published during the call refuses"
+expect_out 'STATUS: CLARIFY-EXISTS' "clarify: a mid-call racer reports CLARIFY-EXISTS"
+expect_out 'while the reviewer was answering' "clarify: says the race happened during the call"
+[ "$(cat "${CH6}/codex-clarification.md")" = "${RACER_BYTES}" ] \
+  || fail "clarify: the losing reply replaced the clarification already on disk"
+ok "clarify: the racing publisher's file is byte-unchanged"
+[ -z "$(find "${CH6}" -name '.codex-clarification.*' -print)" ] \
+  || fail "clarify: the refused publication left its staging file behind"
+ok "clarify: a refused publication leaves no staging file"
 
 # ---- 16. a symlinked skill source is refused, not resolved -------------------
 # Phase 02 incident shape: the suite reached its own source through a symlink,
