@@ -156,6 +156,18 @@ sha256 of the contract, of `.codex-gate.conf`, of the evidence, and of the
 full log. If a later dispute needs to know what was judged, those hashes are
 the answer.
 
+That footer is also what binds the reviewer's verdict to a commit. The harness
+writes the reviewer's table starting at line 1, so `codex-verdict.md` is bound
+by the `head:` line of the footer rather than by line 1. `validate-phase.sh`
+accepts either binding for that file — the footer, or a hand-written line-1
+`HEAD: <sha>`, which may abbreviate the sha the footer spells out in full —
+and reports `STATUS: VERDICT-UNBOUND` when a verdict carries neither, or
+carries both naming different commits. Only the footer the harness appends
+last binds: a reviewer writing about this machinery can quote the footer
+format in its prose, and quoted text never names the candidate.
+`claude-verdict.md` is unchanged: line 1 binds it, because line 1 is what the
+evidence-matrix template writes.
+
 ## 9. Reconcile
 
 Per criterion, using both matrices:
@@ -171,6 +183,19 @@ Write the merged matrix to `docs/phases/<phase>/decision.md`, one row per
 criterion with per-row provenance, then run:
 
     ~/.claude/skills/verified-phase/scripts/validate-phase.sh --release-check docs/phases/<phase>
+
+The matrix has to cover the contract and nothing else, so its row set is
+compared with the contract's criterion set the way the harness compares a
+reviewer verdict with it. Three refusals, each its own status:
+
+| Status | Cause |
+|---|---|
+| `DECISION-DUPLICATE-ROW` | two rows for one criterion; which verdict counted is unreadable |
+| `DECISION-UNKNOWN-ROW` | a row naming a criterion the contract never declared |
+| `DECISION-MISSING-ROW` | a contracted criterion with no row at all |
+
+Every problem found is printed. The status names the first of those three
+classes present, in the order above, so it does not depend on file order.
 
 ### The CANNOT-VERIFY evidence-augmentation rerun
 
@@ -205,7 +230,10 @@ Blocking conditions, none of which are formalities:
 - any UNRESOLVED row
 - any unwaived CANNOT-VERIFY row
 - any INCONCLUSIVE gate result
-- a verdict whose `HEAD:` sha is not the commit under review
+- a verdict bound — on line 1, or by its provenance footer — to some commit
+  other than the one under review, or bound to no commit at all
+- a merged matrix that repeats a criterion, names one the contract never
+  declared, or leaves one out
 - a waiver signed by an agent
 
 State the decision, the evidence behind it, and what remains unverified. An

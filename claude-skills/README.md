@@ -47,6 +47,17 @@ idempotency and preservation, preflight command inference and secret hygiene,
 the read-only invariants, the bounded evidence challenge, and the release
 check. It prints `PASS: <n> verified-phase checks` when it is green.
 
+Two of those cases are worth naming, because they are what a validator gets
+wrong quietly. A phase's reviewer verdict is bound to its commit by the
+provenance footer the gate harness appends last (`head:`), not by line 1, so
+the suite validates a verdict built in that layout — including one whose prose
+quotes the footer format, which must not bind anything. A hand-written line-1
+`HEAD: <sha>` still binds, and a file carrying both bindings must name one
+commit. And the merged matrix in `decision.md` must carry one row for each
+contracted criterion and no others — a repeated, invented, or absent row is
+refused as `DECISION-DUPLICATE-ROW`, `DECISION-UNKNOWN-ROW`, or
+`DECISION-MISSING-ROW`.
+
 ## Portability
 
 Scripts target `/bin/bash` as shipped on macOS — bash 3.2. No `mapfile`, no
