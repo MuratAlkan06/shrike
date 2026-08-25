@@ -691,6 +691,108 @@ run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
 expect_status 1 "validate: an abbreviation of another commit is still a conflict"
 expect_out 'STATUS: VERDICT-UNBOUND' "validate: abbreviated conflicts report VERDICT-UNBOUND"
 
+# The harness delimits its footer: a line that is exactly `---`, and
+# `provenance:` at column 0 on the very next line. Footer-shaped text without
+# that delimiter is prose. The first case below is the scenario adjudicated in
+# the AC-01 challenge of phase 02: no line-1 HEAD, no delimiter, a quoted
+# footer at the end of the file. It must leave the verdict unbound.
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+  printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+  printf '\n## UNSTATED-RISK\n\n- the footer format under review reads:\n\n'
+  printf '```\nprovenance:\n  head: %s\n```\n' "${HARN_CAND}"
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: a quoted footer with no delimiter and no line 1 binds nothing"
+expect_out 'STATUS: VERDICT-UNBOUND' \
+  "validate: the adjudicated AC-01 scenario reports VERDICT-UNBOUND"
+
+# The same shape without the fence: trailing prose is still prose.
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+  printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+  printf '\n## UNSTATED-RISK\n\n- the footer under review ends:\n\n'
+  printf 'provenance:\n  head: %s\n' "${HARN_CAND}"
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: undelimited footer-shaped prose binds nothing"
+expect_out 'STATUS: VERDICT-UNBOUND' "validate: unfenced footer-shaped prose reports VERDICT-UNBOUND"
+
+# The harness writes `provenance:` on the line immediately after `---`;
+# anything between them means the block was not written by the harness.
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+  printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+  printf '\n## UNSTATED-RISK\n\n- none\n'
+  printf '%s\n' '---'
+  printf '\nprovenance:\n'
+  printf '  head: %s\n' "${HARN_CAND}"
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: a blank line between --- and provenance: binds nothing"
+expect_out 'STATUS: VERDICT-UNBOUND' "validate: a detached provenance block reports VERDICT-UNBOUND"
+
+# ...and an indented `provenance:` under a delimiter is quotation, not a footer.
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+  printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+  printf '\n## UNSTATED-RISK\n\n- none\n'
+  printf '%s\n' '---'
+  printf '  provenance:\n'
+  printf '    head: %s\n' "${HARN_CAND}"
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 1 "validate: an indented provenance: under a delimiter binds nothing"
+expect_out 'STATUS: VERDICT-UNBOUND' "validate: an indented provenance block reports VERDICT-UNBOUND"
+
+# The genuine layout the harness publishes — delimiter, `provenance:`, an
+# indented `head:` — still binds, with or without a blank line above it.
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+  printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+  printf '\n## UNSTATED-RISK\n\n- none\n\n'
+  printf '%s\n' '---'
+  printf 'provenance:\n'
+  printf '  head: %s\n' "${HARN_CAND}"
+  printf '  base: %s (merge-base of main)\n' "${HARN_BASE}"
+  printf '  harness: codex-gate.sh v2.1.1 (2026-08-24T21:08:19Z)\n'
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 0 "validate: a delimited harness footer still binds"
+expect_out "VERDICT-OK: codex-verdict\.md \(HEAD ${HARN_CAND}\)" \
+  "validate: the delimited footer names the candidate"
+
+# Two delimited footers: the last one is the one the harness appended.
+{
+  printf '| exact AC-ID | PASS or FAIL or CANNOT-VERIFY | Evidence |\n'
+  printf '|---|---|---|\n'
+  printf '| AC-01 | PASS | `src/deep/a.txt:3` in the DIFF |\n'
+  printf '| AC-02 | PASS | TYPECHECK output line 12 |\n'
+  printf '\n## UNSTATED-RISK\n\n- a footer from an earlier run reads:\n\n'
+  printf '%s\n' '---'
+  printf 'provenance:\n'
+  printf '  head: %s\n' "${HARN_BASE}"
+  printf '\n'
+  printf '%s\n' '---'
+  printf 'provenance:\n'
+  printf '  head: %s\n' "${HARN_CAND}"
+  printf '  harness: codex-gate.sh v2.1.1 (2026-08-24T21:08:19Z)\n'
+} > "${HD}/codex-verdict.md"
+run_in "${R_HARN}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/09
+expect_status 0 "validate: with two delimited footers the last one binds"
+expect_out "VERDICT-OK: codex-verdict\.md \(HEAD ${HARN_CAND}\)" \
+  "validate: an earlier delimited footer does not bind"
+
 # ---- 12c. the merged matrix must cover the contract, and only it -------------
 write_harness_verdict "${HARN_CAND}" ""
 

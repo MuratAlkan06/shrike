@@ -162,11 +162,21 @@ by the `head:` line of the footer rather than by line 1. `validate-phase.sh`
 accepts either binding for that file — the footer, or a hand-written line-1
 `HEAD: <sha>`, which may abbreviate the sha the footer spells out in full —
 and reports `STATUS: VERDICT-UNBOUND` when a verdict carries neither, or
-carries both naming different commits. Only the footer the harness appends
-last binds: a reviewer writing about this machinery can quote the footer
-format in its prose, and quoted text never names the candidate.
-`claude-verdict.md` is unchanged: line 1 binds it, because line 1 is what the
-evidence-matrix template writes.
+carries both naming different commits. `claude-verdict.md` is unchanged: line
+1 binds it, because line 1 is what the evidence-matrix template writes.
+
+What counts as a footer is narrow, because a reviewer judging this machinery
+writes about it. Only a block the harness delimited binds: a line that is
+exactly `---`, then `provenance:` at column 0 on the very next line, then the
+`head: <40-hex>` on an indented line inside that block (the block ends at the
+next unindented line). A `provenance:` line that is not immediately preceded
+by `---` binds nothing, whether it is fenced, indented, or plain prose; if
+several delimited footers are present the last one binds; and a delimited
+footer carrying no readable head leaves the file unbound rather than falling
+back to anything earlier. Stated plainly, the residual: prose that reproduces
+a whole delimited footer byte for byte is indistinguishable from the real
+thing by construction. This rule is a drift guard for a cooperating harness,
+not an adversarial boundary.
 
 ## 9. Reconcile
 

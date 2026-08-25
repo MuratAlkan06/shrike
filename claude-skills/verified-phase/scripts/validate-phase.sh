@@ -170,21 +170,30 @@ validate_contract() {
 # name the same commit. claude-verdict.md is unchanged — the evidence-matrix
 # template mandates line 1, so line 1 is what is read.
 #
-# Only the footer the harness appends at the end of the file binds anything.
-# A reviewer writing about this very machinery can quote `provenance:` and
-# `head:` in its prose, so the LAST such block wins and an earlier quotation
-# binds nothing. If that final block carries no readable head, the file is
-# unbound — verdict prose never gets to name the candidate.
-footer_head_sha() { # $1 file — head sha of the last provenance footer, or empty
+# Only a footer the harness itself delimited binds anything. The harness
+# writes a line that is exactly `---` and, on the very next line, `provenance:`
+# at column 0. Both are required here: a reviewer writing about this very
+# machinery quotes `provenance:` and `head:` in its prose, indented or fenced,
+# and footer-shaped prose must never name the candidate. If several delimited
+# footers exist the LAST one wins; if that one carries no readable head, the
+# file is unbound. Residual, stated plainly: prose that reproduces a whole
+# delimited footer byte for byte is indistinguishable from the real thing by
+# construction. This is a drift guard for a cooperating harness, not an
+# adversarial boundary.
+footer_head_sha() { # $1 file — head sha of the last delimited footer, or empty
   awk '
-    /^[[:space:]]*provenance:[[:space:]]*$/ { inprov = 1; found = 0; val = ""; next }
-    inprov && !found && /^[[:space:]]*head:[[:space:]]*/ {
+    prev == "---" && $0 == "provenance:" {
+      inprov = 1; found = 0; val = ""; prev = $0; next
+    }
+    inprov && $0 !~ /^[[:space:]]/ { inprov = 0 }
+    inprov && !found && /^[[:space:]]+head:[[:space:]]*/ {
       line = $0
       sub(/^[[:space:]]*head:[[:space:]]*/, "", line)
       sub(/[[:space:]]*$/, "", line)
       val = line
       found = 1
     }
+    { prev = $0 }
     END { if (found) print val }
   ' "$1" | sed -n 's/^\([0-9a-fA-F]\{40\}\)$/\1/p'
 }
@@ -219,7 +228,8 @@ validate_verdict() { # $1 file, $2 label, $3 "footer" when a provenance footer m
     if [ "${footer_ok}" = footer ]; then
       die VERDICT-UNBOUND \
         "${label}: nothing binds this verdict to a commit — expected line 1" \
-        "  HEAD: <sha>  or a provenance footer carrying  head: <40-hex>" \
+        "  HEAD: <sha>  or a footer delimited by a line that is exactly  ---" \
+        "immediately above  provenance:  and carrying  head: <40-hex>" \
         "(line 1 is: $(head -n1 "${file}"))"
     fi
     die VERDICT-UNBOUND \

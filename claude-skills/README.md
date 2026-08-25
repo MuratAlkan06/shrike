@@ -50,11 +50,15 @@ check. It prints `PASS: <n> verified-phase checks` when it is green.
 Two of those cases are worth naming, because they are what a validator gets
 wrong quietly. A phase's reviewer verdict is bound to its commit by the
 provenance footer the gate harness appends last (`head:`), not by line 1, so
-the suite validates a verdict built in that layout — including one whose prose
-quotes the footer format, which must not bind anything. A hand-written line-1
-`HEAD: <sha>` still binds, and a file carrying both bindings must name one
-commit. And the merged matrix in `decision.md` must carry one row for each
-contracted criterion and no others — a repeated, invented, or absent row is
+the suite validates a verdict built in that layout. Only a footer the harness
+delimited binds — a line that is exactly `---` with `provenance:` at column 0
+immediately below it — so a verdict whose prose quotes the footer format,
+fenced or indented, binds nothing at all; that boundary is a drift guard for a
+cooperating harness, not a defence against prose that reproduces a whole
+delimited footer verbatim. A hand-written line-1 `HEAD: <sha>` still binds,
+and a file carrying both bindings must name one commit. And the merged matrix
+in `decision.md` must carry one row for each contracted criterion and no
+others — a repeated, invented, or absent row is
 refused as `DECISION-DUPLICATE-ROW`, `DECISION-UNKNOWN-ROW`, or
 `DECISION-MISSING-ROW`.
 
