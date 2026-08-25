@@ -19,10 +19,18 @@ goal, the phase ends and a new contract begins.
 
 Read `~/.claude/skills/verified-phase/references/authority-boundary.md` now.
 The short version: you are the sole lead — planning, delegation,
-implementation, Tier-1 verification, commits, reconciliation, and the release
-decision are all yours. Codex is an independent read-only reviewer, invoked
-only through `~/.claude/harness/codex-gate.sh`. Never call the `codex` CLI
-directly; never rewrite the harness.
+implementation, Tier-1 verification, local commits, reconciliation, and the
+release decision are all yours. Codex is an independent read-only reviewer,
+reached only from `~/.claude/harness/codex-gate.sh` and from
+`~/.claude/skills/verified-phase/scripts/clarify-challenge.sh`. Never call the
+`codex` CLI directly; never rewrite the harness.
+
+Local work is yours; publishing is not. Branch creation, commits, tests,
+reviews, and gate runs need no one's permission. Every remote-mutating
+operation — push, pull-request create, update, ready or merge, issue mutation,
+tag, release — routes through the GitHub workflow manager agent and needs
+explicit human authorization first. A green gate is evidence, not permission.
+The reviewer performs no git or GitHub operation of any kind.
 
 ## Workflow
 
@@ -72,6 +80,21 @@ Full detail for every step:
    `phase-workflow.md`). A material PASS/FAIL disagreement is the only thing
    that may open a bounded challenge:
    `~/.claude/skills/verified-phase/references/discrepancy-protocol.md`.
+   Raise the packet with `validate-phase.sh ... --new-challenge <AC-ID>
+   <candidate-sha>`, then take the one clarification, in FOREGROUND Bash:
+
+       ~/.claude/skills/verified-phase/scripts/clarify-challenge.sh \
+           docs/phases/<phase> <AC-ID>
+
+   `STATUS: CLARIFY-OK` means a reply was published, **not** that the
+   disagreement is settled. Only a published reply spends the one
+   opportunity — `CLARIFY-AUTH`, `CLARIFY-INCONCLUSIVE` and the other
+   refusals publish nothing, so those are rerun. Then run at most the single
+   command the reply names, and only if it is deterministic, in scope and
+   safe. A reply naming `none`, or no reply at all, means you adjudicate on
+   evidence already recorded or the row is UNRESOLVED; whenever you write
+   `clarification_sha256: absent`, write the reason beside it, and never
+   present an unanswered challenge as a completed exchange.
    Write the merged matrix to `docs/phases/<phase>/decision.md`, then run
    `validate-phase.sh --release-check docs/phases/<phase>`.
 10. **Decide.** The release decision is yours alone, stated in the
@@ -81,9 +104,16 @@ Full detail for every step:
 
 ## Non-negotiables
 
-- Never invoke the `codex` CLI from Bash. The harness is the only sanctioned
-  entry point, and a drift guard denies the rest by default.
-- Never run the gate backgrounded.
+- Never invoke the `codex` CLI from Bash. The gate harness and
+  `clarify-challenge.sh` are the only sanctioned entry points, and a drift
+  guard denies the rest by default. Both are drift guards under a cooperative
+  threat model, not adversarial boundaries: the clarification call supplies
+  only the packet, which is not the same as the reviewer seeing only the
+  packet.
+- Never run the gate or the clarification call backgrounded.
+- Never push, open or merge a pull request, mutate an issue, tag, or release
+  without routing it through the GitHub workflow manager agent and getting
+  explicit human authorization first.
 - Never overwrite a user-authored `AGENTS.md`; it is the reviewer's
   instruction file, not a Claude agent definition.
 - Never amend an approved contract to match what got built. Log the

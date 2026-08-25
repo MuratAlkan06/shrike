@@ -12,8 +12,10 @@ then it is over.
    `codex-verdict.md`. A challenge adds files; it never rewrites evidence.
 2. One challenge per (candidate commit, criterion). Ever. There is no second
    round, no appeal, no "one more look".
-3. The reviewer stays read-only throughout. A clarification is delivered
-   through the same harness path as the original verdict.
+3. The reviewer stays read-only throughout. A clarification is delivered by
+   `clarify-challenge.sh`, which runs the reviewer in the same clean room the
+   gate harness uses: foreground, ephemeral, read-only, strict config, user
+   config and rules ignored.
 4. Nothing here converts CANNOT-VERIFY or UNRESOLVED into a pass.
 
 ## What is NOT a trigger
@@ -59,23 +61,65 @@ The packet is neutral. It argues for neither side and proposes no remedy. If
 you cannot state the disagreement without arguing, you do not yet understand
 it.
 
-## Step 2 — one clarification
+## Step 2 — one clarification, one call
 
-The reviewer gets exactly one opportunity to respond, delivered through the
-harness with the packet as its evidence, still sandboxed read-only. The reply
-is written to `challenges/<AC-ID>/codex-clarification.md` and must contain
-four sections and no more:
+    ~/.claude/skills/verified-phase/scripts/clarify-challenge.sh \
+        docs/phases/<phase> <AC-ID>
+
+Two arguments, and no others. There is no prompt override and no argument
+passthrough: the prompt is fixed inside the script, and the only
+caller-controlled bytes that reach the reviewer are the packet's own, handed
+to it on stdin. Run it in FOREGROUND Bash — a backgrounded run is the
+empty-output condition of upstream issue codex#19945, and empty output is
+inconclusive here as well.
+
+Before it calls anything, the script re-verifies the packet against the
+artifacts the packet names: contract, both verdicts, candidate, disputed
+criterion. A packet whose recorded hashes no longer match the files on disk is
+not a frozen record of anything, and nothing in this protocol repairs one.
+
+| STATUS | exit | meaning |
+|---|---|---|
+| `CLARIFY-OK` | 0 | a reply was published — not "the disagreement is settled" |
+| `CLARIFY-EXISTS` | 1 | a clarification is already on record; it is never overwritten |
+| `CLARIFY-ADJUDICATED` | 1 | `challenge-result.md` exists; the challenge is closed |
+| `CLARIFY-PACKET-MISMATCH` | 1 | the packet no longer matches what it records |
+| `CHALLENGE-INCOMPLETE` | 1 | no packet, or a provenance field still unfilled |
+| `CLARIFY-INCONCLUSIVE` | 1 | the reviewer failed, timed out, or replied with nothing |
+| `CLARIFY-AUTH` | 4 | an API-key variable is defined, or the CLI is off the subscription |
+| `USAGE` | 2 | anything other than exactly two arguments |
+
+Only a PUBLISHED `codex-clarification.md` spends the one opportunity. An
+authentication refusal, a reviewer failure and an empty reply publish nothing
+and consume nothing — fix the cause and rerun. What is never rerun is a call
+that already published.
+
+The reply is published verbatim: nothing edits, trims, reformats or
+re-sections it. A `clarify-provenance:` footer is appended below it, binding
+the file to the packet it answered — `packet_sha256`, `disputed_criterion`,
+`candidate_sha`, `base_sha`, `contract_sha256`, the reviewer version, the
+model and flags, and the clarifier version and time. The script does not judge
+what it published. `validate-phase.sh` does, and it recomputes that footer
+against the packet on disk; a reply sitting beside a packet it did not answer
+is refused as `CLARIFICATION-TAMPERED`.
+
+The reply must contain four sections and no more:
 
     ## Claim
     ## Supporting evidence
-    ## What would falsify this claim
-    ## Verification command (at most one)
+    ## What would falsify this
+    ## Verification command
 
-The command section contains the command and nothing else — no prose, no
-alternatives, no fallback. `validate-phase.sh` counts the non-empty lines in
-that section and rejects the file with `STATUS: CLARIFICATION-INVALID` when
-there is more than one. A reviewer who needs three commands to make a point
-does not have evidence yet.
+The command section contains one command and nothing else — no prose, no
+alternatives, no fallback — or the single word `none`. `validate-phase.sh`
+counts the non-empty lines in that section, ignoring the provenance footer
+below it, and rejects the file with `STATUS: CLARIFICATION-INVALID` when there
+is more than one. A reviewer who needs three commands to make a point does not
+have evidence yet.
+
+`none` is a valid and expected answer. It means no single command settles the
+question, and it counts as zero commands, because there is nothing for the
+verification lead to run.
 
 There is no second reply. Not a follow-up question, not a "can you also
 check". If the clarification does not settle it, the protocol is finished and
@@ -91,14 +135,23 @@ and only if it is:
 - safe: no writes outside the work tree, no network mutation, no credential
   use, nothing that changes the candidate
 
-If the command fails any of those, it is not run; record why, and adjudicate
-on the packet alone.
+If the clarification names `none`, if the command fails any of those tests, or
+if no clarification could be obtained at all, then no command is run. Record
+why — in words, in `challenge-result.md` — and adjudicate on what is already
+on record.
 
 Write `challenges/<AC-ID>/challenge-result.md` containing the command that
-was run, its verbatim output, the adjudication and its reasoning, and:
+was run and its verbatim output (or the stated reason none was run), the
+adjudication and its reasoning, and:
 
     discrepancy_sha256: <sha256 of discrepancy.md>
     clarification_sha256: <sha256 of codex-clarification.md, or 'absent'>
+
+`clarification_sha256: absent` is only ever written together with the reason
+it is absent. Absent without a reason is an unexplained hole in the record: a
+later reader cannot tell a reviewer that declined to answer from a call that
+was never made, and the two mean very different things about how much the
+adjudication is worth.
 
 Those two hashes are the tamper-evidence. On every later validation the
 script recomputes them and refuses with `STATUS: CHALLENGE-TAMPERED` if
@@ -114,6 +167,28 @@ Outcomes:
   original `claude-verdict.md` still stands unedited; being wrong on the
   record is the point of keeping it.
 - inconclusive -> UNRESOLVED
+
+The disagreement stays UNRESOLVED unless evidence already on record settles
+the disputed fact deterministically. "The reviewer did not reply, so my
+verdict stands" is not an adjudication; it is the absence of one.
+
+### What an absent clarification is not
+
+A challenge with no clarification is not a complete debate loop. It is one
+side's packet and no reply, and it should never be described as though the
+reviewer had been heard and answered.
+
+It can still be adjudicated — but only from evidence already recorded before
+the challenge was raised, and only when that evidence settles the disputed
+fact deterministically. If it does not, the row is UNRESOLVED, and UNRESOLVED
+is a real outcome rather than a failure to try hard enough.
+
+The AC-01 challenge under `docs/phases/02-validator-harness-alignment/` is
+that shape, and should be read as exactly that: an
+adjudication-from-initial-evidence in which the reviewer never replied. The
+two verdicts and the committed diff settled the disputed fact between them.
+Citing it as a worked example of the clarification loop would misdescribe
+what happened, because the loop's middle step never ran.
 
 ## Step 4 — UNRESOLVED
 
