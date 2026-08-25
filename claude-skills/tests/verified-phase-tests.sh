@@ -10,6 +10,24 @@ set -euo pipefail
 SKILLS_SRC="$(cd "$(dirname "$0")/.." && pwd -P)"
 # pwd -P so the sandbox path matches what git rev-parse reports; on macOS
 # /var is a symlink to /private/var and mktemp -d hands back the symlinked form.
+#
+# Startup guard, before anything is created. If the logical path this suite was
+# reached by differs from the physical one, a symlink sits somewhere in it, and
+# a symlink is how "the sandbox copy" and "the live working tree" become the
+# same bytes: the installer fixture below deliberately drifts a SKILL.md, and
+# under a linked source that write lands in the tree under review. That is the
+# incident this guard exists to make impossible, so it refuses instead of
+# resolving the link and carrying on.
+SKILLS_SRC_LOGICAL="$(cd "$(dirname "$0")/.." && pwd)"
+if [ "${SKILLS_SRC}" != "${SKILLS_SRC_LOGICAL}" ]; then
+  echo "verified-phase-tests: REFUSING — the skill source resolves through a symlink." >&2
+  echo "verified-phase-tests: logical:  ${SKILLS_SRC_LOGICAL}" >&2
+  echo "verified-phase-tests: physical: ${SKILLS_SRC}" >&2
+  echo "verified-phase-tests: run the suite by its real path; no fixture was created." >&2
+  echo "STATUS: TESTS-SRC-SYMLINK"
+  exit 2
+fi
+
 TEST_ROOT="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'chmod -R u+w "${TEST_ROOT}" >/dev/null 2>&1 || true; rm -rf "${TEST_ROOT}"' EXIT
 
@@ -77,6 +95,20 @@ if git -C "${TEST_ROOT}" rev-parse --show-toplevel >/dev/null 2>&1; then
 fi
 ok "sandbox is outside any git work tree"
 
+# Every fixture that WRITES runs against an isolated copy of the skill source,
+# never the live tree. Read-only greps still read the live tree, because what
+# they assert is a property of the tree under review. The live tree is
+# fingerprinted here and re-checked at the end of the run: no case, however it
+# fails, may leave a byte of it changed.
+SKILLS_COPY="${TEST_ROOT}/skills-src"
+cp -Rp "${SKILLS_SRC}" "${SKILLS_COPY}"
+LIVE_TREE_BEFORE="$(tree_hash "${SKILLS_SRC}")"
+LIVE_SKILL_MD="${SKILLS_SRC}/verified-phase/SKILL.md"
+LIVE_SKILL_MD_BEFORE="$(file_hash "${LIVE_SKILL_MD}")"
+[ "$(tree_hash "${SKILLS_COPY}")" = "${LIVE_TREE_BEFORE}" ] \
+  || fail "sandbox: the isolated skill-source copy does not match the live tree"
+ok "sandbox: fixtures run against an isolated copy of the skill source"
+
 # ---- 1. install: first run ---------------------------------------------------
 H1="${TEST_ROOT}/home-a"
 mkdir -p "${H1}/.claude/agents" "${H1}/.claude/skills/other-skill"
@@ -84,17 +116,17 @@ printf '{"keep":true}\n' > "${H1}/.claude/settings.json"
 printf 'agent definition\n' > "${H1}/.claude/agents/keep.md"
 printf 'other skill\n' > "${H1}/.claude/skills/other-skill/SKILL.md"
 
-run_in "${SKILLS_SRC}" env HOME="${H1}" ./install.sh
+run_in "${SKILLS_COPY}" env HOME="${H1}" ./install.sh
 expect_status 0 "install: first run exits 0"
 expect_out 'STATUS: INSTALLED' "install: reports INSTALLED"
 [ -f "${H1}/.claude/skills/verified-phase/SKILL.md" ] \
   || fail "install: SKILL.md not present at the installed path"
 ok "install: SKILL.md present at \$HOME/.claude/skills/verified-phase/SKILL.md"
-for s in bootstrap-repo.sh preflight.sh validate-phase.sh; do
+for s in bootstrap-repo.sh preflight.sh validate-phase.sh clarify-challenge.sh; do
   [ -x "${H1}/.claude/skills/verified-phase/scripts/${s}" ] \
     || fail "install: ${s} is not executable"
 done
-ok "install: all three scripts executable"
+ok "install: every shipped script is executable"
 [ -f "${H1}/.claude/skills/verified-phase/references/discrepancy-protocol.md" ] \
   || fail "install: references/ not copied"
 [ -f "${H1}/.claude/skills/verified-phase/assets/discrepancy-template.md" ] \
@@ -103,7 +135,7 @@ ok "install: references/ and assets/ copied"
 
 # ---- 2. install: idempotent --------------------------------------------------
 installed_before="$(tree_hash "${H1}/.claude/skills/verified-phase")"
-run_in "${SKILLS_SRC}" env HOME="${H1}" ./install.sh
+run_in "${SKILLS_COPY}" env HOME="${H1}" ./install.sh
 expect_status 0 "install: second run exits 0"
 expect_out 'STATUS: UP-TO-DATE' "install: second run reports UP-TO-DATE"
 installed_after="$(tree_hash "${H1}/.claude/skills/verified-phase")"
@@ -116,8 +148,14 @@ ok "install: installed tree mirrors the canonical source"
 
 # ---- 3. install: replace a drifted copy --------------------------------------
 untouched_before="$(home_hash_except_skill "${H1}")"
-printf '\nLOCAL DRIFT\n' >> "${H1}/.claude/skills/verified-phase/SKILL.md"
-run_in "${SKILLS_SRC}" env HOME="${H1}" ./install.sh
+# The drift is written into the fake HOME's installed copy — the file the
+# incident actually corrupted. Assert first that this path is not the live one.
+DRIFT_TARGET="${H1}/.claude/skills/verified-phase/SKILL.md"
+[ "$(cd "$(dirname "${DRIFT_TARGET}")" && pwd -P)" != "$(cd "${SKILLS_SRC}/verified-phase" && pwd -P)" ] \
+  || fail "install: the drift fixture would write into the live skill tree"
+ok "install: the drift fixture target is not the live skill tree"
+printf '\nLOCAL DRIFT\n' >> "${DRIFT_TARGET}"
+run_in "${SKILLS_COPY}" env HOME="${H1}" ./install.sh
 expect_status 0 "install: drifted copy exits 0"
 expect_out 'STATUS: REPLACED' "install: drifted copy reports REPLACED"
 expect_out "BACKUP: ${H1}/.claude/skill-backups/verified-phase-" "install: reports backup path"
@@ -273,13 +311,16 @@ expect_status 1 "preflight: defined-but-empty key still blocks"
 expect_out 'CODEX_API_KEY is defined' "preflight: flags a defined-but-empty key by name"
 
 # ---- 10. read-only invariants ------------------------------------------------
+# The bare subcommand form carries none of the clean-room flags. The one
+# sanctioned call spells every flag out before `exec`, and is checked as such
+# in section 10b; this forbids the shorthand everywhere, including there.
 if grep -RInE '(^|[^a-zA-Z])codex[[:space:]]+(exec|apply|resume)' \
      "${SKILLS_SRC}/verified-phase/scripts" "${SKILLS_SRC}/install.sh" \
      > "${TEST_ROOT}/hits" 2>&1; then
   sed -n '1,20p' "${TEST_ROOT}/hits" >&2
-  fail "scripts invoke the reviewer CLI directly"
+  fail "a script uses the bare reviewer-CLI subcommand form, without the clean room"
 fi
-ok "scripts never invoke the reviewer CLI directly"
+ok "no script uses the bare reviewer-CLI subcommand form"
 if grep -RIn -e '--sandbox workspace-write' -e '--dangerously' \
      "${SKILLS_SRC}/verified-phase" "${SKILLS_SRC}/install.sh" \
      > "${TEST_ROOT}/hits" 2>&1; then
@@ -299,6 +340,61 @@ grep -q 'harness/codex-gate\.sh' "${SKILLS_SRC}/verified-phase/SKILL.md" \
 grep -q 'harness/codex-gate\.sh' "${SKILLS_SRC}/verified-phase/references/phase-workflow.md" \
   || fail "phase-workflow.md does not route Tier-2 through the harness"
 ok "Tier-2 is routed only through the gate harness"
+
+# ---- 10b. the second sanctioned entry point, read statically -----------------
+# clarify-challenge.sh is the one script here that reaches the reviewer CLI. Its
+# licence to do so is the shape of the call: the gate's clean room, a prompt
+# fixed in the file, and no way for a caller to add a byte to either.
+CLARIFY_SRC="${SKILLS_SRC}/verified-phase/scripts/clarify-challenge.sh"
+[ -x "${CLARIFY_SRC}" ] || fail "clarify-challenge.sh is missing or not executable"
+ok "clarify-challenge.sh ships executable"
+
+grep -lE '^[[:space:]]*codex[[:space:]]' "${SKILLS_SRC}/verified-phase/scripts/"*.sh \
+  > "${TEST_ROOT}/invokers" 2>/dev/null || true
+[ "$(cat "${TEST_ROOT}/invokers")" = "${CLARIFY_SRC}" ] \
+  || { sed -n '1,20p' "${TEST_ROOT}/invokers" >&2
+       fail "the reviewer CLI is reached from a script other than clarify-challenge.sh"; }
+ok "clarify-challenge.sh is the only script that reaches the reviewer CLI"
+
+awk '
+  /^codex --ask-for-approval never exec/ { inblk = 1 }
+  inblk { print }
+  inblk && /CODEX_STATUS=\$\?/ { exit }
+' "${CLARIFY_SRC}" > "${TEST_ROOT}/invocation"
+[ -s "${TEST_ROOT}/invocation" ] || fail "could not read the reviewer invocation block"
+grep -oE '(^|[[:space:]])--[a-z][a-z-]*' "${TEST_ROOT}/invocation" \
+  | sed 's/^[[:space:]]*//' | LC_ALL=C sort -u > "${TEST_ROOT}/invocation-flags"
+printf '%s\n' '--ask-for-approval' '--ephemeral' '--ignore-rules' '--ignore-user-config' \
+  '--sandbox' '--strict-config' | LC_ALL=C sort > "${TEST_ROOT}/expected-flags"
+if ! cmp -s "${TEST_ROOT}/invocation-flags" "${TEST_ROOT}/expected-flags"; then
+  echo "expected:" >&2; sed 's/^/  /' "${TEST_ROOT}/expected-flags" >&2
+  echo "found:"    >&2; sed 's/^/  /' "${TEST_ROOT}/invocation-flags" >&2
+  fail "the clarification call does not use exactly the gate's clean-room flag set"
+fi
+ok "clarify-challenge.sh uses exactly the gate's clean-room flag set, and no other flag"
+grep -qE -- '^[[:space:]]*--sandbox[[:space:]]+read-only([[:space:]]*\\)?[[:space:]]*$' \
+  "${TEST_ROOT}/invocation" \
+  || fail "the clarification call does not pin --sandbox read-only"
+if grep -nE -- '--sandbox[[:space:]]+(workspace-write|danger-full-access)' \
+     "${TEST_ROOT}/invocation"; then
+  fail "the clarification call names a write-capable sandbox"
+fi
+ok "clarify-challenge.sh pins --sandbox read-only and names no write-capable sandbox"
+if grep -nE '"\$@"|\$\*|\$\{[0-9]\}|\$[1-9]' "${TEST_ROOT}/invocation"; then
+  fail "a caller-supplied argument reaches the reviewer invocation"
+fi
+ok "no caller-supplied argument appears in the reviewer invocation"
+[ "$(grep -c '^CLARIFY_PROMPT="' "${CLARIFY_SRC}")" = 1 ] \
+  || fail "clarify-challenge.sh does not define exactly one fixed prompt"
+ok "clarify-challenge.sh defines exactly one prompt, in the file"
+if grep -nE '\$\{(CLARIFY_)?PROMPT[:+-]' "${CLARIFY_SRC}"; then
+  fail "the prompt can be overridden from the environment"
+fi
+ok "the prompt cannot be overridden from the environment"
+if grep -nE '(nohup|setsid|disown|run_in_background)' "${CLARIFY_SRC}"; then
+  fail "clarify-challenge.sh contains a backgrounding construct"
+fi
+ok "clarify-challenge.sh is foreground-only"
 
 # ---- 11. the bounded evidence challenge --------------------------------------
 R_CH="${TEST_ROOT}/repo-challenge"
@@ -850,6 +946,7 @@ expect_out 'STATUS: RELEASABLE' "release: the complete matrix reports RELEASABLE
 for script in "${SKILLS_SRC}/verified-phase/scripts/bootstrap-repo.sh" \
               "${SKILLS_SRC}/verified-phase/scripts/preflight.sh" \
               "${SKILLS_SRC}/verified-phase/scripts/validate-phase.sh" \
+              "${SKILLS_SRC}/verified-phase/scripts/clarify-challenge.sh" \
               "${SKILLS_SRC}/install.sh"; do
   /bin/bash -n "${script}" || fail "bash -n failed: ${script}"
   head -n1 "${script}" | grep -q '^#!/bin/bash$' || fail "unexpected shebang: ${script}"
@@ -893,5 +990,365 @@ grep -q 'skills/verified-phase/references/' "${SKILL_MD}" \
 grep -q 'skills/verified-phase/scripts/' "${SKILL_MD}" \
   || fail "SKILL.md: does not point at its scripts by installed path"
 ok "SKILL.md: references and scripts cited by installed path"
+
+# ---- 15. the one clarification call ------------------------------------------
+# A PATH-shadowing stand-in plays the reviewer CLI. It is written by this suite
+# into its own sandbox, is never installed anywhere, reaches no network, and
+# records both its argument vector and the exact bytes handed to it on stdin —
+# so "only the packet reaches the reviewer" is asserted, not assumed.
+CLARIFY="${H1}/.claude/skills/verified-phase/scripts/clarify-challenge.sh"
+MOCKBIN="${TEST_ROOT}/mockbin"
+MOCKDIR="${TEST_ROOT}/mockstate"
+mkdir -p "${MOCKBIN}" "${MOCKDIR}"
+cat > "${MOCKBIN}/codex" <<'STANDIN'
+#!/bin/bash
+set -u
+DIR="${MOCK_CODEX_DIR}"
+if [ "${1:-}" = "login" ]; then
+  printf 'login %s\n' "${2:-}" >> "${DIR}/login-calls"
+  case "${MOCK_CODEX_LOGIN:-chatgpt}" in
+    chatgpt) echo "Logged in using ChatGPT"; exit 0 ;;
+    api)     echo "Logged in using an API key ${MOCK_CODEX_SECRET:-}"; exit 0 ;;
+    *)       echo "Not logged in; ${MOCK_CODEX_SECRET:-} would be required" >&2; exit 1 ;;
+  esac
+fi
+if [ "${1:-}" = "--version" ]; then echo "reviewer-cli 0.146.0 (suite stand-in)"; exit 0; fi
+out=""; prev=""
+for a in "$@"; do
+  if [ "${prev}" = "-o" ]; then out="${a}"; fi
+  prev="${a}"
+done
+printf '%s\n' "$@" > "${DIR}/argv"
+cat > "${DIR}/stdin.bin"
+case "${MOCK_CODEX_MODE:-ok}" in
+  fail)  echo "stand-in reviewer failure" >&2; exit 7 ;;
+  empty) : > "${out}"; exit 0 ;;
+  *)     cat "${DIR}/reply.md" > "${out}"; exit 0 ;;
+esac
+STANDIN
+chmod +x "${MOCKBIN}/codex"
+
+MOCK_LOGIN=chatgpt
+MOCK_MODE=ok
+MOCK_SECRET='sk-planted-login-sentinel'
+run_clarify() { # $... — arguments for clarify-challenge.sh
+  run_in "${R_CLAR}/src/deep" env HOME="${H1}" PATH="${MOCKBIN}:${PATH}" \
+    MOCK_CODEX_DIR="${MOCKDIR}" MOCK_CODEX_LOGIN="${MOCK_LOGIN}" \
+    MOCK_CODEX_MODE="${MOCK_MODE}" MOCK_CODEX_SECRET="${MOCK_SECRET}" \
+    "${CLARIFY}" "$@"
+}
+
+R_CLAR="${TEST_ROOT}/repo-clarify"
+new_repo "${R_CLAR}"
+CL_BASE="$(git -C "${R_CLAR}" rev-parse HEAD)"
+mkdir -p "${R_CLAR}/docs/phases/10"
+CLD="${R_CLAR}/docs/phases/10"
+cat > "${CLD}/contract.md" <<CONTRACT
+# Phase 10: clarification fixture
+
+## Base
+Base SHA: ${CL_BASE}
+Base ref: main
+
+## Acceptance criteria
+AC-01: the first disputed behavior holds.
+AC-02: the second disputed behavior holds.
+AC-03: the third disputed behavior holds.
+AC-04: the fourth disputed behavior holds.
+AC-05: the fifth disputed behavior holds.
+CONTRACT
+git -C "${R_CLAR}" add docs/phases/10/contract.md
+git -C "${R_CLAR}" commit -q -m 'phase 10 contract'
+CL_CAND="$(git -C "${R_CLAR}" rev-parse HEAD)"
+{
+  printf 'HEAD: %s\n\n' "${CL_CAND}"
+  printf '| Criterion | Verdict | Evidence |\n|---|---|---|\n'
+  printf '| AC-0%s | PASS | tests line %s |\n' 1 8 2 9 3 10 4 11 5 12
+} > "${CLD}/claude-verdict.md"
+{
+  printf 'HEAD: %s\n\n' "${CL_CAND}"
+  printf '| Criterion | Verdict | Evidence |\n|---|---|---|\n'
+  printf '| AC-0%s | FAIL | diff line %s |\n' 1 4 2 5 3 6 4 7 5 8
+} > "${CLD}/codex-verdict.md"
+for id in AC-01 AC-02 AC-03 AC-04 AC-05; do
+  run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10 \
+    --new-challenge "${id}" "${CL_CAND}"
+  [ "${RUN_STATUS}" -eq 0 ] || { dump_last; fail "clarify fixture: packet for ${id} not created"; }
+done
+ok "clarify fixture: five frozen packets created"
+CH1="${CLD}/challenges/AC-01"
+
+cat > "${MOCKDIR}/reply.md" <<'REPLY'
+## Claim
+The deadline comparison is absent from the committed range.
+
+## Supporting evidence
+The packet quotes src/deep/reaper.txt:12, and no comparison appears there.
+
+## What would falsify this
+Any line in the packet's quoted range comparing a deadline to a clock reading.
+
+## Verification command
+grep -n deadline src/deep/reaper.txt
+REPLY
+
+# -- arity and passthrough: nothing caller-controlled may reach the reviewer ----
+run_clarify
+expect_status 2 "clarify: no arguments is a usage error"
+expect_out 'STATUS: USAGE' "clarify: reports USAGE with no arguments"
+run_clarify docs/phases/10
+expect_status 2 "clarify: one argument is a usage error"
+run_clarify docs/phases/10 AC-01 extra
+expect_status 2 "clarify: three arguments is a usage error"
+expect_out 'no prompt or argument passthrough' "clarify: says there is no passthrough"
+run_clarify docs/phases/10 AC-01 --sandbox
+expect_status 2 "clarify: a trailing flag is a usage error, not a passthrough"
+run_clarify docs/phases/10 not-a-criterion
+expect_status 2 "clarify: a malformed criterion ID is a usage error"
+[ ! -e "${MOCKDIR}/argv" ] || fail "clarify: reached the reviewer during a usage refusal"
+[ ! -e "${MOCKDIR}/login-calls" ] || fail "clarify: checked login during a usage refusal"
+ok "clarify: a usage refusal never reaches the reviewer CLI"
+
+run_clarify docs/phases/99 AC-01
+expect_status 1 "clarify: an absent phase directory refuses"
+expect_out 'STATUS: MISSING-PHASE-DIR' "clarify: reports MISSING-PHASE-DIR"
+run_clarify docs/phases/10 AC-42
+expect_status 1 "clarify: a criterion with no packet refuses"
+expect_out 'STATUS: CHALLENGE-INCOMPLETE' "clarify: reports CHALLENGE-INCOMPLETE"
+
+# -- secret hygiene: names only, and the captured login output stays captured ---
+run_in "${R_CLAR}/src/deep" env HOME="${H1}" PATH="${MOCKBIN}:${PATH}" \
+  MOCK_CODEX_DIR="${MOCKDIR}" OPENAI_API_KEY='sk-super-secret-sentinel' \
+  "${CLARIFY}" docs/phases/10 AC-01
+expect_status 4 "clarify: a defined API key refuses with exit 4"
+expect_out 'STATUS: CLARIFY-AUTH' "clarify: reports CLARIFY-AUTH"
+expect_out 'OPENAI_API_KEY' "clarify: names the variable"
+refute_out 'sk-super-secret-sentinel' "clarify: the API key value never appears in the output"
+run_in "${R_CLAR}/src/deep" env HOME="${H1}" PATH="${MOCKBIN}:${PATH}" \
+  MOCK_CODEX_DIR="${MOCKDIR}" CODEX_API_KEY= \
+  "${CLARIFY}" docs/phases/10 AC-01
+expect_status 4 "clarify: a defined-but-empty key still refuses"
+expect_out 'CODEX_API_KEY is defined' "clarify: names a defined-but-empty key"
+
+MOCK_LOGIN=api
+run_clarify docs/phases/10 AC-01
+expect_status 4 "clarify: an API-key login refuses with exit 4"
+expect_out 'STATUS: CLARIFY-AUTH' "clarify: an API-key login reports CLARIFY-AUTH"
+refute_out "${MOCK_SECRET}" "clarify: the captured login output is never echoed"
+MOCK_LOGIN=none
+run_clarify docs/phases/10 AC-01
+expect_status 4 "clarify: an unauthenticated CLI refuses with exit 4"
+expect_out 'STATUS: CLARIFY-AUTH' "clarify: an unauthenticated CLI reports CLARIFY-AUTH"
+refute_out "${MOCK_SECRET}" "clarify: an unauthenticated refusal echoes no credential"
+MOCK_LOGIN=chatgpt
+[ ! -e "${CH1}/codex-clarification.md" ] || fail "clarify: an auth refusal published a file"
+ok "clarify: no authentication refusal published anything"
+
+# -- a failed or empty reviewer run does not spend the one shot ----------------
+MOCK_MODE=fail
+run_clarify docs/phases/10 AC-01
+expect_status 1 "clarify: a reviewer failure is inconclusive"
+expect_out 'STATUS: CLARIFY-INCONCLUSIVE' "clarify: reports CLARIFY-INCONCLUSIVE on failure"
+expect_out 'stand-in reviewer failure' "clarify: shows the tail of the reviewer's stderr"
+expect_out 'is NOT spent' "clarify: says the one clarification was not consumed"
+[ ! -e "${CH1}/codex-clarification.md" ] || fail "clarify: a failed run published a file"
+ok "clarify: a failed reviewer run publishes nothing"
+MOCK_MODE=empty
+run_clarify docs/phases/10 AC-01
+expect_status 1 "clarify: an empty reply is inconclusive"
+expect_out 'STATUS: CLARIFY-INCONCLUSIVE' "clarify: reports CLARIFY-INCONCLUSIVE on an empty reply"
+expect_out '19945' "clarify: names the empty-output condition"
+[ ! -e "${CH1}/codex-clarification.md" ] || fail "clarify: an empty reply published a file"
+ok "clarify: an empty reply publishes nothing"
+MOCK_MODE=ok
+
+# -- the happy path ------------------------------------------------------------
+run_clarify docs/phases/10 AC-01
+expect_status 0 "clarify: the happy path exits 0"
+expect_out 'STATUS: CLARIFY-OK' "clarify: reports CLARIFY-OK"
+expect_out 'Structural validity is judged by validate-phase\.sh' \
+  "clarify: says structural validity is judged by validate-phase.sh, not here"
+expect_out 'UNRESOLVED' "clarify: says an unsettled clarification leaves the row UNRESOLVED"
+[ -f "${CH1}/codex-clarification.md" ] || fail "clarify: nothing was published"
+ok "clarify: the clarification is published beside its packet"
+
+cmp -s "${MOCKDIR}/stdin.bin" "${CH1}/discrepancy.md" \
+  || fail "clarify: the bytes on the reviewer's stdin are not the packet's bytes"
+ok "clarify: the reviewer received the packet, byte for byte, and nothing else"
+if grep -qE 'docs/phases/10|AC-01' "${MOCKDIR}/argv"; then
+  sed -n '1,20p' "${MOCKDIR}/argv" >&2
+  fail "clarify: a caller-supplied argument reached the reviewer's argument vector"
+fi
+ok "clarify: no caller-supplied argument reached the reviewer's argument vector"
+for flag in exec --ask-for-approval never --sandbox read-only --ephemeral \
+            --ignore-user-config --ignore-rules --strict-config; do
+  grep -qxF -- "${flag}" "${MOCKDIR}/argv" \
+    || fail "clarify: the reviewer was not given ${flag}"
+done
+ok "clarify: the reviewer ran in the gate's clean room, read-only and ephemeral"
+
+reply_lines="$(wc -l < "${MOCKDIR}/reply.md" | tr -d ' ')"
+head -n "${reply_lines}" "${CH1}/codex-clarification.md" > "${TEST_ROOT}/published-body"
+cmp -s "${TEST_ROOT}/published-body" "${MOCKDIR}/reply.md" \
+  || fail "clarify: the published clarification is not the reply verbatim"
+ok "clarify: the reply is published verbatim, unedited and unreformatted"
+PACKET_SHA="$(file_hash "${CH1}/discrepancy.md")"
+for footer in "^clarify-provenance:$" "^  packet_sha256: ${PACKET_SHA}$" \
+              "^  disputed_criterion: AC-01$" "^  candidate_sha: ${CL_CAND}$" \
+              "^  base_sha: ${CL_BASE}$" "^  contract_sha256: [0-9a-f]{64}$" \
+              "^  codex: reviewer-cli " "^  model: .*sandbox=read-only" \
+              "^  clarifier: clarify-challenge\.sh v1 \(20"; do
+  grep -qE -- "${footer}" "${CH1}/codex-clarification.md" \
+    || fail "clarify: the provenance footer is missing /${footer}/"
+done
+ok "clarify: the footer binds the reply to its packet, candidate, contract, and clarifier"
+[ -z "$(find "${CH1}" -name '.codex-clarification.*' -print)" ] \
+  || fail "clarify: a staging file was left beside the published clarification"
+ok "clarify: the atomic publish left no staging file behind"
+
+# -- the one shot is spent, and only a published file spends it ----------------
+published_sha="$(file_hash "${CH1}/codex-clarification.md")"
+argv_sha="$(file_hash "${MOCKDIR}/argv")"
+run_clarify docs/phases/10 AC-01
+expect_status 1 "clarify: a second clarification for the same criterion refuses"
+expect_out 'STATUS: CLARIFY-EXISTS' "clarify: reports CLARIFY-EXISTS"
+expect_out 'there is no second round' "clarify: says there is no second round"
+[ "${published_sha}" = "$(file_hash "${CH1}/codex-clarification.md")" ] \
+  || fail "clarify: the refused rerun changed the published clarification"
+ok "clarify: the published clarification is never overwritten"
+[ "${argv_sha}" = "$(file_hash "${MOCKDIR}/argv")" ] \
+  || fail "clarify: the refused rerun still called the reviewer"
+ok "clarify: the refused rerun never called the reviewer"
+
+# -- validate-phase.sh judges the published file, footer and all ---------------
+run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10
+expect_status 0 "validate: a published clarification validates"
+expect_out 'CLARIFICATION-OK: AC-01/codex-clarification\.md \(commands: 1\)' \
+  "validate: counts the reply's one command and not the footer below it"
+expect_out 'CLARIFICATION-BOUND: AC-01/codex-clarification\.md' \
+  "validate: verifies the clarify-provenance footer against the packet"
+expect_out 'STATUS: OK' "validate: the phase with a published clarification reports OK"
+
+# -- `none` is a valid answer, and it is zero commands, not one ----------------
+cat > "${MOCKDIR}/reply.md" <<'REPLY'
+## Claim
+The packet does not contain the evidence that would settle this criterion.
+
+## Supporting evidence
+Neither verdict quotes the range the criterion is about.
+
+## What would falsify this
+A quotation of that range anywhere in the packet.
+
+## Verification command
+none
+REPLY
+run_clarify docs/phases/10 AC-02
+expect_status 0 "clarify: a 'none' clarification is published like any other"
+expect_out 'STATUS: CLARIFY-OK' "clarify: reports CLARIFY-OK for a 'none' reply"
+run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10
+expect_status 0 "validate: a 'none' clarification is structurally valid"
+expect_out 'CLARIFICATION-OK: AC-02/codex-clarification\.md \(commands: 0\)' \
+  "validate: a sole 'none' counts as no command to run"
+expect_out 'CLARIFICATION-BOUND: AC-02/codex-clarification\.md' \
+  "validate: the 'none' clarification is bound to its packet too"
+
+# -- a packet that no longer describes what it was cut from --------------------
+CH5="${CLD}/challenges/AC-05"
+sed 's/^contract_sha256:.*/contract_sha256: 0000000000000000000000000000000000000000000000000000000000000000/' \
+  "${CH5}/discrepancy.md" > "${CH5}/discrepancy.new"
+mv "${CH5}/discrepancy.new" "${CH5}/discrepancy.md"
+run_clarify docs/phases/10 AC-05
+expect_status 1 "clarify: a packet whose recorded hashes no longer match refuses"
+expect_out 'STATUS: CLARIFY-PACKET-MISMATCH' "clarify: reports CLARIFY-PACKET-MISMATCH"
+expect_out 'nothing here repairs one' "clarify: says a frozen packet is not repaired"
+[ ! -e "${CH5}/codex-clarification.md" ] || fail "clarify: a mismatched packet published a file"
+ok "clarify: a mismatched packet publishes nothing"
+
+# -- an adjudicated challenge is closed ----------------------------------------
+CH3="${CLD}/challenges/AC-03"
+cat > "${CH3}/challenge-result.md" <<RESULT
+# Adjudication — AC-03
+
+Clarification: not obtained; the reviewer CLI was unavailable in this run.
+Adjudication: sustained on the evidence already recorded in both verdicts.
+
+discrepancy_sha256: $(file_hash "${CH3}/discrepancy.md")
+clarification_sha256: absent
+RESULT
+run_clarify docs/phases/10 AC-03
+expect_status 1 "clarify: an adjudicated challenge refuses"
+expect_out 'STATUS: CLARIFY-ADJUDICATED' "clarify: reports CLARIFY-ADJUDICATED"
+expect_out 'the challenge is closed' "clarify: says the challenge is closed"
+[ ! -e "${CH3}/codex-clarification.md" ] || fail "clarify: an adjudicated challenge published a file"
+ok "clarify: an adjudicated challenge publishes nothing"
+
+# -- the footer is checked against the packet on disk, not trusted -------------
+cp "${CH1}/discrepancy.md" "${TEST_ROOT}/ac01-packet.bak"
+printf '\nan edit made after the reply was published\n' >> "${CH1}/discrepancy.md"
+run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10
+expect_status 1 "validate: a clarification answering another packet refuses"
+expect_out 'STATUS: CLARIFICATION-TAMPERED' "validate: reports CLARIFICATION-TAMPERED"
+expect_out 'not the packet on disk' "validate: says which side moved"
+cp "${TEST_ROOT}/ac01-packet.bak" "${CH1}/discrepancy.md"
+run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10
+expect_status 0 "validate: restoring the packet restores the binding"
+
+# -- publication is verbatim, so a bad reply is caught by the validator --------
+cat > "${MOCKDIR}/reply.md" <<'REPLY'
+## Claim
+Two commands are needed here.
+
+## Supporting evidence
+The packet quotes two ranges.
+
+## What would falsify this
+Either range settling it alone.
+
+## Verification command
+grep -n deadline src/deep/reaper.txt
+grep -n clock src/deep/reaper.txt
+REPLY
+run_clarify docs/phases/10 AC-04
+expect_status 0 "clarify: a two-command reply is still published verbatim"
+expect_out 'STATUS: CLARIFY-OK' "clarify: the script does not judge the reply's structure"
+run_in "${R_CLAR}/src/deep" env HOME="${H1}" "${VALIDATE}" docs/phases/10
+expect_status 1 "validate: a published two-command clarification is refused"
+expect_out 'STATUS: CLARIFICATION-INVALID' "validate: reports CLARIFICATION-INVALID"
+expect_out '2 command lines' "validate: counts two commands, footer excluded"
+
+# ---- 16. a symlinked skill source is refused, not resolved -------------------
+# Phase 02 incident shape: the suite reached its own source through a symlink,
+# so a fixture that drifted an installed SKILL.md drifted the live one instead.
+# Both the installer and this suite now refuse before reading or writing.
+H_SYM="${TEST_ROOT}/home-symlink"
+mkdir -p "${H_SYM}/.claude"
+LIVE_LINK="${TEST_ROOT}/live-skills-link"
+ln -s "${SKILLS_SRC}" "${LIVE_LINK}"
+
+run_in "${LIVE_LINK}" env HOME="${H_SYM}" ./install.sh
+expect_status 2 "install: a symlinked source refuses"
+expect_out 'STATUS: SKILLS-SRC-SYMLINK' "install: reports SKILLS-SRC-SYMLINK"
+expect_out 'resolves through a symlink' "install: says why it refused"
+[ ! -e "${H_SYM}/.claude/skills" ] || fail "install: the refused run created a skills directory"
+ok "install: the refused run created nothing under \$HOME/.claude"
+[ "$(file_hash "${LIVE_SKILL_MD}")" = "${LIVE_SKILL_MD_BEFORE}" ] \
+  || fail "install: the live SKILL.md changed during the symlinked run"
+ok "install: the live SKILL.md is byte-unchanged after the symlinked install"
+
+run_in "${TEST_ROOT}" env HOME="${H_SYM}" "${LIVE_LINK}/tests/verified-phase-tests.sh"
+expect_status 2 "suite: a symlinked skill source refuses"
+expect_out 'STATUS: TESTS-SRC-SYMLINK' "suite: reports TESTS-SRC-SYMLINK"
+expect_out 'no fixture was created' "suite: says nothing was created"
+refute_out '^ok 1 - ' "suite: the refused child ran no fixture"
+[ "$(file_hash "${LIVE_SKILL_MD}")" = "${LIVE_SKILL_MD_BEFORE}" ] \
+  || fail "suite: the live SKILL.md changed during the symlinked child run"
+ok "suite: the live SKILL.md is byte-unchanged after the symlinked child run"
+
+# The whole run, every fixture, every refusal: the tree under review is exactly
+# as this suite found it.
+[ "$(tree_hash "${SKILLS_SRC}")" = "${LIVE_TREE_BEFORE}" ] \
+  || fail "the live skill tree changed during the run"
+ok "the live skill tree is byte-identical to how the run found it"
 
 echo "PASS: ${pass} verified-phase checks"
