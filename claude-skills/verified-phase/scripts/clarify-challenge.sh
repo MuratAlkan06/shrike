@@ -265,16 +265,21 @@ sha_agrees "${PACKET_CANDIDATE}" "${CLAUDE_HEAD}" || candidate_mismatch claude-v
 sha_agrees "${PACKET_CANDIDATE}" "${CODEX_HEAD}"  || candidate_mismatch codex-verdict.md
 
 # ---- precondition: the one shot is still unspent -----------------------------
+# Adjudication is checked FIRST, and the order is the whole point. A challenge
+# adjudicated on a clarification has BOTH files on disk, which is the ordinary
+# end state, not a rare one. Asking about the clarification first would answer
+# every such rerun with CLARIFY-EXISTS — true, but the lesser truth: the shot is
+# spent AND the record is closed, and closed is what the caller must be told.
+if [ -e "${RESULT}" ]; then
+  die CLARIFY-ADJUDICATED \
+    "${AC_ID} is already adjudicated: ${RESULT}" \
+    "the challenge is closed; a reply now could only reopen a settled record"
+fi
 if [ -e "${CLAR}" ]; then
   die CLARIFY-EXISTS \
     "a clarification already exists for ${AC_ID}: ${CLAR}" \
     "one clarification per (candidate, criterion), ever — there is no second round" \
     "nothing here overwrites it; adjudicate on what is already recorded"
-fi
-if [ -e "${RESULT}" ]; then
-  die CLARIFY-ADJUDICATED \
-    "${AC_ID} is already adjudicated: ${RESULT}" \
-    "the challenge is closed; a reply now could only reopen a settled record"
 fi
 
 # ---- precondition: subscription authentication, fail closed ------------------

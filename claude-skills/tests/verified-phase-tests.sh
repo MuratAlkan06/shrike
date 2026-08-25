@@ -1447,6 +1447,41 @@ expect_out 'the challenge is closed' "clarify: says the challenge is closed"
 [ ! -e "${CH3}/codex-clarification.md" ] || fail "clarify: an adjudicated challenge published a file"
 ok "clarify: an adjudicated challenge publishes nothing"
 
+# -- closed outranks spent: the ordinary end state has BOTH files --------------
+# A challenge adjudicated on a clarification keeps both the reply and the
+# result. Both refusals are true of it; only one is the answer the caller needs,
+# and CLARIFY-EXISTS would send them back to a record that is already closed.
+CH2="${CLD}/challenges/AC-02"
+[ -f "${CH2}/codex-clarification.md" ] || fail "clarify fixture: AC-02 has no clarification"
+cat > "${CH2}/challenge-result.md" <<RESULT
+# Adjudication — AC-02
+
+Adjudication: overruled on the clarification recorded beside this result.
+
+discrepancy_sha256: $(file_hash "${CH2}/discrepancy.md")
+clarification_sha256: $(file_hash "${CH2}/codex-clarification.md")
+RESULT
+clarified_sha="$(file_hash "${CH2}/codex-clarification.md")"
+run_clarify docs/phases/10 AC-02
+expect_status 1 "clarify: an adjudicated challenge holding its clarification refuses"
+expect_out 'STATUS: CLARIFY-ADJUDICATED' \
+  "clarify: adjudication outranks the spent shot when both files are present"
+refute_out 'STATUS: CLARIFY-EXISTS' \
+  "clarify: an adjudicated challenge is never reported as merely already clarified"
+expect_out 'the challenge is closed' "clarify: says the closed record is closed"
+[ "${clarified_sha}" = "$(file_hash "${CH2}/codex-clarification.md")" ] \
+  || fail "clarify: the refused rerun changed the adjudicated clarification"
+ok "clarify: the refused rerun leaves the adjudicated clarification untouched"
+rm -f "${CH2}/challenge-result.md"
+
+# Neither refusal has swallowed the other: each fixture still answers for itself.
+run_clarify docs/phases/10 AC-01
+expect_out 'STATUS: CLARIFY-EXISTS' \
+  "clarify: a clarified but unadjudicated challenge still reports CLARIFY-EXISTS"
+run_clarify docs/phases/10 AC-03
+expect_out 'STATUS: CLARIFY-ADJUDICATED' \
+  "clarify: an adjudicated challenge with no clarification still reports CLARIFY-ADJUDICATED"
+
 # -- the footer is checked against the packet on disk, not trusted -------------
 cp "${CH1}/discrepancy.md" "${TEST_ROOT}/ac01-packet.bak"
 printf '\nan edit made after the reply was published\n' >> "${CH1}/discrepancy.md"
